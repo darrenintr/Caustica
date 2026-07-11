@@ -69,6 +69,14 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # git on Windows drops the +x bit on `gradlew` on checkout (core.fileMode
+      # is false by default), so `./gradlew` arrives in the runner as 644 and
+      # `bash: ./gradlew: Permission denied` fails the build before Gradle
+      # even starts. Windows runner is unaffected (uses `gradlew.bat`).
+      - name: Ensure gradlew is executable
+        if: runner.os != 'Windows'
+        run: chmod +x ./gradlew
+
       # Mirror the user's local build command:
       #   ./gradlew compileJava 2>&1 | tee build.log; echo rc=$PIPESTATUS
       # `set -uo pipefail` (no -e) on purpose: the exit code is read from
