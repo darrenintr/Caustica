@@ -133,7 +133,12 @@ public final class LinuxKernelProbe {
     private static String slurp(String path) {
         try {
             return Files.readString(Path.of(path)).trim();
-        } catch (IOException | SecurityException | RuntimeException e) {
+        } catch (IOException e) {
+            // SecurityException extends RuntimeException, so a single checked
+            // catch handles the I/O path. SecurityException is unchecked
+            // and would never be thrown by Files.readString anyway, so the
+            // previous multi-catch was redundant and tripped javac's
+            // "alternatives related by subclassing" rule.
             LOGGER.debug("could not read {}: {}", path, e.getMessage());
             return null;
         }
