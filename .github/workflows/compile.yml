@@ -1,0 +1,118 @@
+name: compile (fast feedback)
+
+# Fast Java-compile-only feedback for Caustica. Catches `error: ...` lines in <2 min
+# without paying the full CI cost (Vulkan SDK download, native shim cmake, gradle build).
+# The full pipeline (native-windows + native-linux + package + bundle-full) lives in
+# ci.yml; this one is the daily-iteration companion.
+
+on:
+  push:
+    paths:
+      - ".github/workflows/compile.yml"
+      - "build.gradle"
+      - "settings.gradle"
+      - "gradle.properties"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      - "src/**"
+  pull_request:
+    paths:
+      - ".github/workflows/compile.yml"
+      - "build.gradle"
+      - "settings.gradle"
+      - "gradle.properties"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      - "src/**"
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same branch / PR so a follow-up push doesn't
+# sit behind a stale failure. The full ci.yml keeps its own (none) policy on
+# purpose — we don't want a fast-feedback re-run to cancel a release-bundle build.
+concurrency:
+  group: compile-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Matches build.gradle's sourceCompatibility / targetCompatibility / --release.
+  JAVA_VERSION: "25"
+
+jobs:
+  compile:
+    name: compileJava (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't kill the other matrix entry on first failure — both are cheap and
+      # we want to see whether the failure is platform-specific.
+      fail-fast: false
+      matrix:
+        # Matches the platforms supported by the project (see `ngxNativePlatforms`
+        # in build.gradle). macOS is intentionally omitted: Caustica ships no
+        # native shim for macOS, and a pure Java compile on macOS would only
+        # duplicate what ubuntu catches. Run on your own Mac if you need it.
+        os: [ubuntu-latest, windows-2022]
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Caustica
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Mirror the user's local build command:
+      #   ./gradlew compileJava 2>&1 | tee build.log; echo rc=$PIPESTATUS
+      # `set -uo pipefail` (no -e) on purpose: the exit code is read from
+      # ${PIPESTATUS[0]}, not auto-propagated, so tee can't swallow it.
+      - name: Compile Java
+        shell: bash
+        run: |
+          set -uo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+              ./gradlew.bat compileJava 2>&1 | tee build.log
+              rc=${PIPESTATUS[0]}
+          else
+              ./gradlew compileJava 2>&1 | tee build.log
+              rc=${PIPESTATUS[0]}
+          fi
+          echo "compileJava rc=$rc"
+          if [ "$rc" -ne 0 ]; then
+              {
+                  echo "## compileJava failed (rc=$rc) on ${{ matrix.os }}"
+                  echo ""
+                  echo "<details><summary>Compiler / Gradle output (click to expand)</summary>"
+                  echo ""
+                  echo '```'
+                  # Pull the lines that actually matter: javac's `error:` / `warning:`,
+                  # Kotlin-style `e: ` errors, and Gradle's own failure header. Grep
+                  # is best-effort — if the build failed before reaching the compiler
+                  # (e.g. settings.gradle, plugin resolution) the `What went wrong`
+                  # block is the only useful signal.
+                  grep -nE '^e: |error: |warning: |What went wrong|FAILURE|\* What went wrong|\* Where:|\* Try:' build.log \
+                      | head -200 || true
+                  echo '```'
+                  echo ""
+                  echo "</details>"
+                  echo ""
+                  echo "Full log uploaded as the \`compile-build-log-${{ matrix.os }}\` artifact below."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit "$rc"
+          fi
+
+      - name: Upload build log (on failure only)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compile-build-log-${{ matrix.os }}
+          path: build.log
+          if-no-files-found: warn
+          retention-days: 7
