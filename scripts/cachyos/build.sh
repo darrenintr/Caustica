@@ -115,8 +115,12 @@ fi
 # ---------- 3. native shim ----------
 # native/ngx_shim/CMakeLists.txt picks up the system Vulkan headers
 # (vulkan-headers) and links the DLSS static lib from $DLSS_SDK/lib/Linux_x86_64.
+# The CMakeLists hard-requires VULKAN_SDK; on Arch/CachyOS the `vulkan-headers`
+# package puts vulkan/vulkan.h under /usr/include, so VULKAN_SDK=/usr makes
+# the shim's ${VULKAN_SDK}/include include path resolve correctly.
 log "compiling native NGX shim (linux-x64 / $SHIM_CONFIG)"
 mkdir -p "$SHIM_OUT"
+export VULKAN_SDK=/usr
 cmake -S native/ngx_shim -B "$SHIM_OUT" \
       -G Ninja \
       -DCMAKE_BUILD_TYPE="$SHIM_CONFIG" \

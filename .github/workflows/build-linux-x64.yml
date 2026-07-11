@@ -112,6 +112,12 @@ jobs:
       - name: Build native NGX shim (linux-x64 / release)
         env:
           DLSS_SDK: ${{ github.workspace }}/third_party/DLSS
+          # native/ngx_shim/CMakeLists.txt hard-requires VULKAN_SDK and
+          # adds ${VULKAN_SDK}/include to the include path. On Ubuntu the
+          # libvulkan-dev package puts vulkan/vulkan.h under /usr/include,
+          # so VULKAN_SDK=/usr makes the path resolve correctly. (Same trick
+          # the existing ci.yml native-linux job uses.)
+          VULKAN_SDK: /usr
         run: |
           cmake -S native/ngx_shim -B build/cmake/ngx_shim/release \
                 -G Ninja \
