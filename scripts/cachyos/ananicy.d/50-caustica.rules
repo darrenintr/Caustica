@@ -1,0 +1,19 @@
+# /etc/ananicy.d/50-caustica.rules
+# (ananicy-cpp native text format — simple name-based, applied when the JSON
+#  rule in 50-caustica.rules.json doesn't match. JSON does the precise
+#  cmdline-based match; this is the fallback for the common "java" comm name.)
+#
+# Ananicy-cpp reads rules from /etc/ananicy.d/*.rules (or whatever the service's
+# --rules-dir points at). Each line is:
+#   TYPE PROCESS_NAME CGROUP
+# where TYPE is one of: Game, Multimedia, IO, CPU_Bound, etc. CGROUP is the
+# cgroup-name only (like "cpu" or "cpu/game"), not the full path.
+#
+# This rule treats *all* java processes as Game-class. That's broader than
+# ideal — it would also lift, say, a long-running Jenkins agent — but on
+# a CachyOS gaming box where the only java is the MC launcher, it's fine.
+# For precise cmdline-based matching, see 50-caustica.rules.json.
+#
+# Format: TYPE  PROCESS_NAME  CGROUP
+
+Game  java  cpu/game

@@ -13,6 +13,11 @@ public final class CausticaMod implements ModInitializer {
 		// Register every setting (applying TOML file values) and write a default config on first run.
 		CausticaConfig.ensureRegistered();
 		CausticaConfig.saveIfMissing();
+		// Probe the host kernel / scheduler / cgroup state on Linux. Logs the running
+		// kernel version, THP mode, and ananicy-cpp presence so the user can confirm
+		// the box is configured the way scripts/cachyos/install.sh set it up. No-op on
+		// other platforms.
+		LinuxKernelProbe.probe();
 		LOGGER.info("Caustica initialized (common); config: {}", CausticaConfig.configPath());
 	}
 }

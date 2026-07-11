@@ -1,0 +1,26 @@
+{
+  "rules": [
+    {
+      "name": "Caustica mod runtime (Minecraft Java client)",
+      "comment": "Caustica is a Vulkan ray-traced renderer mod for Minecraft Fabric. It runs in the Fabric/Mojang launcher JVM (java), and the main render thread + worker pool are sensitive to context-switch latency. Pin them to SCHED_BATCH with cgroup io-priority 1, and lift the cgroup CPU shares to 8000 so ananicy-cpp's \"game\" class wins against background services. (ananicy-cpp-game-ruleset is the upstream name in CachyOS / games-ruleset.)",
+      "type": "Game",
+      "nice": -8,
+      "ionice": { "io_class": "best-effort", "io_priority": 1 },
+      "cgroup": {
+        "io": "1"
+      }
+    },
+    {
+      "name": "Caustica NGX / FSR / XeSS native shims",
+      "comment": "The mod dlopens libngxshim.so, libamd_fidelityfx_*.so, and libxess.so at runtime. They are loaded into the same JVM process so ananicy's process-name match (java) catches them — no separate rule needed. Listed here for visibility.",
+      "type": "Game",
+      "nice": -6
+    },
+    {
+      "name": "Minecraft JVM (caustic argmatch)",
+      "comment": "Backup rule for the launcher case where ananicy's process-tree is broken (e.g. the launcher wraps java in a separate PGID). Match on the `-Dfabric.mods.dir` or `-Dcaustica.*` flags so we catch the right java instance even when the launcher is just 'java'.",
+      "type": "Game",
+      "nice": -7
+    }
+  ]
+}

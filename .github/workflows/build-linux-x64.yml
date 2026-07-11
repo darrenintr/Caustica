@@ -1,0 +1,158 @@
+name: build-linux-x64
+
+# Build the Caustica JAR with the full linux-x64 native bundle (NGX + FSR +
+# XeSS + Vulkan RT shim). Output is uploaded as a downloadable artifact so
+# Linux users (CachyOS, Arch, NixOS, etc.) can drop the JAR into
+# ~/.minecraft/mods/ without building locally.
+#
+# Windows / native-windows still goes through ci.yml (with NVIDIA DLSS SDK
+# clone etc.) — this workflow is the equivalent for the linux-x64 platform
+# only, so the matrix stays small and the artifact is predictable.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-linux-x64.yml"
+      - "build.gradle"
+      - "settings.gradle"
+      - "gradle.properties"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      - "native/**"
+      - "shaders/**"
+      - "src/**"
+      - "scripts/cachyos/**"
+  pull_request:
+    paths:
+      - ".github/workflows/build-linux-x64.yml"
+      - "build.gradle"
+      - "settings.gradle"
+      - "gradle.properties"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      - "native/**"
+      - "shaders/**"
+      - "src/**"
+      - "scripts/cachyos/**"
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same branch / PR so a follow-up push
+# doesn't sit behind a stale build.
+concurrency:
+  group: build-linux-x64-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: "25"
+  DLSS_SDK_REF: v310.7.0
+  FFX_SDK_REF: fsr3-v3.0.4
+  XESS_SDK_REF: v3.0.1
+
+jobs:
+  build:
+    name: Build linux-x64 JAR
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout Caustica
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Build toolchain: cmake / ninja / clang for the shim, glslang /
+      # spirv-tools for the GLSL->SPIR-V shader compile, vulkan headers
+      # for the shim's Vulkan includes.
+      - name: Install build dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              cmake ninja-build clang lld \
+              glslang-tools spirv-tools \
+              libvulkan-dev vulkan-tools
+
+      # Vendor SDKs. Public github mirrors — same as ci.yml's matrix.
+      - name: Checkout DLSS SDK
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA/DLSS
+          ref: ${{ env.DLSS_SDK_REF }}
+          path: third_party/DLSS
+
+      - name: Checkout AMD FidelityFX SDK
+        uses: actions/checkout@v4
+        with:
+          repository: GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+          ref: ${{ env.FFX_SDK_REF }}
+          path: third_party/FidelityFX-SDK
+
+      # XeSS Linux binaries are gated to Intel DevZone; the public release
+      # only ships libxess.dll. build.gradle's bundleXessNatives task will
+      # log a warning and skip — the mod still builds and runs, just without
+      # XeSS upscaling.
+      - name: Checkout Intel XeSS SDK
+        uses: actions/checkout@v4
+        with:
+          repository: intel/xess
+          ref: ${{ env.XESS_SDK_REF }}
+          path: third_party/xess
+        continue-on-error: true
+
+      - name: Build native NGX shim (linux-x64 / release)
+        env:
+          DLSS_SDK: ${{ github.workspace }}/third_party/DLSS
+        run: |
+          cmake -S native/ngx_shim -B build/cmake/ngx_shim/release \
+                -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=clang \
+                -DCMAKE_CXX_COMPILER=clang++ \
+                -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+                -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld"
+          cmake --build build/cmake/ngx_shim/release --config Release
+
+      - name: Build Caustica JAR (linux-x64 native bundle)
+        env:
+          DLSS_SDK: ${{ github.workspace }}/third_party/DLSS
+          FFX_SDK: ${{ github.workspace }}/third_party/FidelityFX-SDK
+          XESS_SDK: ${{ github.workspace }}/third_party/xess
+        # VULKAN_SDK is intentionally NOT set — build.gradle's resolveVulkanTool()
+        # tries ${VULKAN_SDK}/Bin/ (Windows-style capital B) which never matches
+        # on Linux; the PATH fallback to /usr/bin/{glslangValidator,spirv-val}
+        # (apt: glslang-tools, spirv-tools) is what we want.
+        run: |
+          ./gradlew --no-daemon build \
+              -PngxPlatforms=linux-x64 \
+              -PfsrPlatforms=linux-x64 \
+              -PxessPlatforms=linux-x64
+
+      - name: List bundled linux-x64 natives
+        if: always()
+        run: |
+          ls -la build/generated/ngx-natives/caustica/natives/linux-x64/ || true
+          ls -la build/generated/fsr-natives/caustica/natives/linux-x64/ || true
+          ls -la build/generated/xess-natives/caustica/natives/linux-x64/ || true
+
+      - name: Upload JAR + build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: caustica-linux-x64-jar
+          path: |
+            build/libs/caustica-*.jar
+            build/generated/ngx-natives/caustica/natives/linux-x64/
+            build/generated/fsr-natives/caustica/natives/linux-x64/
+            build/generated/xess-natives/caustica/natives/linux-x64/
+          if-no-files-found: warn
+          retention-days: 14

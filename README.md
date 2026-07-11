@@ -43,6 +43,43 @@ changes while the renderer is being built.
 4. Launch the game with the Vulkan graphics backend.
 5. Open Video Settings to adjust Caustica's renderer options.
 
+## Linux / CachyOS
+
+Caustica is supported on Linux with the same DLSS / FSR / XeSS native
+bundle as Windows. The project ships a CachyOS-tuned build + runtime
+pack at [`scripts/cachyos/`](scripts/cachyos/) covering:
+
+- `build.sh` — full build pipeline (deps, DLSS/FFX/XeSS SDKs, native
+  shim, gradle bundleNgxNatives for linux-x64).
+- `install.sh` — one-shot setup (deps, ananicy-cpp rule, kernel
+  sysctls, optional build).
+- `run-caustica.sh` — runtime launcher with gamemode, ananicy-cpp,
+  nice/ionice, NUMA bind, and the JVM flags the renderer needs.
+- `.github/workflows/build-linux-x64.yml` — CI build of the same JAR on
+  a `ubuntu-latest` runner. Download the artifact from the run's
+  "Artifacts" panel.
+
+Quickstart on CachyOS:
+
+```bash
+# Pull a prebuilt JAR from CI (or build it locally with scripts/cachyos/build.sh)
+gh run download -n caustica-linux-x64-jar      # or copy build/libs/caustica-*-linux-x64.jar
+
+# One-shot setup
+sudo ./scripts/cachyos/install.sh
+
+# Drop the JAR in and launch
+cp caustica-*-linux-x64.jar ~/.minecraft/mods/
+caustica-launch prism-launcher                 # or any launcher you use
+```
+
+CachyOS-specific notes: use `linux-cachyos-bore` or `-eevdf` kernel for
+the best render-thread scheduling; HDR requires a Wayland session
+(Plasma 6 / Hyprland / Gamescope 3.16+). XeSS-Linux is gated to Intel
+DevZone; FSR works out of the box from the bundled natives.
+
+See [scripts/cachyos/README.md](scripts/cachyos/README.md) for details.
+
 ## Usage Notes
 
 - Caustica is client-side only.
