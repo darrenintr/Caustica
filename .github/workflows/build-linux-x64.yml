@@ -137,7 +137,11 @@ jobs:
         # tries ${VULKAN_SDK}/Bin/ (Windows-style capital B) which never matches
         # on Linux; the PATH fallback to /usr/bin/{glslangValidator,spirv-val}
         # (apt: glslang-tools, spirv-tools) is what we want.
+        # `chmod +x ./gradlew` defends against git ever dropping the +x bit on
+        # checkout (core.fileMode is false by default — same trap compile.yml
+        # hit on its first run; see `Ensure gradlew is executable` there).
         run: |
+          chmod +x ./gradlew
           ./gradlew --no-daemon build \
               -PngxPlatforms=linux-x64 \
               -PfsrPlatforms=linux-x64 \
