@@ -5,7 +5,6 @@ import com.mojang.blaze3d.vulkan.VulkanDevice;
 
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
-import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 
 import it.unimi.dsi.fastutil.longs.LongList;
 
@@ -39,7 +38,7 @@ import java.nio.LongBuffer;
  * a self-contained present here failed validation). Then at {@code present()} HEAD we present the extra
  * image(s) before MC presents the real one, giving display order generated-then-real.
  *
- * <p>The generated frame is {@link RtDlssFg}'s real DLSSG-interpolated output (via
+ * <p>The generated frame is the active {@code FrameGen}'s real interpolated output (DLSSG via
  * {@link RtComposite#fgInterpolate}); when there's simply no captured RT frame this tick (menu/loading/
  * transition — routine) it falls back to duplicating the real frame for just that one frame (see
  * {@code interpFallbackDuplicate} in the present-rate log), but a genuine FG failure is fatal (see that
@@ -75,10 +74,18 @@ public final class RtFramePresenter {
     private RtFramePresenter() {
     }
 
-    /** Whether FG extra-present should run this frame (enabled, available, in a world). */
+    /** Whether FG extra-present should run this frame (any vendor — DLSSG, FSR FG, XeSS-FG). */
     public boolean isActive() {
-        return !failed && RtDlssFg.enabled() && RtDlssFg.INSTANCE.isAvailable()
-                && Minecraft.getInstance().level != null;
+        if (failed || Minecraft.getInstance().level == null) {
+            return false;
+        }
+        // The FrameGenSelector is the master switch: its mode (off / auto / forced) plus the per-backend
+        // availability determine whether FG runs. The legacy {@code caustica.rt.fg} config is honoured
+        // by the selector: a fresh config file still has {@code caustica.rt.fg = true} (which the
+        // selector maps to the resolved mode = AUTO) and the user can override per-vendor with
+        // {@code caustica.rt.framegen.mode}.
+        dev.comfyfluffy.caustica.framegen.FrameGen fg = dev.comfyfluffy.caustica.framegen.FrameGenSelector.current();
+        return fg.isAvailable() && fg.effectiveMultiFrameCount() > 0;
     }
 
     /**
@@ -140,7 +147,7 @@ public final class RtFramePresenter {
         } catch (Throwable t) {
             failed = true;
             pendingCount = 0;
-            CausticaMod.LOGGER.error("DLSS-FG present-record failed; frame generation disabled", t);
+            CausticaMod.LOGGER.error("Frame generation present-record failed; FG disabled", t);
         }
     }
 
@@ -164,12 +171,12 @@ public final class RtFramePresenter {
                 }
             } catch (Throwable t) {
                 failed = true;
-                CausticaMod.LOGGER.error("DLSS-FG present failed; frame generation disabled", t);
+                CausticaMod.LOGGER.error("Frame generation present failed; FG disabled", t);
             } finally {
                 pendingCount = 0;
             }
         }
-        if (RtDlssFg.enabled()) {
+        if (dev.comfyfluffy.caustica.framegen.FrameGenSelector.current().isAvailable()) {
             logPresentRate(presentedThisFrame);
         }
     }
@@ -200,7 +207,8 @@ public final class RtFramePresenter {
                         + "interpOk={} interpFallbackDuplicate={}",
                 realFramesInWindow, generatedFramesInWindow,
                 String.format("%.1f", realFps), String.format("%.1f", totalFps),
-                RtDlssFg.INSTANCE.effectiveMultiFrameCount(), interpOkInWindow, interpFallbackInWindow);
+                dev.comfyfluffy.caustica.framegen.FrameGenSelector.current().effectiveMultiFrameCount(),
+                interpOkInWindow, interpFallbackInWindow);
         logWindowStartNs = now;
         realFramesInWindow = 0;
         generatedFramesInWindow = 0;

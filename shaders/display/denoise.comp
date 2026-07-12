@@ -1,0 +1,145 @@
+#version 460
+//
+// Simplified SVGF-style denoise pass for the path-traced HDR color.
+//
+// Inputs (all at render resolution, exactly as world.rgen wrote them):
+//   inColor   rgba16f   noisy HDR color (linear radiance)
+//   inNormal  rgba16f   xyz world normal, w = roughness (unused for diffuse denoise)
+//   inDepth   r32f      linear view-space depth (HW-reversed-Z remapped to linear at the call site)
+//   inMotion  rg16f     screen-space motion vectors, render pixels (this frame's reprojection of next)
+//
+// History (sampled, bilinear, from a separate descriptor set):
+//   samplerPrev        rgba16f  previous frame's denoised color, reprojected via inMotion
+//   samplerPrevNormal  rgba16f  previous frame's normal
+//   samplerPrevDepth   r32f     previous frame's depth
+//
+// Output:
+//   outColor rgba16f   denoised HDR color (consumed by FSR / XeSS / DLSS-RR)
+//
+// Algorithm (single-pass joint bilateral + temporal blend, deliberately NOT iterative a-trous
+// wavelet — the upscaler does the heavy lifting; this pass is just enough to suppress per-pixel
+// Monte-Carlo noise before the upscaler reads the buffers):
+//
+//   1. 3x3 joint bilateral on (color, normal, depth) — preserves geometric edges, suppresses
+//      per-pixel variance.
+//   2. Reproject prev via inMotion. Test disocclusion by prev depth/normal vs current — if any
+//      disagree, history is rejected (the previous frame's pixel was occluded by something new).
+//   3. Temporal blend: history = mix(bilateral, reproj_prev, t) where t depends on (a) the
+//      disocclusion test and (b) the per-pixel variance of the bilateral result (low variance =
+//      high confidence = more history reuse).
+//
+// Why not iterative a-trous: the variance-driven 3x3 already removes most of the high-frequency
+// noise; further iterations cost dispatch + bandwidth and the upscaler's own temporal accumulator
+// covers the residual. The point of this pass is to get the upscaler clean-enough input, not to
+// produce a final-quality image itself.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Set 0: current-frame storage images + output.
+layout(set = 0, binding = 0, rgba16f) readonly  uniform image2D inColor;
+layout(set = 0, binding = 1, rgba16f) readonly  uniform image2D inNormal;
+layout(set = 0, binding = 2, r32f)    readonly  uniform image2D inDepth;
+layout(set = 0, binding = 3, rg16f)   readonly  uniform image2D inMotion;
+layout(set = 0, binding = 4, rgba16f) writeonly  uniform image2D outColor;
+
+// Set 1: previous-frame history, sampled with bilinear. (Format qualifiers like rgba16f only apply to
+// image2D; sampled textures inherit their format from the bound VkImage view. The descriptor type is
+// COMBINED_IMAGE_SAMPLER (with bilinear sampling), so use sampler2D and plain texture() — no separate
+// sampler binding required.)
+layout(set = 1, binding = 0) uniform sampler2D samplerPrev;
+layout(set = 1, binding = 1) uniform sampler2D samplerPrevNormal;
+layout(set = 1, binding = 2) uniform sampler2D samplerPrevDepth;
+
+// Per-frame params via push constants:
+//   sigmaDepth   (linear depth, post-NDC remap; ~0.05 reads as "tolerate 5cm of depth difference")
+//   sigmaNormal  (1 - dot; ~0.1 reads as "tolerate ~25° of normal difference")
+//   sigmaColor   (HDR radiance; ~0.5 reads as "tolerate ~half a unit of HDR luminance per channel")
+//   temporalMin  floor of history weight (e.g. 0 = pure bilateral on disocclusion)
+//   temporalMax  ceiling of history weight (e.g. 0.85 = strong reuse on stable surfaces)
+//   motionScale  gMotion is in render pixels; multiply by this to get UV delta (1.0/renderW)
+layout(push_constant) uniform DenoiseParams {
+    float sigmaDepth;
+    float sigmaNormal;
+    float sigmaColor;
+    float temporalMin;
+    float temporalMax;
+    float motionScale;
+    float _pad0;
+    float _pad1;
+} pc;
+
+float luma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inColor);
+    if (pos.x >= size.x || pos.y >= size.y) {
+        return;
+    }
+
+    vec3 cCenter = imageLoad(inColor, pos).rgb;
+    vec3 nCenter = imageLoad(inNormal, pos).xyz;
+    float dCenter = imageLoad(inDepth, pos).r;
+
+    // ---- 1. 3x3 joint bilateral filter on the noisy color ----
+    vec3 sum = vec3(0.0);
+    float sumW = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 np = pos + ivec2(dx, dy);
+            if (np.x < 0 || np.y < 0 || np.x >= size.x || np.y >= size.y) {
+                continue;
+            }
+            vec3 cN = imageLoad(inColor, np).rgb;
+            vec3 nN = imageLoad(inNormal, np).xyz;
+            float dN = imageLoad(inDepth, np).r;
+            float wD = exp(-(dCenter - dN) * (dCenter - dN) / (pc.sigmaDepth * pc.sigmaDepth));
+            float dotN = clamp(dot(nCenter, nN), -1.0, 1.0);
+            float wN = exp(-(1.0 - dotN) * (1.0 - dotN) / (pc.sigmaNormal * pc.sigmaNormal));
+            float lumaDiff = luma(cCenter - cN);
+            float wC = exp(-lumaDiff * lumaDiff / (pc.sigmaColor * pc.sigmaColor));
+            float w = wD * wN * wC;
+            sum += cN * w;
+            sumW += w;
+        }
+    }
+    vec3 bilat = sum / max(sumW, 1e-6);
+
+    // ---- 2. Reproject previous frame via motion vectors ----
+    vec2 mv = imageLoad(inMotion, pos).rg;
+    vec2 uv = (vec2(pos) + 0.5) / vec2(size);
+    vec2 prevUV = uv - mv * pc.motionScale;
+
+    bool inBounds = all(greaterThanEqual(prevUV, vec2(0.0))) && all(lessThanEqual(prevUV, vec2(1.0)));
+    vec3 prevC = inBounds ? texture(samplerPrev, prevUV).rgb : vec3(0.0);
+    vec3 prevN = inBounds ? texture(samplerPrevNormal, prevUV).xyz : vec3(0.0);
+    float prevD = inBounds ? texture(samplerPrevDepth, prevUV).r : 0.0;
+
+    // ---- 3. Disocclusion test: did the previous frame's pixel survive to this position? ----
+    // If prev depth/normal disagree with current, the previous pixel was occluded or replaced —
+    // don't trust the history. Use sigmaDepth/Normal to define a soft cut.
+    bool disoccluded = !inBounds;
+    if (inBounds) {
+        if (abs(prevD - dCenter) > 5.0 * pc.sigmaDepth) {
+            disoccluded = true;
+        }
+        if (clamp(dot(prevN, nCenter), -1.0, 1.0) < 1.0 - 5.0 * pc.sigmaNormal) {
+            disoccluded = true;
+        }
+    }
+
+    // Temporal weight: how confident are we in the history?
+    // - Disocclusion: clamp to temporalMin (usually 0 — pure bilateral).
+    // - Otherwise: high history when bilat matches reproj, low when they disagree (flicker / fireflies).
+    float wHist = 1.0 - exp(-luma(bilat - prevC) * luma(bilat - prevC)
+                            / (pc.sigmaColor * pc.sigmaColor * 16.0));
+    wHist = mix(pc.temporalMin, pc.temporalMax, wHist);
+    if (disoccluded) {
+        wHist = pc.temporalMin;
+    }
+
+    vec3 result = mix(bilat, prevC, wHist);
+    imageStore(outColor, pos, vec4(result, 1.0));
+}

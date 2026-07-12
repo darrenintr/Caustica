@@ -53,7 +53,13 @@ layout(push_constant) uniform PushAddr {
     uint frameIndex;
 } pcAddr;
 
-layout(location = 1) rayPayloadInEXT vec4 shadowVis;
+// Shadow ray payload — must match the ShadowRay declared in world.rgen / shadow.rmiss (same location 1).
+struct ShadowRay {
+    vec3 tint;
+    float waterT;
+    float escaped;
+};
+layout(location = 1) rayPayloadInEXT ShadowRay shadowVis;
 
 hitAttributeEXT vec2 attribs;
 
@@ -132,11 +138,11 @@ void main() {
     // the biome water color, then keep walking so submerged terrain is lit by colored transmission.
     if (bucket == BUCKET_WATER) {
         Prim pr = Prims(sec.primAddr).p[tri];
-        shadowVis.rgb *= mix(vec3(1.0), pr.tint.rgb, WATER_SHADOW_TINT);
-        // Record the NEAREST water crossing (any-hit order is arbitrary) in the otherwise-unused alpha
-        // lane. For an underwater shading point this is the exit point of its sun shadow ray, where
-        // world.rgen evaluates the wave-refraction caustic. visibility() seeds the -1 sentinel.
-        shadowVis.a = shadowVis.a < 0.0 ? gl_HitTEXT : min(shadowVis.a, gl_HitTEXT);
+        shadowVis.tint *= mix(vec3(1.0), pr.tint.rgb, WATER_SHADOW_TINT);
+        // Record the NEAREST water crossing (any-hit order is arbitrary) in the dedicated waterT lane. For an
+        // underwater shading point this is the exit point of its sun shadow ray, where world.rgen evaluates
+        // the wave-refraction caustic. visibility() seeds the -1 sentinel.
+        shadowVis.waterT = shadowVis.waterT < 0.0 ? gl_HitTEXT : min(shadowVis.waterT, gl_HitTEXT);
         ignoreIntersectionEXT;
         return;
     }
@@ -153,7 +159,7 @@ void main() {
     // alpha-lerp toward the raw average color: a per-channel extinction is derived from how dark that
     // average is, scaled by the average alpha (how much of the sprite is glass-colorant vs. see-through
     // frame), so richly saturated panes darken transmitted light non-linearly instead of just fading
-    // linearly toward flat paint. Multiplying into shadowVis.rgb (rather than mixing from a fresh
+    // linearly toward flat paint. Multiplying into shadowVis.tint (rather than mixing from a fresh
     // vec3(1.0)) blends this absorption with the light color already accumulated by any surfaces the
     // shadow ray crossed earlier — stacked colored panes compound correctly.
     if (bucket == BUCKET_TRANSLUCENT) {
@@ -165,7 +171,7 @@ void main() {
         // into the alpha-scaled term crushed it to near-zero for exactly the white/clear-glass case it's
         // meant to cover. Only the color-derived term scales with alpha (how saturated the pane's own tint
         // is); every translucent hit still pays the flat neutral cost regardless.
-        shadowVis.rgb *= exp(-colorExtinction * pr.mat.a - TRANSLUCENT_NEUTRAL_EXTINCTION);
+        shadowVis.tint *= exp(-colorExtinction * pr.mat.a - TRANSLUCENT_NEUTRAL_EXTINCTION);
         ignoreIntersectionEXT;
         return;
     }

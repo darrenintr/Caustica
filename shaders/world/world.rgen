@@ -4,10 +4,14 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-// SER builds two SPIR-V variants from this source. The shader body uses the EXT spelling everywhere; the
+// SER builds three SPIR-V variants from this source. The shader body uses the EXT spelling everywhere; the
 // CAUSTICA_SER_NV variant aliases that spelling to GL_NV_shader_invocation_reorder and expands the EXT fused
-// trace/reorder/execute helper into the equivalent NV three-step sequence.
-#ifdef CAUSTICA_SER_NV
+// trace/reorder/execute helper into the equivalent NV three-step sequence. The CAUSTICA_SER_NONE variant
+// targets GPUs with no Shader Execution Reordering extension at all (AMD RDNA, Intel Arc, older NVIDIA): it
+// collapses the fused helper into a plain traceRayEXT (no hit object, no reorder) and takes the no-SER branch
+// in visibility(). Every bounce site reads its result from `payload`, never from the hit object, so the
+// traceRayEXT expansion is functionally identical minus the reorder's scheduling win.
+#if defined(CAUSTICA_SER_NV)
 #extension GL_NV_shader_invocation_reorder : require
 #define hitObjectEXT hitObjectNV
 #define hitObjectTraceRayEXT hitObjectTraceRayNV
@@ -15,6 +19,13 @@
 #define hitObjectIsMissEXT hitObjectIsMissNV
 #define hitObjectTraceReorderExecuteEXT(hitObject_, topLevel_, rayFlags_, cullMask_, sbtRecordOffset_, sbtRecordStride_, missIndex_, origin_, Tmin_, direction_, Tmax_, payload_) \
     { hitObjectTraceRayEXT(hitObject_, topLevel_, rayFlags_, cullMask_, sbtRecordOffset_, sbtRecordStride_, missIndex_, origin_, Tmin_, direction_, Tmax_, payload_); reorderThreadNV(hitObject_); hitObjectExecuteShaderEXT(hitObject_, payload_); }
+#elif defined(CAUSTICA_SER_NONE)
+// No SER: `hitObjectEXT hObj;` becomes a throwaway local and the fused trace/reorder/execute collapses to a
+// single traceRayEXT, which invokes the hit/miss shaders directly (they write `payload`, exactly as the
+// hit-object execute would). visibility()'s hit-object miss query is handled by its own #ifdef branch.
+#define hitObjectEXT float
+#define hitObjectTraceReorderExecuteEXT(hitObject_, topLevel_, rayFlags_, cullMask_, sbtRecordOffset_, sbtRecordStride_, missIndex_, origin_, Tmin_, direction_, Tmax_, payload_) \
+    traceRayEXT(topLevel_, rayFlags_, cullMask_, sbtRecordOffset_, sbtRecordStride_, missIndex_, origin_, Tmin_, direction_, Tmax_, payload_)
 #else
 #extension GL_EXT_shader_invocation_reorder : require
 #endif
@@ -111,7 +122,15 @@ struct Payload {
     uint rayCone;     // packHalf2x16(vec2(width, spread))
 };
 layout(location = 0) rayPayloadEXT Payload payload;
-layout(location = 1) rayPayloadEXT vec4 shadowVis; // rgb = transmittance; a = nearest water-crossing t (-1 = none)
+// Shadow / sun-visibility ray payload. `tint` and `waterT` were previously the .rgb / .a of a vec4; they are
+// split into a struct so the no-SER path can carry a dedicated `escaped` flag (written by shadow.rmiss)
+// WITHOUT clobbering the water-crossing t the water any-hit records — the two used to collide on the .a lane.
+struct ShadowRay {
+    vec3 tint;      // colored-glass / water shadow transmittance (accumulated by world.rahit)
+    float waterT;   // nearest water-crossing t along the shadow ray; -1 = none
+    float escaped;  // no-SER path only: 1.0 once the ray reaches shadow.rmiss (sun-visible), else 0.0
+};
+layout(location = 1) rayPayloadEXT ShadowRay shadowVis;
 
 const uint MATERIAL_OPAQUE = 0u;
 const uint MATERIAL_WATER = 1u;
@@ -237,7 +256,7 @@ vec3 applyWaterWaves(vec3 nGeo, vec2 worldXZ, float t) {
 // ---- Water caustics. Sunlight refracting through the waved surface converges/diverges before it
 // reaches an underwater receiver; the analytic wave field makes the true focusing factor computable
 // instead of faked with a scrolling texture. Where the shadow ray of an underwater NEE vertex crossed
-// water (recorded by world.rahit in shadowVis.a), evaluate the horizontal landing position of the
+// water (recorded by world.rahit in shadowVis.waterT), evaluate the horizontal landing position of the
 // refracted sun ray as a function of surface position and finite-difference it: the caustic intensity is
 // the inverse Jacobian determinant of that surface→floor mapping (area compression = brightening, real
 // fold caustics where det → 0). Because this uses the SAME wave field as the visible surface normals,
@@ -453,15 +472,28 @@ const uint SBT_SHADOW = TERRAIN_BUCKETS;
 const uint SBT_STRIDE_BUCKET = 1u;
 
 vec3 visibility(vec3 origin, vec3 dir, float tmax) {
-    shadowVis = vec4(1.0, 1.0, 1.0, -1.0); // a = water-crossing sentinel, filled by the water any-hit
+    shadowVis.tint = vec3(1.0);   // full transmittance until any-hit tints it
+    shadowVis.waterT = -1.0;      // water-crossing sentinel, filled by the water any-hit
+    shadowVis.escaped = 0.0;      // no-SER: shadow.rmiss flips this to 1.0 when the ray reaches the sun
     // Shadow SBT records run any-hit only for cutout/translucent/water. Cutout alpha-tests; translucent
-    // and water tint shadowVis.rgb and pass through. Solid blocks terminate traversal. There is no closest
-    // or miss shader worth executing, so use a hit object only as the traversal result.
+    // and water tint shadowVis.tint and pass through. Solid blocks terminate traversal.
+#ifdef CAUSTICA_SER_NONE
+    // No SER: trace with a real miss shader (SBT miss index 1 = shadow.rmiss) that marks escape into
+    // shadowVis.escaped. TerminateOnFirstHit + SkipClosestHit means an opaque blocker ends traversal before
+    // the miss runs (escaped stays 0.0 → fully shadowed); reaching open sky runs shadow.rmiss (escaped = 1.0).
+    traceRayEXT(topLevelAS,
+                gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, 1u, origin, RAY_TMIN, dir, tmax, 1);
+    return shadowVis.escaped > 0.5 ? shadowVis.tint : vec3(0.0);
+#else
+    // SER: trace-without-execute; the hit object's miss state IS the visibility answer (no miss shader run),
+    // so there is no closest or miss shader worth executing here.
     hitObjectEXT hObj;
     hitObjectTraceRayEXT(hObj, topLevelAS,
                 gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
                 CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, 0u, origin, RAY_TMIN, dir, tmax, 1);
-    return hitObjectIsMissEXT(hObj) ? shadowVis.rgb : vec3(0.0);
+    return hitObjectIsMissEXT(hObj) ? shadowVis.tint : vec3(0.0);
+#endif
 }
 
 vec2 projectPrevNdc(vec3 worldPos) {
@@ -834,8 +866,8 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
             // Underwater receiver whose shadow ray crossed a water surface: scale the direct light by
             // the wave-refraction caustic at the exit point. Focusing scales the incident irradiance,
             // so it applies to the whole NEE term (diffuse + specular).
-            if (inWater && waterWaves && shadowVis.a > 0.0) {
-                vis *= waterCaustic(p + lightDir * shadowVis.a, lightDir, shadowVis.a);
+            if (inWater && waterWaves && shadowVis.waterT > 0.0) {
+                vis *= waterCaustic(p + lightDir * shadowVis.waterT, lightDir, shadowVis.waterT);
             }
             if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
                 vec3 brdf = diffAlb * INV_PI; // Lambertian diffuse (f = albedo/PI)
@@ -865,8 +897,8 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
                 vec3 visB = visibility(hitPos - n * SURF_BIAS, lightDir, 10000.0);
                 // Same caustic as the front-face NEE — underwater kelp/seagrass transmission should
                 // flicker with the same light bands as the floor around it.
-                if (inWater && waterWaves && shadowVis.a > 0.0) {
-                    visB *= waterCaustic(hitPos + lightDir * shadowVis.a, lightDir, shadowVis.a);
+                if (inWater && waterWaves && shadowVis.waterT > 0.0) {
+                    visB *= waterCaustic(hitPos + lightDir * shadowVis.waterT, lightDir, shadowVis.waterT);
                 }
                 if (max(visB.r, max(visB.g, visB.b)) > 0.0) {
                     float cosT = dot(lightDir, rd);

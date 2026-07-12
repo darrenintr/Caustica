@@ -133,6 +133,7 @@ abstract class CompileShaders extends DefaultTask {
 			compileOne(src, spv, [])
 			if (src.name == "world.rgen") {
 				compileOne(src, new File(outDirFile, "world_nv.rgen.spv"), ["-DCAUSTICA_SER_NV=1"])
+				compileOne(src, new File(outDirFile, "world_noser.rgen.spv"), ["-DCAUSTICA_SER_NONE=1"])
 			}
 		}
 	}
@@ -256,7 +257,8 @@ def bundleNgxNatives = tasks.register("bundleNgxNatives") {
 		def missing = []
 		def dlssSdkRoot = dlssSdkRootProvider.orNull
 		if (dlssSdkRoot == null) {
-			throw new GradleException("DLSS_SDK environment variable is not set.")
+			logger.warn("DLSS_SDK environment variable is not set; skipping NGX/DLSS native bundle. Set it to the NVIDIA DLSS SDK root to enable DLSS / DLSS-RR / DLSS-FG (NVIDIA only). AMD (FSR) and Intel (XeSS) GPUs do not need this.")
+			return
 		}
 		selectedNgxNativePlatforms.each { platform ->
 			def platformShimFiles = fileTree(ngxShimOutDir) {
@@ -299,6 +301,189 @@ def bundleNgxNatives = tasks.register("bundleNgxNatives") {
 }
 
 sourceSets.main.resources.srcDir(files(ngxNativeGenRoot).builtBy(bundleNgxNatives))
+
+// ----- AMD FidelityFX SDK (FSR 3 / FSR 4) native bundle -----
+// Mirrors bundleNgxNatives above: reads the AMD FFX SDK runtime libraries from ${FFX_SDK} and
+// copies them into the mod resources. End users can also set -Dcaustica.fsr.path to point at a
+// pre-installed SDK; the env var is for builders.
+//
+// IMPORTANT: Caustica is a Vulkan path. AMD FFX SDK 2.x dropped the Vulkan runtime (the 2.x
+// binaries in Kits/FidelityFX/signedbin/ are D3D12-only — they would not load on Caustica's
+// Vulkan pipeline even if we bundled them). FSR 1.1.x (the last FSR release with Vulkan
+// binaries) is what the FsrUpscaler code path actually drives; we look for that layout.
+//
+// Layouts we try (any one with at least the loader + upscaler DLLs is enough; FG is optional):
+//   bin/Windows_x64/amd_fidelityfx_loader.dll, amd_fidelityfx_upscaler.dll,
+//                      amd_fidelityfx_framegeneration.dll
+//   bin/Linux_x64/   libamd_fidelityfx_loader.so, libamd_fidelityfx_upscaler.so,
+//                      libamd_fidelityfx_framegeneration.so
+def ffxSdkEnv = providers.environmentVariable("FFX_SDK")
+def ffxSdkRootProvider = ffxSdkEnv.map { file(it) }
+def fsrNativeGenRoot = layout.buildDirectory.dir("generated/fsr-natives")
+def fsrNativePlatforms = [
+	[
+		name: "windows-x64",
+		binaryDir: { sdkRoot -> new File(sdkRoot, "bin/Windows_x64") },
+		files: [
+			"amd_fidelityfx_loader.dll",
+			"amd_fidelityfx_upscaler.dll",
+			"amd_fidelityfx_framegeneration.dll"
+		]
+	],
+	[
+		name: "linux-x64",
+		binaryDir: { sdkRoot -> new File(sdkRoot, "bin/Linux_x64") },
+		files: [
+			"libamd_fidelityfx_loader.so",
+			"libamd_fidelityfx_upscaler.so",
+			"libamd_fidelityfx_framegeneration.so"
+		]
+	]
+]
+def fsrNativePlatformByName = fsrNativePlatforms.collectEntries { platform -> [(platform.name): platform] }
+def requestedFsrPlatformsRaw = (findProperty("fsrPlatforms") ?: "current").toString()
+		.split(",").collect { it.trim() }.findAll { !it.isEmpty() }
+def selectedFsrNativePlatforms
+if (requestedFsrPlatformsRaw.size() == 1 && requestedFsrPlatformsRaw[0].equalsIgnoreCase("all")) {
+	selectedFsrNativePlatforms = fsrNativePlatforms
+} else if (requestedFsrPlatformsRaw.size() == 1 && requestedFsrPlatformsRaw[0].equalsIgnoreCase("current")) {
+	if (currentNgxPlatform == null || !fsrNativePlatformByName.containsKey(currentNgxPlatform)) {
+		// Fall back to empty (no platforms bundled) rather than failing the build.
+		selectedFsrNativePlatforms = []
+	} else {
+		selectedFsrNativePlatforms = [fsrNativePlatformByName[currentNgxPlatform]]
+	}
+} else {
+	def unknownPlatforms = requestedFsrPlatformsRaw.findAll { !fsrNativePlatformByName.containsKey(it) }
+	if (!unknownPlatforms.empty) {
+		throw new GradleException("Unknown FSR platform(s): ${unknownPlatforms.join(', ')}")
+	}
+	selectedFsrNativePlatforms = requestedFsrPlatformsRaw.collect { fsrNativePlatformByName[it] }
+}
+
+def bundleFsrNatives = tasks.register("bundleFsrNatives") {
+	group = "build"
+	description = "Bundles AMD FidelityFX SDK (FSR 3 / FSR 4) runtime libraries into the mod resources. Skipped silently when FFX_SDK is not set."
+
+	outputs.dir(fsrNativeGenRoot)
+	outputs.upToDateWhen { false }
+
+	doLast {
+		delete(fsrNativeGenRoot)
+		def ffxSdkRoot = ffxSdkRootProvider.orNull
+		if (ffxSdkRoot == null) {
+			logger.warn("FFX_SDK environment variable is not set; skipping FSR native bundle. Set it to the AMD FidelityFX SDK 2.1+ root to enable FSR 3 / FSR 4 (RDNA 3 INT8) support.")
+			return
+		}
+		def missing = []
+		selectedFsrNativePlatforms.each { platform ->
+			def platformBinaryDir = platform.binaryDir(ffxSdkRoot)
+			def missingIncludes = platform.files.findAll { fileName ->
+				!new File(platformBinaryDir, fileName).exists()
+			}
+			if (!missingIncludes.empty) {
+				missing += "${platform.name} libraries ${missingIncludes.join(', ')} in ${platformBinaryDir}"
+			}
+		}
+		if (!missing.empty) {
+			throw new GradleException("Missing FSR native inputs:\n - " + missing.join("\n - "))
+		}
+		copy {
+			selectedFsrNativePlatforms.each { platform ->
+				from(platform.binaryDir(ffxSdkRoot)) {
+					include platform.files
+					into "caustica/natives/${platform.name}"
+				}
+			}
+			into fsrNativeGenRoot
+		}
+	}
+}
+
+sourceSets.main.resources.srcDir(files(fsrNativeGenRoot).builtBy(bundleFsrNatives))
+
+// ----- Intel XeSS SDK native bundle -----
+// Mirrors bundleNgxNatives / bundleFsrNatives. Required layout inside XESS_SDK:
+//   bin/libxess.dll     (Windows; XeSS 3.x puts every platform's runtime DLL into bin/ directly)
+//   bin/libxess.so      (Linux — note: not currently distributed on the public intel/xess GitHub
+//                        release; Linux XeSS binaries are gated to Intel's developer zone)
+//   bin/libxess_fg.dll  (XeSS-FG; only present in 3.0+; optional)
+//   bin/libxell.dll     (XeLL low-latency; optional for our use today)
+def xessSdkEnv = providers.environmentVariable("XESS_SDK")
+def xessSdkRootProvider = xessSdkEnv.map { file(it) }
+def xessNativeGenRoot = layout.buildDirectory.dir("generated/xess-natives")
+def xessNativePlatforms = [
+	[
+		name: "windows-x64",
+		binaryDir: { sdkRoot -> new File(sdkRoot, "bin") },
+		files: ["libxess.dll", "libxess_fg.dll", "libxell.dll"]
+	],
+	[
+		name: "linux-x64",
+		binaryDir: { sdkRoot -> new File(sdkRoot, "bin") },
+		files: ["libxess.so", "libxess_fg.so", "libxell.so"]
+	]
+]
+def xessNativePlatformByName = xessNativePlatforms.collectEntries { platform -> [(platform.name): platform] }
+def requestedXessPlatformsRaw = (findProperty("xessPlatforms") ?: "current").toString()
+		.split(",").collect { it.trim() }.findAll { !it.isEmpty() }
+def selectedXessNativePlatforms
+if (requestedXessPlatformsRaw.size() == 1 && requestedXessPlatformsRaw[0].equalsIgnoreCase("all")) {
+	selectedXessNativePlatforms = xessNativePlatforms
+} else if (requestedXessPlatformsRaw.size() == 1 && requestedXessPlatformsRaw[0].equalsIgnoreCase("current")) {
+	if (currentNgxPlatform == null || !xessNativePlatformByName.containsKey(currentNgxPlatform)) {
+		selectedXessNativePlatforms = []
+	} else {
+		selectedXessNativePlatforms = [xessNativePlatformByName[currentNgxPlatform]]
+	}
+} else {
+	def unknownPlatforms = requestedXessPlatformsRaw.findAll { !xessNativePlatformByName.containsKey(it) }
+	if (!unknownPlatforms.empty) {
+		throw new GradleException("Unknown XeSS platform(s): ${unknownPlatforms.join(', ')}")
+	}
+	selectedXessNativePlatforms = requestedXessPlatformsRaw.collect { xessNativePlatformByName[it] }
+}
+
+def bundleXessNatives = tasks.register("bundleXessNatives") {
+	group = "build"
+	description = "Bundles Intel XeSS SDK runtime libraries into the mod resources. Skipped silently when XESS_SDK is not set."
+
+	outputs.dir(xessNativeGenRoot)
+	outputs.upToDateWhen { false }
+
+	doLast {
+		delete(xessNativeGenRoot)
+		def xessSdkRoot = xessSdkRootProvider.orNull
+		if (xessSdkRoot == null) {
+			logger.warn("XESS_SDK environment variable is not set; skipping XeSS native bundle. Set it to the Intel XeSS SDK 2.0+ root to enable XeSS / XeSS-FG (Intel Arc + cross-vendor DP4a) support.")
+			return
+		}
+		def missing = []
+		selectedXessNativePlatforms.each { platform ->
+			def platformBinaryDir = platform.binaryDir(xessSdkRoot)
+			def missingIncludes = platform.files.findAll { fileName ->
+				!new File(platformBinaryDir, fileName).exists()
+			}
+			if (!missingIncludes.empty) {
+				missing += "${platform.name} libraries ${missingIncludes.join(', ')} in ${platformBinaryDir}"
+			}
+		}
+		if (!missing.empty) {
+			throw new GradleException("Missing XeSS native inputs:\n - " + missing.join("\n - "))
+		}
+		copy {
+			selectedXessNativePlatforms.each { platform ->
+				from(platform.binaryDir(xessSdkRoot)) {
+					include platform.files
+					into "caustica/natives/${platform.name}"
+				}
+			}
+			into xessNativeGenRoot
+		}
+	}
+}
+
+sourceSets.main.resources.srcDir(files(xessNativeGenRoot).builtBy(bundleXessNatives))
 
 tasks.withType(JavaCompile).configureEach {
 	it.options.release = 25

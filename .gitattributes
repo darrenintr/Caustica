@@ -1,0 +1,35 @@
+# Caustica — line ending policy.
+#
+# The project is authored on Windows; PowerShell + batch scripts MUST stay CRLF
+# so cmd.exe and PowerShell.exe parse them correctly. Everything else is LF so
+# that .patch review, .git blame, and cross-platform editors stay clean.
+#
+# `text=auto` lets git decide per-content (avoiding spurious diffs on binary
+# blobs); explicit `eol` overrides pin the line endings on the scripts below.
+*               text=auto eol=lf
+
+# Java + GLSL/SPIR-V + build tooling — must be LF
+*.java          text eol=lf
+*.gradle        text eol=lf
+gradlew         text eol=lf
+*.glsl          text eol=lf
+*.comp          text eol=lf
+*.rgen          text eol=lf
+*.rchit         text eol=lf
+*.rahit         text eol=lf
+*.rmiss         text eol=lf
+*.rcall         text eol=lf
+*.vert          text eol=lf
+*.frag          text eol=lf
+
+# Windows-native scripts — must stay CRLF for cmd.exe / PowerShell.exe
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+*.ps1           text eol=crlf
+
+# JSON config (lang files, fabric.mod.json, mixins) — LF
+*.json          text eol=lf
+
+# Markdown + plain text — LF
+*.md            text eol=lf
+*.txt           text eol=lf

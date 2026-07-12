@@ -91,9 +91,12 @@ public final class RtDeviceBringup {
             VK_KHR_RAY_QUERY_EXTENSION_NAME);
 
     /**
-     * Shader Execution Reordering is still required by Caustica's current world raygen, but the SPIR-V
-     * extension differs between the original NVIDIA path and the ratified EXT path. Prefer NV when present
-     * for older NVIDIA drivers, otherwise use EXT.
+     * Shader Execution Reordering — a scheduling optimisation for the world raygen, NOT a hard requirement.
+     * The SPIR-V extension differs between the original NVIDIA path and the ratified EXT path; prefer EXT when
+     * present, else NV for older NVIDIA drivers. When a device exposes neither (AMD RDNA, Intel Arc, older
+     * NVIDIA), {@link SerBackend#NONE} is selected and the {@code world_noser.rgen.spv} variant — which traces
+     * with plain {@code traceRayEXT} instead of a hit object — is used, so RT still comes up. SER is therefore
+     * treated like the other optional extensions below, never gating {@link #firstUnsupported}.
      */
     public static final List<String> SER_EXTENSIONS = List.of(
             VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME,
@@ -132,7 +135,7 @@ public final class RtDeviceBringup {
     private static boolean loggedUnavailable;
 
     private enum SerBackend {
-        NONE("none", null, "world.rgen.spv"),
+        NONE("none", null, "world_noser.rgen.spv"),
         NV("NV", VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME, "world_nv.rgen.spv"),
         EXT("EXT", VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME, "world.rgen.spv");
 
@@ -255,10 +258,8 @@ public final class RtDeviceBringup {
                 return ext;
             }
         }
-        if (selectSerBackend(physicalDevice) == SerBackend.NONE) {
-            return VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME + " or "
-                    + VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME;
-        }
+        // SER is intentionally NOT checked here: a device without it still comes up RT-capable via the
+        // no-SER raygen variant (see SER_EXTENSIONS / SerBackend.NONE). Only RT_EXTENSIONS are mandatory.
         return null;
     }
 
@@ -273,7 +274,7 @@ public final class RtDeviceBringup {
             }
         }
         String serExtension = selectSerBackend(physicalDevice).extensionName;
-        if (!augmentedExtensions.contains(serExtension)) {
+        if (serExtension != null && !augmentedExtensions.contains(serExtension)) {
             augmentedExtensions.add(serExtension);
         }
         for (String ext : supportedOptionalExtensions(physicalDevice)) {
@@ -314,13 +315,18 @@ public final class RtDeviceBringup {
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
                 VkPhysicalDeviceRayQueryFeaturesKHR.SIZEOF);
         SerBackend selectedSerBackend = selectSerBackend(physicalDevice);
-        VulkanPNextStruct serStruct = selectedSerBackend == SerBackend.NV
-                ? new VulkanPNextStruct(
-                        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV,
-                        VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV.SIZEOF)
-                : new VulkanPNextStruct(
-                        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT,
-                        VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.SIZEOF);
+        // SER feature struct only when the device actually has an SER extension; SerBackend.NONE (no-SER
+        // raygen) enables no reorder feature and comes up RT-capable without it.
+        VulkanPNextStruct serStruct = null;
+        if (selectedSerBackend == SerBackend.NV) {
+            serStruct = new VulkanPNextStruct(
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV,
+                    VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV.SIZEOF);
+        } else if (selectedSerBackend == SerBackend.EXT) {
+            serStruct = new VulkanPNextStruct(
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT,
+                    VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.SIZEOF);
+        }
         // bufferDeviceAddress merges into vanilla's existing Vulkan12Features struct.
         features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "bufferDeviceAddress",
                 VkPhysicalDeviceVulkan12Features.BUFFERDEVICEADDRESS));
@@ -346,10 +352,12 @@ public final class RtDeviceBringup {
                 VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR.RAYTRACINGPOSITIONFETCH));
         features.add(new VulkanFeature(rayQueryStruct, "rayQuery",
                 VkPhysicalDeviceRayQueryFeaturesKHR.RAYQUERY));
-        features.add(new VulkanFeature(serStruct, "rayTracingInvocationReorder",
-                selectedSerBackend == SerBackend.NV
-                        ? VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV.RAYTRACINGINVOCATIONREORDER
-                        : VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.RAYTRACINGINVOCATIONREORDER));
+        if (serStruct != null) {
+            features.add(new VulkanFeature(serStruct, "rayTracingInvocationReorder",
+                    selectedSerBackend == SerBackend.NV
+                            ? VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV.RAYTRACINGINVOCATIONREORDER
+                            : VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.RAYTRACINGINVOCATIONREORDER));
+        }
 
         // Optional: wideLines (core VK10 feature, no extension). Lets the world-overlay pass (block
         // outline) draw a real thick native line via a raster pipeline's lineWidth / VK_DYNAMIC_STATE_LINE
@@ -408,7 +416,8 @@ public final class RtDeviceBringup {
                 "Ray tracing: enabling {} + {}{}{} + features [bufferDeviceAddress, accelerationStructure, rayTracingPipeline, rayQuery, rayTracingInvocationReorder({})"
                         + (wideLinesEnabled ? ", wideLines(max=" + maxLineWidth + ")" : "")
                         + (ommEnabled ? ", opacityMicromap" : "") + "] + overlayMsaa=" + overlayMsaaSamples + "x on [{}]",
-                RT_EXTENSIONS, serBackend.extensionName, ommEnabled ? " + " + OPTIONAL_RT_EXTENSIONS : "",
+                RT_EXTENSIONS, serBackend.extensionName != null ? serBackend.extensionName : "no SER extension",
+                ommEnabled ? " + " + OPTIONAL_RT_EXTENSIONS : "",
                 reflexEnabled ? " + " + REFLEX_EXTENSIONS : "", serBackend.label, physicalDevice.deviceName());
     }
 

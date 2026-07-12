@@ -4,6 +4,7 @@ import com.electronwill.nightconfig.core.CommentedConfig;
 import com.electronwill.nightconfig.core.file.CommentedFileConfig;
 import com.electronwill.nightconfig.core.file.FileNotFoundAction;
 import com.electronwill.nightconfig.toml.TomlFormat;
+import dev.comfyfluffy.caustica.upscale.UpscalerSelector;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -57,9 +58,12 @@ public final class CausticaConfig {
         @SuppressWarnings("unused")
         Object[] touch = {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Omm.ENABLED,
-            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
+            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED, Rt.Denoise.MODE, Rt.Denoise.SIGMA_DEPTH, Rt.Denoise.SIGMA_NORMAL, Rt.Denoise.SIGMA_COLOR, Rt.Denoise.TEMPORAL_MAX,
             Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.FrameStats.ENABLED,
-            Rt.Hdr.ENABLED, Ngx.PATH,
+            Rt.Hdr.ENABLED, Rt.Upscaler.MODE, Rt.Upscaler.QUALITY, Rt.Upscaler.SHARPEN, Rt.Upscaler.SHARPNESS,
+            Rt.Fsr.PATH, Rt.Fsr.FORCE_FSR_3, Rt.FrameGen.MODE, Rt.FrameGen.MULTI_FRAME_COUNT,
+            Rt.XeSs.PATH, Rt.XeSs.MODE,
+            Ngx.PATH,
         };
     }
 
@@ -517,6 +521,109 @@ public final class CausticaConfig {
         }
     }
 
+    /**
+     * String-backed enum setting. Stores the enum's {@code name()} (stable across renames) so the TOML file
+     * doesn't break if the enum's display label changes. The {@code key} mapping is separate — readers that
+     * want the {@code key} style (e.g. {@code "fsr-4"} for {@link UpscalerMode#FSR_4}) call
+     * {@link #valueKey()}.
+     */
+    public static final class EnumSetting<T extends Enum<T>> implements RuntimeSetting<T> {
+        private final String key;
+        private final String tomlPath;
+        private final T defaultValue;
+        private final Class<T> enumClass;
+        private final java.util.function.Function<String, T> fromKey;
+        private volatile T value;
+
+        private EnumSetting(String key, String tomlPath, T defaultValue, Class<T> enumClass,
+                            java.util.function.Function<String, T> fromKey) {
+            this.key = key;
+            this.tomlPath = tomlPath;
+            this.defaultValue = defaultValue;
+            this.enumClass = enumClass;
+            this.fromKey = fromKey;
+            this.value = resolveInitial();
+            SETTINGS.add(this);
+        }
+
+        @Override
+        public String key() { return key; }
+        @Override
+        public String tomlPath() { return tomlPath; }
+        @Override
+        public T defaultValue() { return defaultValue; }
+        @Override
+        public T get() { return value; }
+        public T value() { return value; }
+        /** Returns the enum's {@code key()} (e.g. {@code "fsr-4"}), or {@code null} for the default
+         *  sentinel. Used by UIs that want the short, kebab-case form. */
+        public String valueKey() {
+            try {
+                return (String) enumClass.getMethod("key").invoke(value);
+            } catch (Throwable t) {
+                return value.name();
+            }
+        }
+        /** Returns the current value as the matching {@code UpscalerSelector.Mode} when applicable, or
+         *  {@code AUTO} as a safe default. Used by the selector to read the requested mode. */
+        public UpscalerSelector.Mode valueEnum() {
+            if (enumClass == UpscalerMode.class) {
+                UpscalerMode m = (UpscalerMode) value;
+                return switch (m) {
+                    case OFF -> UpscalerSelector.Mode.OFF;
+                    case AUTO -> UpscalerSelector.Mode.AUTO;
+                    case DLSS_RR -> UpscalerSelector.Mode.DLSS_RR;
+                    case FSR_3 -> UpscalerSelector.Mode.FSR_3;
+                    case FSR_4 -> UpscalerSelector.Mode.FSR_4;
+                    case XESS -> UpscalerSelector.Mode.XESS;
+                };
+            }
+            if (enumClass == FrameGenMode.class) {
+                FrameGenMode m = (FrameGenMode) value;
+                return switch (m) {
+                    case OFF -> UpscalerSelector.Mode.OFF;
+                    case AUTO -> UpscalerSelector.Mode.AUTO;
+                    case DLSSG -> UpscalerSelector.Mode.DLSS_RR; // not used; kept for completeness
+                    case FSR_3, FSR_4, XESS -> UpscalerSelector.Mode.AUTO; // framegen has its own mapping
+                };
+            }
+            return UpscalerSelector.Mode.AUTO;
+        }
+
+        @Override
+        public void set(T value) {
+            this.value = value != null ? value : defaultValue;
+        }
+
+        @Override
+        public void reloadFromSystemProperties() {
+            set(fromKey.apply(System.getProperty(key)));
+        }
+
+        @Override
+        public void writeToFile(CommentedConfig config) {
+            config.set(tomlPath, value.name());
+        }
+
+        private T resolveInitial() {
+            String prop = System.getProperty(key);
+            if (prop != null) {
+                T parsed = fromKey.apply(prop);
+                if (parsed != null) return parsed;
+            }
+            String fromFile = fileString(tomlPath);
+            if (fromFile != null) {
+                // Accept both the name (e.g. "FSR_4") and the key (e.g. "fsr-4") on read.
+                for (T m : enumClass.getEnumConstants()) {
+                    if (m.name().equalsIgnoreCase(fromFile)) return m;
+                }
+                T parsed = fromKey.apply(fromFile);
+                if (parsed != null) return parsed;
+            }
+            return defaultValue;
+        }
+    }
+
     public static final class Rt {
         public static final BooleanSetting ENABLED = bool("caustica.rt", "enabled", true);
         public static final IntSetting WORKER_THREADS =
@@ -635,6 +742,102 @@ public final class CausticaConfig {
             public static final IntSetting QUALITY = intValue("caustica.rt.dlssRr.quality", "dlss-rr.quality", 0);
 
             private DlssRr() {
+            }
+        }
+
+        /**
+         * Upscaler selection. Default AUTO; the selector resolves at session start to whatever the device
+         * supports best (NVIDIA → DLSS-RR, AMD RDNA 3/4 → FSR 4.1 INT8, else FSR 3, else XeSS DP4a, else
+         * off). Force a specific mode with {@code mode = "dlss-rr"} / {@code "fsr-3"} / {@code "fsr-4"} /
+         * {@code "xess"} / {@code "off"}. Quality maps to each SDK's native enum (DLSS-RR uses NGX
+         * perf-quality; FSR / XeSS use 0=NATIVE..4=ULTRA_PERF).
+         */
+        public static final class Upscaler {
+            public static final EnumSetting<UpscalerMode> MODE = enumSetting("caustica.rt.upscaler", "upscaler.mode",
+                    UpscalerMode.AUTO, UpscalerMode.class, UpscalerMode::fromKey);
+            public static final IntSetting QUALITY = clampedInt("caustica.rt.upscaler.quality", "upscaler.quality",
+                    1, 0, 4);
+            public static final BooleanSetting SHARPEN = bool("caustica.rt.upscaler.sharpening", "upscaler.sharpening",
+                    true);
+            public static final FloatSetting SHARPNESS = clampedFloat("caustica.rt.upscaler.sharpness",
+                    "upscaler.sharpness", 0.5f, 0.0f, 1.0f);
+
+            private Upscaler() {
+            }
+        }
+
+        /**
+         * AMD FidelityFX runtime configuration. {@code path} overrides the bundled native location (the
+         * mod ships the FFX SDK loader + per-feature DLLs at {@code caustica-fsr/natives/} so end users
+         * usually don't need to set this). {@code forceFsr3} forces the FFX upscaler to use the FSR 3 model
+         * even when the SDK bundle contains an FSR 4 model — useful for diagnosing FSR 4 instability on
+         * RDNA 3.
+         */
+        public static final class Fsr {
+            public static final OptionalStringSetting PATH = optionalString("caustica.fsr.path", "fsr.path");
+            public static final EnumSetting<FsrForceMode> FORCE_FSR_3 = enumSetting("caustica.fsr.forceFsr3",
+                    "fsr.force-fsr-3", FsrForceMode.AUTO, FsrForceMode.class, FsrForceMode::fromKey);
+
+            private Fsr() {
+            }
+        }
+
+        /**
+         * Frame generation selection. Default AUTO; matches the active upscaler (DLSS-RR → DLSSG; FSR 4 → FSR
+         * 4 FG; FSR 3 → FSR 3 FG; XeSS → XeSS-FG) for best feature parity. Set {@code mode = "off"} to
+         * disable.
+         */
+        public static final class FrameGen {
+            public static final EnumSetting<FrameGenMode> MODE = enumSetting("caustica.rt.framegen", "framegen.mode",
+                    FrameGenMode.AUTO, FrameGenMode.class, FrameGenMode::fromKey);
+            public static final IntSetting MULTI_FRAME_COUNT = intAtLeast("caustica.rt.framegen.multiFrameCount",
+                    "framegen.multi-frame-count", 1, 1);
+
+            private FrameGen() {
+            }
+        }
+
+        /**
+         * Intel XeSS runtime configuration. {@code path} overrides the bundled native location (the mod ships
+         * the XeSS runtime DLLs at {@code caustica-xess/natives/}). {@code mode} selects the SDK's execution
+         * path: AUTO = XMX on Arc / Xe-LPG, DP4a fallback on NVIDIA / AMD; XMX_FORCE = require XMX and fail
+         * if unavailable; DP4A_FORCE = DP4a only (broader device support, slightly lower quality).
+         */
+        public static final class XeSs {
+            public static final OptionalStringSetting PATH = optionalString("caustica.xess.path", "xess.path");
+            public static final EnumSetting<XeSsMode> MODE = enumSetting("caustica.xess.mode", "xess.mode",
+                    XeSsMode.AUTO, XeSsMode.class, XeSsMode::fromKey);
+
+            private XeSs() {
+            }
+        }
+
+        /**
+         * Caustica's internal SVGF-lite denoise pass. Default-on for any non-DLSS-RR path (FSR / XeSS
+         * don't have a path-tracing-specific denoise, so the input has to be cleaner for their
+         * temporal accumulators to lock on); off for DLSS-RR (which has its own denoise and would
+         * just pay the cost without quality gain). Set {@code mode = "off"} to disable; "svgf" forces
+         * on regardless of the upscaler.
+         */
+        public static final class Denoise {
+            public static final StringSetting MODE = string("caustica.rt.denoise.mode", "denoise.mode", "auto",
+                    v -> {
+                        String s = v == null ? "auto" : v.toLowerCase();
+                        if (s.equals("auto") || s.equals("off") || s.equals("svgf") || s.equals("on")) {
+                            return s.equals("on") ? "svgf" : s; // "on" is a legacy alias for "svgf"
+                        }
+                        return "auto";
+                    });
+            public static final FloatSetting SIGMA_DEPTH = clampedFloat("caustica.rt.denoise.sigmaDepth",
+                    "denoise.sigma-depth", 0.05f, 0.001f, 1.0f);
+            public static final FloatSetting SIGMA_NORMAL = clampedFloat("caustica.rt.denoise.sigmaNormal",
+                    "denoise.sigma-normal", 0.1f, 0.01f, 1.0f);
+            public static final FloatSetting SIGMA_COLOR = clampedFloat("caustica.rt.denoise.sigmaColor",
+                    "denoise.sigma-color", 0.5f, 0.01f, 10.0f);
+            public static final FloatSetting TEMPORAL_MAX = clampedFloat("caustica.rt.denoise.temporalMax",
+                    "denoise.temporal-max", 0.85f, 0.0f, 0.99f);
+
+            private Denoise() {
             }
         }
 
@@ -767,6 +970,94 @@ public final class CausticaConfig {
         }
     }
 
+    /** Upscaler mode (config). The {@code UpscalerSelector.Mode} enum is the resolved mode; this one is the
+     *  user-requested mode (which may differ if the device can't run the requested SDK). */
+    public enum UpscalerMode {
+        OFF("off"),
+        AUTO("auto"),
+        DLSS_RR("dlss-rr"),
+        FSR_3("fsr-3"),
+        FSR_4("fsr-4"),
+        XESS("xess");
+
+        final String key;
+        UpscalerMode(String key) { this.key = key; }
+        public String key() { return key; }
+
+        public static UpscalerMode fromKey(String s) {
+            if (s == null) return AUTO;
+            for (UpscalerMode m : values()) {
+                if (m.key.equalsIgnoreCase(s) || m.name().equalsIgnoreCase(s)) return m;
+            }
+            return AUTO;
+        }
+    }
+
+    /** Frame gen mode (config). Like {@link UpscalerMode} but for frame gen; the selector may pick a
+     *  different resolved mode if the device can't run the requested SDK. */
+    public enum FrameGenMode {
+        OFF("off"),
+        AUTO("auto"),
+        DLSSG("dlssg"),
+        FSR_3("fsr-3"),
+        FSR_4("fsr-4"),
+        XESS("xess");
+
+        final String key;
+        FrameGenMode(String key) { this.key = key; }
+        public String key() { return key; }
+
+        public static FrameGenMode fromKey(String s) {
+            if (s == null) return AUTO;
+            for (FrameGenMode m : values()) {
+                if (m.key.equalsIgnoreCase(s) || m.name().equalsIgnoreCase(s)) return m;
+            }
+            return AUTO;
+        }
+    }
+
+    /** Whether the FFX upscaler should be forced to the FSR 3 model even when the bundle ships an FSR 4
+     *  model. AUTO picks per-device (RDNA 3 → FSR 4.1 INT8; RDNA 2 / older → FSR 3); FORCE pins the
+     *  choice, useful for diagnosing FSR 4 instability. */
+    public enum FsrForceMode {
+        AUTO("auto"),
+        FORCE_FSR_3("force-fsr-3"),
+        FORCE_FSR_4("force-fsr-4");
+
+        final String key;
+        FsrForceMode(String key) { this.key = key; }
+        public String key() { return key; }
+
+        public static FsrForceMode fromKey(String s) {
+            if (s == null) return AUTO;
+            for (FsrForceMode m : values()) {
+                if (m.key.equalsIgnoreCase(s) || m.name().equalsIgnoreCase(s)) return m;
+            }
+            return AUTO;
+        }
+    }
+
+    /** Intel XeSS SDK execution path. AUTO picks the best (XMX on Intel, DP4a elsewhere); FORCE_XMX
+     *  requires XMX (rejects non-XMX devices — used for diagnosing DP4a issues); FORCE_DP4A pins to DP4a
+     *  (broader device support, lower quality). */
+    public enum XeSsMode {
+        AUTO("auto"),
+        FORCE_XMX("force-xmx"),
+        FORCE_DP4A("force-dp4a");
+
+        final String key;
+        XeSsMode(String key) { this.key = key; }
+        public String key() { return key; }
+
+        public static XeSsMode fromKey(String s) {
+            if (s == null) return AUTO;
+            for (XeSsMode m : values()) {
+                if (m.key.equalsIgnoreCase(s) || m.name().equalsIgnoreCase(s)) return m;
+            }
+            return AUTO;
+        }
+    }
+
     private static BooleanSetting bool(String key, String tomlPath, boolean fallback) {
         return new BooleanSetting(key, tomlPath, fallback);
     }
@@ -777,6 +1068,12 @@ public final class CausticaConfig {
 
     private static OptionalStringSetting optionalString(String key, String tomlPath) {
         return new OptionalStringSetting(key, tomlPath);
+    }
+
+    private static <T extends Enum<T>> EnumSetting<T> enumSetting(String key, String tomlPath, T fallback,
+                                                                  Class<T> enumClass,
+                                                                  java.util.function.Function<String, T> fromKey) {
+        return new EnumSetting<>(key, tomlPath, fallback, enumClass, fromKey);
     }
 
     private static IntSetting intValue(String key, String tomlPath, int fallback) {

@@ -25,12 +25,32 @@ on:
       - "native/**"
       - "shaders/**"
       - "src/**"
+  # Manual trigger: maintainers can run a full bundle with private SDK binaries uploaded as
+  # artifacts. See the "Bundle full release" job below — it only runs on workflow_dispatch
+  # with the `bundle-full` input flag, and the FFX_SDK / XESS_SDK paths are passed in via the
+  # environment. Use this for cutting release tags when the upstream SDK binaries are
+  # available locally.
+  workflow_dispatch:
+    inputs:
+      bundle_full:
+        description: "Bundle FSR + XeSS native libraries (requires FFX_SDK + XESS_SDK env)"
+        type: boolean
+        default: false
 
 env:
+  # Public SDK refs
   DLSS_SDK_REF: v310.7.0
   DLSS_SDK_PATH: third_party/DLSS
+  FFX_SDK_REF: fsr3-v3.0.4
+  FFX_SDK_PATH: third_party/FidelityFX-SDK
+  XESS_SDK_REF: v3.0.1
+  XESS_SDK_PATH: third_party/xess
+
+  # NGX shim build config
   NGX_SHIM_CONFIG: release
   NGX_VENDOR_CONFIG: rel
+
+  # Vulkan SDK (CI only)
   VULKAN_SDK_VERSION: 1.4.350.0
   VULKAN_SDK_SHA256: b65f068ab36263559da49d7cacd7e7b9df23824ca8b68ccc522a2b06f5725df2
 
@@ -49,6 +69,20 @@ jobs:
           repository: NVIDIA/DLSS
           ref: ${{ env.DLSS_SDK_REF }}
           path: ${{ env.DLSS_SDK_PATH }}
+
+      - name: Checkout AMD FidelityFX SDK (source only)
+        uses: actions/checkout@v4
+        with:
+          repository: GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+          ref: ${{ env.FFX_SDK_REF }}
+          path: ${{ env.FFX_SDK_PATH }}
+
+      - name: Checkout Intel XeSS SDK (Windows binaries)
+        uses: actions/checkout@v4
+        with:
+          repository: intel/xess
+          ref: ${{ env.XESS_SDK_REF }}
+          path: ${{ env.XESS_SDK_PATH }}
 
       - name: Setup Vulkan SDK
         uses: humbletim/setup-vulkan-sdk@v1.2.1
@@ -92,6 +126,13 @@ jobs:
           repository: NVIDIA/DLSS
           ref: ${{ env.DLSS_SDK_REF }}
           path: ${{ env.DLSS_SDK_PATH }}
+
+      - name: Checkout AMD FidelityFX SDK (source only)
+        uses: actions/checkout@v4
+        with:
+          repository: GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+          ref: ${{ env.FFX_SDK_REF }}
+          path: ${{ env.FFX_SDK_PATH }}
 
       - name: Install native build dependencies
         run: |
@@ -168,6 +209,12 @@ jobs:
           path: build/native/ngx_shim/release
           merge-multiple: true
 
+      # AMD FFX and Intel XeSS SDKs aren't bundled by default on CI — the public GitHub repos
+      # only ship source / Windows binaries, and the runtime DLLs come from private downloads
+      # (AMD GPUOpen download page, Intel Developer Zone). `bundleFsrNatives` and
+      # `bundleXessNatives` graceful-skip when the SDK paths don't exist, so the build still
+      # produces a working mod jar — the FSR / XeSS code paths just activate at runtime when
+      # the user installs the SDKs and points caustica.fsr.path / caustica.xess.path at them.
       - name: Build bundled jar
         env:
           DLSS_SDK: ${{ github.workspace }}/${{ env.DLSS_SDK_PATH }}
@@ -181,6 +228,59 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: caustica-bundled-jar
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
+            !build/libs/*-dev.jar
+          if-no-files-found: error
+
+  # Full-bundle release job. Only runs when triggered manually with the `bundle_full` input.
+  # Expects the FFX + XeSS SDK binaries to be present on the runner as environment paths
+  # (passed in via a self-hosted runner with FFX_SDK + XESS_SDK exported, or via the actions
+  # environment). This job produces a "fat" jar with all three native SDKs bundled.
+  bundle-full:
+    name: Build full-bundle release (manual)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.bundle_full
+    needs:
+      - native-windows
+      - native-linux
+      - package
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Verify SDK env is set
+        env:
+          FFX_SDK: ${{ vars.FFX_SDK }}
+          XESS_SDK: ${{ vars.XESS_SDK }}
+        run: |
+          if [ -z "${FFX_SDK}" ] || [ -z "${XESS_SDK}" ]; then
+            echo "::error::FFX_SDK and XESS_SDK vars must be set on this workflow (or in the org's env settings) to run the full bundle."
+            exit 1
+          fi
+          echo "FFX_SDK=${FFX_SDK}"
+          echo "XESS_SDK=${XESS_SDK}"
+          ls -la "${FFX_SDK}/bin" "${XESS_SDK}/bin"
+
+      - name: Re-run gradle build with SDK envs
+        env:
+          FFX_SDK: ${{ vars.FFX_SDK }}
+          XESS_SDK: ${{ vars.XESS_SDK }}
+        run: >
+          bash ./gradlew clean build
+          -PngxPlatforms=windows-x64,linux-x64
+          -PngxVendorConfig=${{ env.NGX_VENDOR_CONFIG }}
+          -PngxShimConfig=${{ env.NGX_SHIM_CONFIG }}
+
+      - name: Upload full-bundle jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: caustica-full-bundle-jar
           path: |
             build/libs/*.jar
             !build/libs/*-sources.jar
