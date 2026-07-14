@@ -38,6 +38,8 @@ public final class CausticaClient implements ClientModInitializer {
 				RtContext ctx = RtContext.get();
 				if (ctx != null) {
 					rtInitDone = true;
+					// P0: probe official FidelityFX Denoiser native once (no-op if .so missing).
+					dev.comfyfluffy.caustica.ffx.denoiser.FfxDenoiserRuntime.INSTANCE.tryLoad();
 				}
 			}
 
