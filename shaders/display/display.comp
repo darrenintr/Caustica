@@ -47,8 +47,9 @@ vec3 agxDefaultContrast(vec3 x) {
 }
 
 vec3 applyLook(vec3 color) {
-    const float contrast = 1.04;   // try 1.15, 1.25, 1.4
-    const float saturation = 1.05; // try 1.05-1.15 if AgX feels grey
+    // Mild post-AgX grade: indoor wood rooms read muddy without a touch of contrast/sat.
+    const float contrast = 1.06;
+    const float saturation = 1.08;
 
     color = clamp((color - 0.5) * contrast + 0.5, 0.0, 1.0);
 
@@ -58,18 +59,31 @@ vec3 applyLook(vec3 color) {
     return color;
 }
 
+// Soft shoulder for HDR peaks (outdoor through a window, emissives) so auto-exposure can
+// lift dim interiors without nuking bright outdoor to pure white. Midtones barely move.
+vec3 softHighlightShoulder(vec3 hdr) {
+    hdr = max(hdr, vec3(0.0));
+    float L = max(dot(hdr, vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
+    // Below ~0.9: identity. Above: asymptotically compress excess toward a soft white.
+    const float start = 0.9;
+    const float softness = 0.55; // higher = gentler roll-off
+    float excess = max(L - start, 0.0);
+    float L2 = L - excess + excess / (1.0 + excess * softness);
+    return hdr * (L2 / L);
+}
+
 vec3 agx(vec3 color) {
     color = AGX_INSET * max(color, vec3(0.0));
     color = clamp(log2(max(color, vec3(1.0e-10))), AGX_MIN_EV, AGX_MAX_EV);
     color = (color - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV);
     color = agxDefaultContrast(color);
-    // color = applyLook(color);
+    color = applyLook(color);
     color = AGX_OUTSET * color;
     return clamp(color, 0.0, 1.0);
 }
 
 vec3 tonemap(vec3 hdr, float exposure) {
-    return agx(hdr * exposure);
+    return agx(softHighlightShoulder(hdr * exposure));
 }
 
 const float PQ_M1 = 0.1593017578125;
@@ -99,7 +113,7 @@ const mat3 BT709_TO_BT2020 = mat3(
 // paper white lands exactly at paperWhiteNits. Highlights above 1.0 roll off smoothly and asymptote to
 // `headroom`, i.e. the brightest pixels approach peakNits. No SDR clamp here — that is the point.
 vec3 tonemapHdr(vec3 hdr, float exposure) {
-    vec3 c = max(hdr * exposure, vec3(0.0));
+    vec3 c = softHighlightShoulder(max(hdr * exposure, vec3(0.0)));
     vec3 lo = min(c, vec3(1.0));
     vec3 hi = max(c - vec3(1.0), vec3(0.0));
     float k = max(pc.headroom - 1.0, 0.0);

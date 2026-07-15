@@ -398,6 +398,20 @@ public final class RtPipeline {
         }
     }
 
+    /** Write an extra storage buffer (SSBO) into binding {@code firstExtraBinding + slot} across every ring slot. */
+    public void setExtraStorageBuffer(int slot, long buffer, long size) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var bufInfo = org.lwjgl.vulkan.VkDescriptorBufferInfo.calloc(1, stack);
+            bufInfo.get(0).buffer(buffer).offset(0).range(size);
+            VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(RING, stack);
+            for (int i = 0; i < RING; i++) {
+                write.get(i).sType$Default().dstSet(descriptorSets[i]).dstBinding(firstExtraBinding + slot)
+                        .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(bufInfo);
+            }
+            VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
+        }
+    }
+
     /** Bind the block atlas (combined image sampler) into every ring slot — only valid if created withAtlasSampler. */
     public void setAtlasSampler(long imageView, long sampler) {
         try (MemoryStack stack = MemoryStack.stackPush()) {

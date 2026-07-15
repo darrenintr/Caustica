@@ -4,6 +4,7 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
+import dev.comfyfluffy.caustica.fsr.Fsr2ClassicUpscaler;
 import dev.comfyfluffy.caustica.fsr.FsrUpscaler;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
 import dev.comfyfluffy.caustica.vendor.GpuVendor;
@@ -98,8 +99,24 @@ public final class UpscalerSelector {
                 return setActive(NoopUpscaler.INSTANCE);
             }
             case DLSS_RR -> candidate = DlssRrUpscaler.tryCreate();
-            case FSR_3 -> candidate = FsrUpscaler.tryCreateFsr3(gpu);
-            case FSR_4 -> candidate = FsrUpscaler.tryCreateFsr4(gpu);
+            case FSR_3 -> {
+                candidate = FsrUpscaler.tryCreateFsr3(gpu);
+                if (candidate == null) {
+                    candidate = Fsr2ClassicUpscaler.tryCreate(gpu);
+                    if (candidate != null) {
+                        requestedReason = "fsr-3 → classic FSR2 (Vulkan)";
+                    }
+                }
+            }
+            case FSR_4 -> {
+                candidate = FsrUpscaler.tryCreateFsr4(gpu);
+                if (candidate == null) {
+                    candidate = Fsr2ClassicUpscaler.tryCreate(gpu);
+                    if (candidate != null) {
+                        requestedReason = "fsr-4 unavailable → classic FSR2 (Vulkan)";
+                    }
+                }
+            }
             case XESS -> candidate = XeSsUpscaler.tryCreate();
             case AUTO -> {
                 // Best-mode picker.
@@ -118,7 +135,14 @@ public final class UpscalerSelector {
                 if (candidate == null && gpu.canRunFsr3()) {
                     candidate = FsrUpscaler.tryCreateFsr3(gpu);
                     if (candidate != null) {
-                        requestedReason = "auto: → FSR 3";
+                        requestedReason = "auto: → modular FSR 3";
+                    }
+                }
+                // Linux Vulkan: modular FSR often has no provider — classic FSR2 is the real path.
+                if (candidate == null) {
+                    candidate = Fsr2ClassicUpscaler.tryCreate(gpu);
+                    if (candidate != null) {
+                        requestedReason = "auto: → classic FSR2 (Vulkan)";
                     }
                 }
                 if (candidate == null && gpu.canRunXeSs()) {
@@ -129,7 +153,7 @@ public final class UpscalerSelector {
                 }
             }
         }
-        if (candidate == null || !candidate.isReady()) {
+        if (candidate == null) {
             LOGGER.warn("Requested upscaler mode '{}' did not initialise on this device; falling back to none.",
                     requested.key);
             resolvedMode = Mode.OFF;

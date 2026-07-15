@@ -31,7 +31,6 @@ import dev.comfyfluffy.caustica.rt.RtDebugLabels;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
-import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 
 /**
@@ -119,19 +118,30 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
         if (!shouldRenderForGameMode(pos)) {
             return false;
         }
-        VoxelShape shape = state.shape();
-        float baseX = pos.getX() - terrain.blockX;
-        float baseY = pos.getY() - terrain.blockY;
-        float baseZ = pos.getZ() - terrain.blockZ;
+        RtComposite composite = RtComposite.INSTANCE;
+        if (!composite.hasPlateCamera()) {
+            return false;
+        }
+        // Camera-relative edge verts (vanilla LevelRenderer.submitBlockOutline style):
+        //   translate(blockPos - camera), then emit VoxelShape edges in local 0..1 space.
+        // Previously we used terrain-rebase coords + RtEntities.glowCamOffset, which could be
+        // stale/zero when entity capture skipped a frame — outline drifted off the targeted block.
+        final double camX = composite.plateCamX();
+        final double camY = composite.plateCamY();
+        final double camZ = composite.plateCamZ();
+        final double ox = pos.getX() - camX;
+        final double oy = pos.getY() - camY;
+        final double oz = pos.getZ() - camZ;
 
+        VoxelShape shape = state.shape();
         FloatArrayList verts = new FloatArrayList(72);
         shape.forAllEdges((x1, y1, z1, x2, y2, z2) -> {
-            verts.add((float) (baseX + x1));
-            verts.add((float) (baseY + y1));
-            verts.add((float) (baseZ + z1));
-            verts.add((float) (baseX + x2));
-            verts.add((float) (baseY + y2));
-            verts.add((float) (baseZ + z2));
+            verts.add((float) (ox + x1));
+            verts.add((float) (oy + y1));
+            verts.add((float) (oz + z1));
+            verts.add((float) (ox + x2));
+            verts.add((float) (oy + y2));
+            verts.add((float) (oz + z2));
         });
         vertexCount = verts.size() / 3;
         if (vertexCount == 0) {
@@ -143,7 +153,8 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
         vbo = pool.acquireVertex(ctx, (long) data.length * Float.BYTES, "block outline vbo");
         MemoryUtil.memFloatBuffer(vbo.mapped, data.length).put(data);
 
-        viewProj.set(RtComposite.INSTANCE.currentViewProjection());
+        // Same P·V the RT plate used (camera-relative, jitter-free).
+        viewProj.set(composite.currentViewProjection());
         boundSet = accelSet.bind(ctx, tlas);
         return true;
     }
@@ -234,9 +245,8 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
                 VK10.vkCmdSetLineWidth(cmd, Math.min(desiredWidthPx, RtDeviceBringup.maxLineWidth()));
                 ByteBuffer push = stack.malloc(PUSH_BYTES);
                 viewProj.get(0, push);
-                RtEntities entities = RtEntities.INSTANCE;
-                push.putFloat(64, entities.glowCamOffsetX()).putFloat(68, entities.glowCamOffsetY())
-                        .putFloat(72, entities.glowCamOffsetZ());
+                // Verts are already camera-relative (see prepare); camOffset is zero.
+                push.putFloat(64, 0f).putFloat(68, 0f).putFloat(72, 0f);
                 push.putFloat(80, 0f).putFloat(84, 0f).putFloat(88, 0f).putFloat(92, OUTLINE_ALPHA);
                 VK10.vkCmdPushConstants(cmd, pipeline.layout,
                         VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT, 0, push);

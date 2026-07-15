@@ -62,12 +62,36 @@ public final class RtDlssRr {
 
     private boolean resetHistory;
     private long lastFrameNanos;
+    // Observability for the in-game debug overlay — see CausticaDebugOverlay.
+    private int lastEvaluateRc;
+    private int evaluateFailureCount;
 
     private RtDlssRr() {
     }
 
     public boolean isReady() {
         return initialized && !failed && !isNull(feature);
+    }
+
+    /**
+     * Best-effort probe used by the {@code UpscalerSelector} before committing to DLSS-RR. Returns
+     * true when NGX can be acquired for the current device AND the runtime reports DLSS-RR
+     * (DLSSD) as available; never throws and never latches the failure state.
+     */
+    public static boolean dlssdProbeAvailable() {
+        try {
+            if (!(((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device)) {
+                return false;
+            }
+            NgxLibrary l = NgxRuntime.INSTANCE.acquire(device);
+            if (l == null) {
+                return false;
+            }
+            return l.dlssdAvailable();
+        } catch (Throwable t) {
+            CausticaMod.LOGGER.debug("DLSS-RR probe failed; treating as unavailable", t);
+            return false;
+        }
     }
 
     /**
@@ -99,7 +123,7 @@ public final class RtDlssRr {
                 rc = lib.evaluateDlssd(cmd, feature,
                         color.view, color.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                         depth.view, depth.image, VK10.VK_FORMAT_R32_SFLOAT,
-                        motion.view, motion.image, VK10.VK_FORMAT_R16G16_SFLOAT,
+                        motion.view, motion.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                         diffuseAlbedo.view, diffuseAlbedo.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                         specularAlbedo.view, specularAlbedo.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                         normals.view, normals.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -113,15 +137,49 @@ public final class RtDlssRr {
             }
             resetHistory = false;
             if (NgxRuntime.ngxFailed(rc)) {
+                lastEvaluateRc = rc;
+                evaluateFailureCount++;
                 throw new IllegalStateException("ngxshim_evaluate_dlssd failed: 0x" + Integer.toHexString(rc)
                         + " last=0x" + Integer.toHexString(lib.lastResult()));
             }
+            lastEvaluateRc = 0;
             return true;
         } catch (Throwable t) {
             failed = true;
+            evaluateFailureCount++;
             CausticaMod.LOGGER.error("DLSS-RR evaluate failed; RT composite continues without it", t);
             return false;
         }
+    }
+
+    /** True once {@link #evaluate} has ever failed. The internal failure latch never resets until {@link #destroy}. */
+    public boolean evaluateFailed() {
+        return failed;
+    }
+
+    /**
+     * Latch the next evaluate to drop DLSS-RR's NGX internal temporal accumulator.
+     * Wired from {@code RtComposite.invalidateHistory()} on hard cuts (teleport /
+     * dimension change / resource reload) so the new scene's colour palette does not
+     * smear for a few frames after the cut. Idempotent; safe to call when RR is off
+     * (the flag is honoured on the next evaluate, which is a no-op until RR initialises).
+     */
+    public void requestResetHistory() {
+        resetHistory = true;
+    }
+
+    /** Number of times {@link #evaluate} has failed since this {@link RtDlssRr} instance was created. */
+    public int evaluateFailureCount() {
+        return evaluateFailureCount;
+    }
+
+    /**
+     * Return code from the most recent {@code evaluate} call, or 0 if the last call succeeded. NVSDK error
+     * codes have {@code 0xBADxxxxx} in the top 12 bits ({@link NgxRuntime#ngxFailed}); reading this lets
+     * the debug overlay flag the exact reason a frame rendered without DLSS-RR.
+     */
+    public int lastEvaluateRc() {
+        return lastEvaluateRc;
     }
 
     /**

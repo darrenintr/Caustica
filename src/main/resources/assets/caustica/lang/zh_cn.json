@@ -56,5 +56,8 @@
 	"caustica.options.rt.debugView.4": "粗糙度",
 	"caustica.options.rt.debugView.5": "运动",
 	"caustica.options.rt.debugView.6": "高光",
-	"caustica.options.rt.debugView.7": "高光运动"
+	"caustica.options.rt.debugView.7": "高光运动",
+	"caustica.options.rt.debugView.8": "阴影命中",
+	"caustica.options.rt.debugView.9": "漫反射拆分",
+	"caustica.options.rt.debugView.10": "反射拆分"
 }

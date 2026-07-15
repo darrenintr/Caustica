@@ -1,0 +1,108 @@
+// Radiance-style compose after NRD:
+//   sky / clear  → clear radiance (path-traced, not NRD)
+//   surface      → unpack YCoCg irradiance × albedo (remodulate)
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly  uniform image2D gDiff;
+layout(binding = 1, rgba16f) readonly  uniform image2D gSpec;
+layout(binding = 2, rgba16f) readonly  uniform image2D gDiffAlbedo;
+layout(binding = 3, rgba16f) readonly  uniform image2D gSpecAlbedo;
+layout(binding = 4, rgba16f) readonly  uniform image2D gNormalRough;
+layout(binding = 5, rgba16f) readonly  uniform image2D gClearRadiance; // pre-denoise beauty (sky + full frame)
+layout(binding = 6, rgba16f) writeonly uniform image2D gOut;
+
+layout(push_constant) uniform Push {
+    float surfaceGain; // scale NRD surface (default ~0.95)
+    float skyGain;     // scale clear/sky (default ~1.12)
+    float detailMix;   // unused (kept for push layout); remultiply restores texture
+    float _pad;
+} pc;
+
+// Must match prepare_nrd_inputs.comp demode floors / smooth threshold.
+const vec3 kMinDiffAlb = vec3(0.04);
+const vec3 kMinSpecAlb = vec3(0.03);
+const float kSmoothDielectric = 0.12;
+
+vec3 yCoCgToLinear(vec3 color) {
+    float t = color.x - color.z;
+    vec3 r;
+    r.y = color.x + color.z;
+    r.x = t + color.y;
+    r.z = t - color.y;
+    return max(r, vec3(0.0));
+}
+
+float luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(gOut);
+    if (pix.x >= size.x || pix.y >= size.y) {
+        return;
+    }
+
+    vec3 clear = max(imageLoad(gClearRadiance, pix).rgb, vec3(0.0));
+    vec4 nr = imageLoad(gNormalRough, pix);
+    float rough = clamp(nr.w, 0.0, 1.0);
+    float nLen = length(nr.xyz);
+    bool sky = nLen < 0.5;
+
+    // Radiance: if clear path (sky), use clear radiance only
+    if (sky) {
+        float sg = pc.skyGain > 0.0 ? pc.skyGain : 1.15;
+        vec3 c = clear * sg;
+        if (any(isnan(c)) || any(isinf(c))) c = clear;
+        c = min(c, vec3(64.0));
+        imageStore(gOut, pix, vec4(c, 1.0));
+        return;
+    }
+
+    float sg = pc.surfaceGain > 0.0 ? pc.surfaceGain : 1.0;
+    vec3 c;
+    if (rough <= kSmoothDielectric) {
+        // Water / ice / glass: prepare packed *pre-modulated full beauty* into DIFF (no demode).
+        // Must use NRD output — clear plate is raw SPP glitter (stream noise in screenshots).
+        c = yCoCgToLinear(imageLoad(gDiff, pix).xyz) * sg;
+        float nrdY = luma(c);
+        float clearY = luma(clear);
+        // Soft protect: only if REBLUR fully died, and blend (not replace) to avoid firefly pop-in.
+        if (any(isnan(c)) || any(isinf(c)) || nrdY < 1e-8) {
+            c = clear;
+        } else if (clearY > 1e-3 && nrdY < clearY * 0.02) {
+            c = mix(c, clear, 0.35);
+        }
+    } else {
+        // Remodulate: must invert prepare demode.
+        vec3 diffAlb = max(imageLoad(gDiffAlbedo, pix).rgb, kMinDiffAlb);
+        vec3 specAlb = max(imageLoad(gSpecAlbedo, pix).rgb, kMinSpecAlb);
+        vec3 diff = yCoCgToLinear(imageLoad(gDiff, pix).xyz) * diffAlb;
+        vec3 specLin = yCoCgToLinear(imageLoad(gSpec, pix).xyz);
+        vec3 spec = (rough > 0.22) ? (specLin * specAlb) : specLin;
+        c = (diff + spec) * sg;
+
+        // ONLY fall back on true death — never re-inject raw grain over good REBLUR.
+        float nrdY = luma(c);
+        if (any(isnan(c)) || any(isinf(c)) || nrdY < 1e-8) {
+            c = clear;
+        }
+    }
+    if (any(isnan(c)) || any(isinf(c))) {
+        c = max(clear, vec3(0.0));
+    }
+    // Aggressive firefly squash for dark scenes (starfield grain at SPP=1).
+    // Two-stage: soft compress moderate spikes, hard clamp extreme outliers.
+    float L = luma(c);
+    if (L > 2.5) {
+        c *= (2.5 + 0.2 * (L - 2.5)) / L;
+    }
+    L = luma(c);
+    if (L > 6.0) {
+        c *= 6.0 / L;
+    }
+    c = min(max(c, vec3(0.0)), vec3(16.0));
+    imageStore(gOut, pix, vec4(c, 1.0));
+}

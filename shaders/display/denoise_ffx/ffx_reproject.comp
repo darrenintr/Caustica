@@ -1,0 +1,121 @@
+#version 460
+//
+// FFX Denoiser (whole-radiance) — pass 1: reproject previous-frame radiance.
+// Writes reprojected color + a reliability/variance estimate for temporal resolve.
+//
+// Variance encodes both depth mismatch AND screen-space motion so resolve can
+// drop history weight while panning (anti-ghost) without re-introducing the
+// SPP-1 "kill history on colour diff" bug.
+//
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D inColor;
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D inNormal;
+layout(set = 0, binding = 2, r32f)    readonly uniform image2D inDepth;
+layout(set = 0, binding = 3, rgba16f) readonly uniform image2D inMotion;
+layout(set = 0, binding = 4, rgba16f) readonly uniform image2D gSpecAlbedo; // unused, host-side compat
+
+layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D outReprojected;
+layout(set = 0, binding = 6, r32f)    writeonly uniform image2D outVariance;
+
+layout(set = 0, binding = 7) uniform sampler2D samplerPrev;
+
+layout(push_constant) uniform FfxReprojectParams {
+    vec2 motionVectorScale;
+    float disocclusionThreshold;
+    float normalThreshold;
+    float depthThreshold;
+    float frameHistoryReady;
+    float _pad0;
+    float _pad1;
+} pc;
+
+bool ffxIsSkyByNormal(vec3 n) {
+    return length(n) < 0.5;
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inColor);
+    if (pos.x >= size.x || pos.y >= size.y) {
+        return;
+    }
+
+    vec3 currColor = imageLoad(inColor, pos).rgb;
+    vec3 currNormal = imageLoad(inNormal, pos).xyz;
+
+    // Sky: no stable surface. Force max variance so resolve refuses history.
+    if (ffxIsSkyByNormal(currNormal)) {
+        imageStore(outReprojected, pos, vec4(currColor, 0.0));
+        imageStore(outVariance, pos, vec4(1.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    float currDepth = imageLoad(inDepth, pos).r;
+    vec2 mv = imageLoad(inMotion, pos).rg;
+
+    // Bad MVs would sample garbage history and freeze it as a colour trail.
+    bool mvInvalid = any(isnan(mv)) || any(isinf(mv));
+    if (mvInvalid) {
+        imageStore(outReprojected, pos, vec4(vec3(0.0), currDepth));
+        imageStore(outVariance, pos, vec4(1.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    float mvLen = length(mv); // render pixels (world.rgen)
+
+    vec2 uv = (vec2(pos) + 0.5) / vec2(size);
+    // world.rgen stores gMotion = (prevNdc - curNdc) * 0.5 * size
+    //   = (prevUV - curUV) * size  →  pixel offset from CURRENT to PREVIOUS.
+    // Correct sample: prevUV = uv + mv * (1/size). Using minus samples the
+    // opposite side of motion and paints multi-frame "升天" ghost trails.
+    vec2 prevUV = uv + mv * pc.motionVectorScale;
+
+    vec3 prevRadiance = vec3(0.0);
+    float prevDepth = 0.0;
+    bool prevInBounds = pc.frameHistoryReady > 0.5
+            && all(greaterThanEqual(prevUV, vec2(0.0)))
+            && all(lessThanEqual(prevUV, vec2(1.0)));
+    if (prevInBounds) {
+        vec4 prev = texture(samplerPrev, prevUV);
+        prevRadiance = prev.rgb;
+        prevDepth = prev.a;
+        // Reject NaN/Inf history (defensive — corrupted ring entries).
+        if (any(isnan(prevRadiance)) || any(isinf(prevRadiance)) || isnan(prevDepth) || isinf(prevDepth)) {
+            prevInBounds = false;
+            prevRadiance = vec3(0.0);
+            prevDepth = 0.0;
+        }
+    }
+
+    // Depth tests. History packs depth into rgba16f .a (fp16), current is r32f.
+    // Use OR: either absolute or relative jump past threshold → reject.
+    // (AND was too loose and let camera-pan ghosts through.)
+    float absDepthJump = abs(currDepth - prevDepth);
+    float relDepthJump = absDepthJump / max(max(currDepth, prevDepth), 1e-3);
+    float absThr = max(pc.depthThreshold, 0.05);
+    float relThr = max(pc.disocclusionThreshold, 0.05);
+    bool depthReject = absDepthJump > absThr || relDepthJump > relThr;
+    // Empty history (cleared slot / never written): treat as disocclusion.
+    bool historyEmpty = prevInBounds && (prevDepth <= 1e-6) && (dot(prevRadiance, prevRadiance) < 1e-10);
+    // Hard cut on large screen motion (fast pan / teleport). Soft motion is
+    // encoded into variance below so resolve can taper history weight.
+    bool hugeMotion = mvLen > 48.0;
+    bool disocclusion = !prevInBounds || depthReject || historyEmpty || hugeMotion;
+
+    vec3 historyRadiance = disocclusion ? vec3(0.0) : prevRadiance;
+
+    // Variance / uncertainty in [0,1]:
+    //   1.0  — hard disocclusion (resolve must ignore history)
+    //   0.05 — trusted static reprojection
+    // Motion soft-raises variance so pan frames use less history (anti-ghost)
+    // without zeroing the spatial filter.
+    float softDepth = smoothstep(absThr * 0.2, absThr, absDepthJump);
+    float variance = disocclusion ? 1.0 : mix(0.05, 0.40, softDepth);
+    // ~0 at rest, ramps to ~0.9 by 20 px/frame (brisk look-around).
+    float motionVar = smoothstep(3.0, 20.0, mvLen) * 0.90;
+    variance = max(variance, motionVar);
+
+    imageStore(outReprojected, pos, vec4(historyRadiance, currDepth));
+    imageStore(outVariance, pos, vec4(variance, 0.0, 0.0, 0.0));
+}

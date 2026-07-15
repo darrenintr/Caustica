@@ -1,4 +1,6 @@
 #version 460
+// Radiance-style: average log-luminance between low/high histogram percentiles
+// (exclude darkest voids AND brightest snow peaks), then middle-grey target.
 
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
@@ -12,14 +14,18 @@ layout(std430, binding = 2, set = 0) buffer ExposureState {
 } stateBuf;
 
 layout(push_constant) uniform Push {
-    uint pixelCount;
-    float key;
+    float key;               // middle grey / key (Radiance middleGrey)
     float minEv;
     float maxEv;
     float adaptUp;
     float adaptDown;
     float frameTimeSeconds;
     float evBias;
+    float lowPercent;        // e.g. 0.08 — drop darkest 8%
+    float highPercent;       // e.g. 0.90 — drop brightest 10%
+    float _pad0;
+    float _pad1;
+    float _pad2;
 } pc;
 
 const float LOG_MIN = -12.0;
@@ -31,9 +37,25 @@ float binCenter(uint bin) {
 }
 
 void main() {
-    uint total = max(pc.pixelCount, 1u);
-    uint lowCount = uint(floor(float(total) * 0.50));
-    uint highCount = max(lowCount + 1u, uint(ceil(float(total) * 0.95)));
+    // Sum actual histogram samples (may be center-cropped; do NOT use full-frame pixelCount)
+    uint total = 0u;
+    for (uint i = 0u; i < 256u; ++i) {
+        total += hist.bins[i];
+    }
+
+    float prev = stateBuf.initialized == 0u ? pc.key : max(stateBuf.previous, 1.0e-4);
+    if (total == 0u) {
+        stateBuf.previous = clamp(prev, exp2(pc.minEv), exp2(pc.maxEv));
+        stateBuf.initialized = 1u;
+        imageStore(exposureImage, ivec2(0), vec4(stateBuf.previous, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    float fTotal = float(total);
+    float lo = clamp(pc.lowPercent, 0.0, 0.49);
+    float hi = clamp(pc.highPercent, lo + 0.05, 1.0);
+    uint lowCount = uint(floor(lo * fTotal));
+    uint highCount = max(lowCount + 1u, uint(ceil(hi * fTotal)));
 
     uint cumulative = 0u;
     float weightedLogLum = 0.0;
@@ -50,13 +72,17 @@ void main() {
             weightedCount += take;
         }
         cumulative = end;
+        if (cumulative >= highCount) {
+            break;
+        }
     }
 
     float avgLogLum = weightedCount > 0u ? weightedLogLum / float(weightedCount) : 0.0;
-    float target = pc.key * exp2(pc.evBias - avgLogLum);
+    // Radiance: targetExposure = middleGrey / avgLum
+    float avgLum = exp2(avgLogLum);
+    float target = (pc.key / max(avgLum, 1e-6)) * exp2(pc.evBias);
     target = clamp(target, exp2(pc.minEv), exp2(pc.maxEv));
 
-    float prev = stateBuf.initialized == 0u ? target : max(stateBuf.previous, 1.0e-4);
     float rate = target > prev ? pc.adaptUp : pc.adaptDown;
     float alpha = stateBuf.initialized == 0u ? 1.0 : 1.0 - exp(-pc.frameTimeSeconds / max(rate, 1.0e-4));
     float exposure = mix(prev, target, clamp(alpha, 0.0, 1.0));

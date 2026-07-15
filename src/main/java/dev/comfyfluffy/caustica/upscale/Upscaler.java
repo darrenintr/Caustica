@@ -73,4 +73,19 @@ public interface Upscaler {
      * {@code ensureFeature} is called again.
      */
     void destroy();
+
+    /**
+     * Ask the upscaler to drop its internal temporal history on the next evaluate
+     * (or as soon as the SDK supports it). Called by
+     * {@code RtComposite.invalidateHistory()} on hard cuts (teleport,
+     * dimension change, resource reload) so the NGX / FFX / XeSS internal
+     * accumulator does not smear the previous scene's colour into the new one.
+     *
+     * <p>Default no-op is safe: an upscaler whose SDK doesn't expose a reset path
+     * simply relies on its own history-rejection logic + the consumer's depth /
+     * MV rejection. Implementations with an SDK reset path (DLSS-RR's NGX
+     * {@code reset} flag) MUST override.
+     */
+    default void requestResetHistory() {
+    }
 }

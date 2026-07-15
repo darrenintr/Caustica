@@ -1,0 +1,73 @@
+// FidelityFX Shadow Denoiser — spatial filter pass (Caustica-hosted SPIR-V).
+// Edge-stopping blur on the scalar shadow mask (depth + normal). Multi-step
+// like FFX soft-shadow filter passes 0/1/2. Sample-count from .g drives kernel
+// aggressiveness (thin history → stronger blur).
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rg16f) readonly  uniform image2D gIn;     // r=shadow g=count
+layout(binding = 1, r32f)  readonly  uniform image2D gDepth;
+layout(binding = 2, rgba16f) readonly uniform image2D gNormal;
+layout(binding = 3, rg16f) writeonly uniform image2D gOut;
+
+layout(push_constant) uniform Push {
+    int step;           // atrous-style dilation: 1, 2, 4
+    float depthSigma;
+    float normalSigma;
+    float pad;
+} pc;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(gIn);
+    if (pix.x >= size.x || pix.y >= size.y) {
+        return;
+    }
+
+    vec2 center = imageLoad(gIn, pix).rg;
+    float cShadow = center.r;
+    float cCount = center.g;
+    float cDepth = imageLoad(gDepth, pix).r;
+    vec3 cN = normalize(imageLoad(gNormal, pix).xyz + 1e-6);
+
+    // No surface: passthrough.
+    if (length(imageLoad(gNormal, pix).xyz) < 1e-4 || cDepth <= 1e-6) {
+        imageStore(gOut, pix, vec4(cShadow, cCount, 0.0, 0.0));
+        return;
+    }
+
+    // Thin history → stronger spatial (FFX variance boost idea).
+    float spatialBoost = mix(2.5, 1.0, clamp(cCount / 16.0, 0.0, 1.0));
+    float depthSigma = max(pc.depthSigma * spatialBoost, 1e-4);
+    float normalSigma = max(pc.normalSigma, 1e-4);
+
+    // 5x5 kernel with step dilation (FFX soft-shadow style).
+    const float k[3] = float[3](0.4, 0.25, 0.05); // |offset| weights for 0,1,2
+    float wSum = 0.0;
+    float sSum = 0.0;
+    int step = max(pc.step, 1);
+
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            ivec2 q = pix + ivec2(dx, dy) * step;
+            if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size))) {
+                continue;
+            }
+            float s = imageLoad(gIn, q).r;
+            float d = imageLoad(gDepth, q).r;
+            vec3 n = normalize(imageLoad(gNormal, q).xyz + 1e-6);
+
+            float wSpatial = k[min(abs(dx), 2)] * k[min(abs(dy), 2)];
+            float wDepth = exp(-abs(cDepth - d) / (depthSigma * max(cDepth, 1e-3)));
+            float wNormal = exp(-max(0.0, 1.0 - dot(cN, n)) / normalSigma);
+            float w = wSpatial * wDepth * wNormal;
+            wSum += w;
+            sSum += s * w;
+        }
+    }
+
+    float outShadow = (wSum > 1e-5) ? (sSum / wSum) : cShadow;
+    outShadow = clamp(outShadow, 0.0, 1.0);
+    imageStore(gOut, pix, vec4(outShadow, cCount, 0.0, 0.0));
+}

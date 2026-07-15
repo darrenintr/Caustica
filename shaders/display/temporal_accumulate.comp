@@ -1,0 +1,141 @@
+#version 460
+//
+// Temporal accumulation for path-traced beauty — playable while moving.
+//
+// Frame N:  P_n   = current path-traced color (noisy).
+// History is reprojected along gMotion, neighbourhood-clamped (anti-ghost),
+// then blended with a motion-adaptive alpha (more current when the camera moves).
+//
+//   history  = sample(prevAccum, uv + mv * mvScale)
+//   history  = clamp(history, neighbourhood_min/max of P_n)   // reject ghosts
+//   a        = mix(baseAlpha, highAlpha, motionAmount)
+//   accum    = mix(history, P_n, a)  or P_n on disocclusion
+//
+// Motion convention: gMotion = (prevNdc - curNdc) * 0.5 * size → CURRENT→PREVIOUS px.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D inColor;
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D inNormal;
+layout(set = 0, binding = 2, r32f)    readonly uniform image2D inDepth;
+layout(set = 0, binding = 3, rgba16f) readonly uniform image2D inMotion;
+
+layout(set = 0, binding = 4) uniform sampler2D historySampler;
+
+layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D outAccum;
+layout(set = 0, binding = 6, rgba16f) writeonly uniform image2D historyOut;
+
+layout(push_constant) uniform TemporalAccumParams {
+    vec2  motionVectorScale;   // (1/width, 1/height)
+    float disocclusionThreshold;
+    float alpha;               // base weight of current frame when nearly static
+    float frameHistoryReady;   // 0 on first frame
+    float _pad0;
+    float _pad1;
+} pc;
+
+bool isSkyByNormal(vec3 n) {
+    return length(n) < 0.5;
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inColor);
+    if (pos.x >= size.x || pos.y >= size.y) {
+        return;
+    }
+
+    vec3 currColor = imageLoad(inColor, pos).rgb;
+    // Firefly guard — history must never re-amplify spikes.
+    currColor = min(max(currColor, vec3(0.0)), vec3(8.0));
+    vec3 currNormal = imageLoad(inNormal, pos).xyz;
+    bool sky = isSkyByNormal(currNormal);
+
+    float currDepth = imageLoad(inDepth, pos).r;
+    vec2 mv = imageLoad(inMotion, pos).rg;
+
+    bool mvBad = any(isnan(mv)) || any(isinf(mv));
+    // Large pan/sprint: drop history entirely (no multi-frame smear).
+    float mvLen = mvBad ? 1e6 : length(mv);
+    bool hugeMotion = mvLen > 48.0;
+    if (mvBad || hugeMotion) {
+        imageStore(outAccum, pos, vec4(currColor, 1.0));
+        imageStore(historyOut, pos, vec4(currColor, sky ? 0.0 : currDepth));
+        return;
+    }
+
+    vec2 uv = (vec2(pos) + 0.5) / vec2(size);
+    vec2 prevUV = uv + mv * pc.motionVectorScale;
+
+    bool prevInBounds = pc.frameHistoryReady > 0.5
+            && all(greaterThanEqual(prevUV, vec2(0.0)))
+            && all(lessThanEqual(prevUV, vec2(1.0)));
+
+    vec3 historyColor = currColor;
+    bool disocclusion = !prevInBounds;
+    if (prevInBounds) {
+        vec4 prev = texture(historySampler, prevUV);
+        historyColor = min(max(prev.rgb, vec3(0.0)), vec3(8.0));
+        float prevDepth = prev.a;
+        if (sky) {
+            // Sky: no reliable reverse-Z; only reject if history was terrain.
+            disocclusion = prevDepth > 1e-4;
+        } else {
+            float depthJump = abs(currDepth - prevDepth) / max(currDepth, 1e-3);
+            float thresh = pc.disocclusionThreshold;
+            disocclusion = depthJump > thresh || abs(currDepth - prevDepth) > thresh * 0.5
+                    || prevDepth < 1e-5; // was sky, now surface
+        }
+    }
+
+    // 3×3 neighbourhood AABB of *current* frame — classic TAA anti-ghost clamp.
+    vec3 nMin = currColor;
+    vec3 nMax = currColor;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            ivec2 q = clamp(pos + ivec2(dx, dy), ivec2(0), size - 1);
+            vec3 s = min(max(imageLoad(inColor, q).rgb, vec3(0.0)), vec3(8.0));
+            nMin = min(nMin, s);
+            nMax = max(nMax, s);
+        }
+    }
+    // Neighbourhood AABB clamp — keep expand modest. A large "darkBoost" used to let
+    // bright snow history survive the clamp on dark ice/water → milky snow smear.
+    float luma = dot(currColor, vec3(0.2126, 0.7152, 0.0722));
+    float histLuma = dot(historyColor, vec3(0.2126, 0.7152, 0.0722));
+    // Slightly more room in dark grain, but never enough to admit full snow albedo.
+    float darkBoost = 1.0 + 0.6 * (1.0 - smoothstep(0.0, 0.15, luma));
+    vec3 expand = (vec3(0.10) + 0.30 * abs(nMax - nMin)) * darkBoost;
+    if (sky) {
+        expand = vec3(0.30) + 0.45 * abs(nMax - nMin);
+    }
+    historyColor = clamp(historyColor, nMin - expand, nMax + expand);
+    histLuma = dot(historyColor, vec3(0.2126, 0.7152, 0.0722));
+
+    // Bright history on a much darker current pixel = snow/sky ghost on ice/water.
+    // Force disocclusion-style rejection instead of slowly fading the smear.
+    bool brightGhost = !sky && histLuma > luma * 1.35 + 0.04 && (histLuma - luma) > 0.08;
+    if (brightGhost) {
+        disocclusion = true;
+    }
+
+    // Motion-adaptive blend: static → more history; walking → more current.
+    float baseA = clamp(pc.alpha, 0.05, 1.0);
+    float motionT = smoothstep(0.5, 8.0, mvLen);
+    float a = mix(baseA, max(baseA, 0.88), motionT);
+    // Dark ice/water: prefer CURRENT so residual snow history cannot re-stick.
+    // (Previously we leaned hard on history here → "光糊一脸" on frozen lakes.)
+    if (!sky && luma < 0.18) {
+        float darkT = 1.0 - smoothstep(0.0, 0.18, luma);
+        a = mix(a, max(a, 0.70), 0.85 * darkT);
+    }
+    if (sky) {
+        a = mix(min(baseA, 0.12), 0.75, motionT);
+    }
+
+    vec3 accumulated = disocclusion ? currColor : mix(historyColor, currColor, a);
+    accumulated = min(max(accumulated, vec3(0.0)), vec3(8.0));
+
+    imageStore(outAccum, pos, vec4(accumulated, 1.0));
+    imageStore(historyOut, pos, vec4(accumulated, sky ? 0.0 : currDepth));
+}

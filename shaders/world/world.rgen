@@ -58,9 +58,22 @@ layout(binding = 1, set = 0, rgba16f) uniform image2D outImage;
 layout(binding = 3, set = 0, rgba16f) uniform image2D gNormal; // xyz world normal, w roughness
 layout(binding = 4, set = 0, rgba16f) uniform image2D gAlbedo; // rgb diffuse albedo
 layout(binding = 5, set = 0, r32f)    uniform image2D gDepth;  // r HW reversed-Z depth (near=1, far/sky~0)
-layout(binding = 6, set = 0, rg16f)   uniform image2D gMotion;    // xy screen-space motion (render pixels)
+layout(binding = 6, set = 0, rgba16f) uniform image2D gMotion;    // xy screen MV (px), z = viewZprev-viewZ
 layout(binding = 7, set = 0, rgba16f) uniform image2D gSpecAlbedo; // specular albedo (0 — diffuse-only)
 layout(binding = 8, set = 0, rg16f)   uniform image2D gSpecMotion; // reflection motion vectors for RR
+// Split lighting for official FFX Denoiser (P1):
+//   gShadowHit   — primary NEE sun visibility [0,1]
+//   gDiffuse     — unshadowed diffuse direct + GI + emission (+ sky)
+//   gReflection  — specular NEE + specular-path radiance
+layout(binding = 9, set = 0, r8)      uniform image2D gShadowHit;
+layout(binding = 10, set = 0, rgba16f) uniform image2D gDiffuse;
+layout(binding = 11, set = 0, rgba16f) uniform image2D gReflection;
+// ReSTIR DI bindings (12-14):
+layout(binding = 12, set = 0) readonly buffer BlockLights {
+    vec4 lights[]; // xyz = position, w = packed (intensity, colorRGB)
+} blockLights;
+layout(binding = 13, set = 0, rgba32ui) uniform uimage2D gReservoirCurr;
+layout(binding = 14, set = 0, rgba32ui) uniform uimage2D gReservoirPrev;
 
 // Per-frame push data lives in a host-visible BDA buffer; only its 8-byte address is pushed. The std430
 // layout must match RtComposite. Raygen loads it once into the `pc` global at the top of main().
@@ -87,6 +100,12 @@ struct WorldPush {
     vec4 waterParams;          // 320 xyz = camera-biome water tint; w = wave time (s)
     vec4 waterAnchor;          // 336 xy = world-stable wave-domain anchor (terrain origin mod 4096); zw unused
     mat4 curViewProj;          // 352 forward camera-relative view-projection (= inverse(invViewProj)); HW depth + water MV
+    // Block-breaking overlay: breakCount(@416) + breaking[MAX_BREAKING](@432, 16B each = 128B total)
+    // ReSTIR DI parameters (@560 = 432 + 8*16)
+    uint blockLightCount;      // 560 number of block lights in the buffer
+    uint restirCandidates;     // 564 candidate samples per pixel (default 8)
+    float restirMaxMTemporal;  // 568 max temporal M clamp (default 20.0)
+    float restirMaxMSpatial;   // 572 max spatial M clamp (default 100.0)
 };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WorldPushRef { WorldPush v; };
 layout(push_constant) uniform PushAddr { uint64_t worldPushAddr; } pcAddr;
@@ -156,21 +175,41 @@ const float INV_PI = 0.31830988618;
 // payload.albedo and accumulates that sky radiance. The directional NEE light is pushed separately as
 // pc.lightDir / pc.lightRadiance / pc.sunDir.
 const float EMISSIVE_STRENGTH = 3.0; // HDR radiance of a full (level-15) emitter, modulated by albedo
+
+// Hard upper bound on per-pixel radiance written to outImage. The Cook–Torrance
+// specular term `(D·G·F) / (4·ndv·ndl)` for a perfectly smooth mirror under
+// direct noon sun (`pc.lightRadiance = 21.0`, ndh→1) evaluates to >100 before
+// the brdf·radiance multiplier, producing a single-sample firefly >2000. With
+// SPP=1 the path tracer occasionally hits that alignment and writes the
+// ~2000 to the rgba16f storage image, which the FFX atrous colour weight
+// (sigma 0.55..3.4) cannot dampen because every surrounding sample is orders
+// of magnitude dimmer. The result is a saturated bright pixel that survives
+// into history and reads as an orange halo around small emissive sources
+// (torches, lanterns, glowstone) and around smooth surfaces near specular
+// alignment. 8.0 is well above any path the AgX tonemap + auto-exposure use
+// (paper-white is ~6.7 for direct noon sun on snow) and well below the
+// 65504 fp16 ceiling, so legitimate HDR converges through the rest of the
+// pipeline while specimen-class specular spikes are squashed before they
+// can poison the FFX history.
+// Tight ceiling: high peaks survive denoise as grit. Prefer slightly flatter HDR.
+const float MAX_HDR_RADIANCE = 4.0;
 const float SURF_BIAS = 0.005;  // offset secondary-ray origins along the normal (anti-acne)
 const float RAY_TMIN = 0.001;   // tiny tmin: the normal offset already clears the surface
 
 // Water is a smooth dielectric. IOR 1.333; absorption is per-block Beer-Lambert extinction.
 // Keep the extinction mostly neutral and low so water reads as clear glassy volume instead of a
-// strongly blue-green fog. Guide roughness feeds DLSS-RR a stable smooth primary water hit.
+// strongly blue-green fog. Guide roughness feeds DLSS-RR / NRD a stable primary water hit.
+// Slightly above a pure mirror (0.02) so REBLUR is less aggressive on SPP-1 glint fireflies
+// while still reading as smooth water; must stay <= prepare_nrd_inputs kSmoothDielectric (0.12).
 const float WATER_IOR = 1.333;
-const float WATER_GUIDE_ROUGH = 0.02;
+const float WATER_GUIDE_ROUGH = 0.06;
 const vec3 SKY_SPEC_ALBEDO = vec3(0.5); // RR guide default for sky pixels.
 const vec3 SKY_DIFF_ALBEDO = vec3(0.5);
 
 // Stained glass / ice (material 3): a thin colored dielectric. IOR ~1.5 (soda-lime glass); the guide
-// roughness feeds DLSS-RR a stable smooth primary surface, as for water.
+// roughness feeds DLSS-RR / NRD a stable smooth primary surface, as for water.
 const float GLASS_IOR = 1.52;
-const float GLASS_GUIDE_ROUGH = 0.04;
+const float GLASS_GUIDE_ROUGH = 0.06;
 // Transmitted-ray origin offset when crossing a glass face. Must be SMALLER than the terrain-side
 // TRANSLUCENT_INSET (RtTerrain, 2e-4 blocks): glass is recessed into its block by that inset, so a face
 // touching a slab/stair leaves a tiny gap before the neighbour's surface. A large bias (SURF_BIAS) would
@@ -190,8 +229,11 @@ const float RAY_CONE_GLOSSY_SPREAD_SCALE = 0.35;
 // water hits, or pc.waterParams.xyz for the camera's own biome when starting submerged). A blue ocean
 // tint (low red) absorbs red fastest → bluer with depth; swamp green-brown shifts the hue. The floor
 // keeps even a white-tinted body very slightly absorbing so deep water never reads as clear vacuum.
-const float WATER_DENSITY = 0.05;
-const vec3  WATER_ABSORB_FLOOR = vec3(0.015, 0.010, 0.008);
+// Tuned so mid-range ocean (tens of blocks) stays deep blue rather than pure black at SPP-1, while
+// still darkening with depth — NRD cannot invent missing transmission energy.
+const float WATER_DENSITY = 0.035;
+const vec3  WATER_ABSORB_FLOOR = vec3(0.010, 0.007, 0.005);
+
 vec3 waterExtinction(vec3 tint) {
     return WATER_ABSORB_FLOOR + WATER_DENSITY * (vec3(1.0) - clamp(tint, 0.0, 1.0));
 }
@@ -207,7 +249,8 @@ vec3 waterExtinction(vec3 tint) {
 //    gradient) so wavefronts wander instead of ruling straight periodic lines across the sea.
 // The domain is world-anchored (see applyWaterWaves) so the pattern is pinned in world space, and the
 // caustics (waterCaustic) differentiate this same field, so they stay in sync with the visible ripples.
-const float WATER_WAVE_STRENGTH = 0.3;  // slope scale (higher = choppier glints / more broken reflections)
+// Milder than 0.3: strong animated normals reject NRD/TAA history every frame → pan ghosting.
+const float WATER_WAVE_STRENGTH = 0.18;  // slope scale (higher = choppier glints / more broken reflections)
 const float WAVE_SPEED = 0.8;           // global time scale; dispersion keeps relative speeds physical
 const int   WAVE_COUNT = 10;            // λ = 14 m … 0.38 m (each octave 1.5× shorter)
 const float WAVE_G = 9.81;
@@ -385,6 +428,229 @@ uint pcg(inout uint s) {
     return (w >> 22u) ^ w;
 }
 float rndf(inout uint s) { return float(pcg(s)) * (1.0 / 4294967296.0); }
+// Hash function for ReSTIR (non-mutating, returns [0,1])
+float hash1(uint x) {
+    x = (x ^ 61u) ^ (x >> 16u);
+    x *= 9u;
+    x = x ^ (x >> 4u);
+    x *= 0x27d4eb2du;
+    x = x ^ (x >> 15u);
+    return float(x) * (1.0 / 4294967296.0);
+}
+
+// ============================================================================
+// ReSTIR Direct Illumination for block lights
+// ============================================================================
+
+struct Reservoir {
+    uint lightIndex;
+    float wSum;
+    float M;
+    uint age;
+};
+
+uvec4 packReservoir(Reservoir r) {
+    return uvec4(
+        r.lightIndex,
+        floatBitsToUint(r.wSum),
+        packHalf2x16(vec2(r.M, float(r.age))),
+        0u
+    );
+}
+
+Reservoir unpackReservoir(uvec4 packed) {
+    Reservoir r;
+    r.lightIndex = packed.x;
+    r.wSum = uintBitsToFloat(packed.y);
+    vec2 mAge = unpackHalf2x16(packed.z);
+    r.M = mAge.x;
+    r.age = uint(mAge.y);
+    return r;
+}
+
+Reservoir emptyReservoir() {
+    Reservoir r;
+    r.lightIndex = 0xFFFFFFFFu;
+    r.wSum = 0.0;
+    r.M = 0.0;
+    r.age = 0u;
+    return r;
+}
+
+void updateReservoir(inout Reservoir r, uint lightIdx, float weight, inout uint seed) {
+    r.wSum += weight;
+    r.M += 1.0;
+    if (rndf(seed) < weight / max(r.wSum, 1e-6)) {
+        r.lightIndex = lightIdx;
+    }
+}
+
+Reservoir combineReservoirs(Reservoir ra, Reservoir rb, float misWeight, float maxM) {
+    if (rb.lightIndex == 0xFFFFFFFFu) return ra;
+    if (ra.lightIndex == 0xFFFFFFFFu) return rb;
+
+    Reservoir r;
+    r.wSum = ra.wSum + rb.wSum * misWeight;
+    r.M = min(ra.M + rb.M * misWeight, maxM);
+    r.age = min(ra.age, rb.age);
+
+    float totalWeight = ra.wSum + rb.wSum * misWeight;
+    if (totalWeight > 1e-6) {
+        if (hash1(floatBitsToUint(totalWeight)) < ra.wSum / totalWeight) {
+            r.lightIndex = ra.lightIndex;
+        } else {
+            r.lightIndex = rb.lightIndex;
+        }
+    } else {
+        r.lightIndex = ra.lightIndex;
+    }
+
+    return r;
+}
+
+float getReservoirContribution(Reservoir r) {
+    if (r.lightIndex == 0xFFFFFFFFu || r.M < 0.5) return 0.0;
+    return r.wSum / max(r.M, 1.0);
+}
+
+vec3 getLightPosition(uint idx) {
+    return blockLights.lights[idx].xyz;
+}
+
+float getLightIntensity(uint idx) {
+    uint packed = floatBitsToUint(blockLights.lights[idx].w);
+    return unpackHalf2x16(packed).x;
+}
+
+vec3 getLightColor(uint idx) {
+    uint packed = floatBitsToUint(blockLights.lights[idx].w);
+    uint colorBits = packed & 0xFFFFu;
+    float r = float((colorBits >> 10) & 0x1Fu) / 31.0;
+    float g = float((colorBits >> 5) & 0x1Fu) / 31.0;
+    float b = float(colorBits & 0x1Fu) / 31.0;
+    return vec3(r, g, b);
+}
+
+vec3 evalBlockLightUnshadowed(uint lightIdx, vec3 hitPos, vec3 normal, vec3 albedo) {
+    if (lightIdx >= pc.blockLightCount) return vec3(0.0);
+
+    vec3 lightPos = getLightPosition(lightIdx);
+    vec3 toLight = lightPos - hitPos;
+    float distSq = dot(toLight, toLight);
+    float dist = sqrt(distSq);
+    vec3 L = toLight / dist;
+
+    float ndl = max(0.0, dot(normal, L));
+    if (ndl < 0.001) return vec3(0.0);
+
+    float intensity = getLightIntensity(lightIdx);
+    vec3 color = getLightColor(lightIdx);
+    float attenuation = intensity / (1.0 + distSq * 0.1);
+
+    return albedo * color * attenuation * ndl * INV_PI;
+}
+
+float targetFunction(uint lightIdx, vec3 hitPos, vec3 normal, vec3 albedo) {
+    vec3 contrib = evalBlockLightUnshadowed(lightIdx, hitPos, normal, albedo);
+    return max(contrib.r, max(contrib.g, contrib.b));
+}
+
+Reservoir generateCandidates(vec3 hitPos, vec3 normal, vec3 albedo, inout uint seed) {
+    Reservoir r = emptyReservoir();
+    if (pc.blockLightCount == 0) return r;
+
+    for (int i = 0; i < int(pc.restirCandidates); i++) {
+        uint lightIdx = uint(rndf(seed) * float(pc.blockLightCount));
+        lightIdx = min(lightIdx, pc.blockLightCount - 1);
+
+        float target = targetFunction(lightIdx, hitPos, normal, albedo);
+        float pdf = 1.0 / float(pc.blockLightCount);
+        float weight = target / max(pdf, 1e-6);
+
+        updateReservoir(r, lightIdx, weight, seed);
+    }
+
+    return r;
+}
+
+Reservoir temporalReuse(Reservoir rCurr, ivec2 pix, vec2 motion, ivec2 size,
+                        vec3 hitPos, vec3 normal, vec3 albedo) {
+    vec2 prevUv = (vec2(pix) + motion) / vec2(size);
+    ivec2 prevPix = ivec2(prevUv * vec2(size));
+
+    if (any(lessThan(prevPix, ivec2(0))) || any(greaterThanEqual(prevPix, size))) {
+        return rCurr;
+    }
+
+    uvec4 prevPacked = imageLoad(gReservoirPrev, prevPix);
+    Reservoir rPrev = unpackReservoir(prevPacked);
+
+    if (rPrev.lightIndex == 0xFFFFFFFFu || rPrev.age > 60u) {
+        return rCurr;
+    }
+
+    float targetPrev = targetFunction(rPrev.lightIndex, hitPos, normal, albedo);
+    float misWeight = targetPrev / max(rPrev.wSum / max(rPrev.M, 1.0), 1e-6);
+
+    Reservoir r = combineReservoirs(rCurr, rPrev, misWeight, pc.restirMaxMTemporal);
+    r.age = rPrev.age + 1u;
+    return r;
+}
+
+Reservoir spatialReuse(Reservoir rCenter, ivec2 pix, ivec2 size,
+                       vec3 hitPos, vec3 normal, vec3 albedo) {
+    Reservoir r = rCenter;
+
+    const ivec2 offsets[8] = ivec2[](
+        ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1),
+        ivec2(-1,  0),               ivec2(1,  0),
+        ivec2(-1,  1), ivec2(0,  1), ivec2(1,  1)
+    );
+
+    for (int i = 0; i < 8; i++) {
+        ivec2 nPix = pix + offsets[i];
+        if (any(lessThan(nPix, ivec2(0))) || any(greaterThanEqual(nPix, size))) continue;
+
+        uvec4 nPacked = imageLoad(gReservoirCurr, nPix);
+        Reservoir rNeighbor = unpackReservoir(nPacked);
+
+        if (rNeighbor.lightIndex == 0xFFFFFFFFu) continue;
+
+        float targetNeighbor = targetFunction(rNeighbor.lightIndex, hitPos, normal, albedo);
+        float misWeight = targetNeighbor / max(rNeighbor.wSum / max(rNeighbor.M, 1.0), 1e-6);
+
+        if (targetNeighbor < 1e-6) continue;
+
+        r = combineReservoirs(r, rNeighbor, misWeight, pc.restirMaxMSpatial);
+    }
+
+    return r;
+}
+
+vec3 evalBlockLightReSTIR(ivec2 pix, ivec2 size, vec3 hitPos, vec3 normal, vec3 albedo,
+                          vec2 motion, inout uint seed, out uint selectedLightIdx) {
+    selectedLightIdx = 0xFFFFFFFFu;
+
+    if (pc.blockLightCount == 0) return vec3(0.0);
+
+    Reservoir r = generateCandidates(hitPos, normal, albedo, seed);
+    r = temporalReuse(r, pix, motion, size, hitPos, normal, albedo);
+    r = spatialReuse(r, pix, size, hitPos, normal, albedo);
+
+    imageStore(gReservoirCurr, pix, packReservoir(r));
+
+    if (r.lightIndex == 0xFFFFFFFFu || r.M < 0.5) return vec3(0.0);
+
+    selectedLightIdx = r.lightIndex;
+    vec3 unshadowedContrib = evalBlockLightUnshadowed(r.lightIndex, hitPos, normal, albedo);
+
+    float pHat = r.wSum / max(r.M, 1.0);
+    if (pHat < 1e-6) return vec3(0.0);
+
+    return unshadowedContrib * getReservoirContribution(r) / pHat;
+}
+
+// ============================================================================
 
 vec3 primaryRayDir(vec2 ndc) {
     vec4 nearH = pc.invViewProj * vec4(ndc.x, ndc.y, 1.0, 1.0);
@@ -613,10 +879,73 @@ void refractedGuideHit(vec3 surfacePos, vec3 incidentDir, vec3 surfaceNormal, bo
     }
 }
 
-// One Monte Carlo path from (ro, rd). Returns accumulated radiance along the path.
-vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
-    vec3 L = vec3(0.0);
+// Split path radiance for official FFX Denoiser + hybrid NRD prep.
+// unshadowedDirect: bounce-0 diffuse NEE without visibility (× primaryShadow / denoised mask in composite)
+// diffuseOther: multi-bounce NEE (raw vis), GI, emission, non-specular sky, SSS (own vis)
+// specular: Cook-Torrance NEE * vis + specular-lobe path continuation
+// primaryShadow: bounce-0 NEE visibility scalar (1 = fully lit / sky / no NEE)
+// hitDistDiffuse / hitDistSpecular: NRD hit-distance (meters-ish); 0 if unknown
+// Energy: undenoised = unshadowedDirect * primaryShadow + diffuseOther + specular
+struct PathAccum {
+    vec3 unshadowedDirect;
+    vec3 diffuseOther;
+    vec3 specular;
+    float primaryShadow;
+    float hitDistDiffuse;
+    float hitDistSpecular;
+};
+
+// One-bounce radiance along a mirror ray (sky miss or lit opaque hit). Used to evaluate the
+// Fresnel reflection lobe on primary water/ice every frame so SPP-1 does not stochastically
+// skip it (~F=0.02 when looking down → black lakes without this).
+vec3 mirrorLobeRadiance(vec3 origin, vec3 dir, float coneWidth, float coneSpread) {
+    payload.hitT = -1.0;
+    payloadSetTraceState(true, coneWidth, coneSpread);
+    hitObjectEXT hObj;
+    hitObjectTraceReorderExecuteEXT(hObj, topLevelAS, gl_RayFlagsNoneEXT, CULL_SECONDARY,
+                SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, origin, RAY_TMIN, dir, 10000.0, 0);
+    if (payload.hitT < 0.0) {
+        return max(payload.albedo, vec3(0.0)); // sky / sun disc from miss
+    }
+    uint mat = payloadMaterial();
+    vec3 hitP = origin + dir * payload.hitT;
+    vec3 hn = payload.normal;
+    vec3 alb = max(payload.albedo, vec3(0.0));
+    if (mat == MATERIAL_OPAQUE) {
+        vec3 L = vec3(0.0);
+        float emission = payloadEmission();
+        if (emission > 0.0) {
+            L += alb * emission * EMISSIVE_STRENGTH;
+        }
+        vec3 lightDir = pc.lightDir.xyz;
+        float ndl = max(0.0, dot(hn, lightDir));
+        if (ndl > 0.0) {
+            vec3 vis = visibility(hitP + hn * SURF_BIAS, lightDir, 10000.0);
+            L += alb * INV_PI * pc.lightRadiance.xyz * ndl * vis;
+        }
+        // Soft fill so reflected cliffs/snow aren't pure black under overcast
+        L += alb * 0.05;
+        return L;
+    }
+    if (mat == MATERIAL_GLASS) {
+        return alb * 0.45; // thin ice/glass flash
+    }
+    // Water or particle: weak tinted response (avoid infinite mirror recursion)
+    return alb * 0.12;
+}
+
+// One Monte Carlo path from (ro, rd). Returns split radiance + primary shadow.
+PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
+    PathAccum acc;
+    acc.unshadowedDirect = vec3(0.0);
+    acc.diffuseOther = vec3(0.0);
+    acc.specular = vec3(0.0);
+    acc.primaryShadow = 1.0;
+    acc.hitDistDiffuse = 0.0;
+    acc.hitDistSpecular = 0.0;
     vec3 throughput = vec3(1.0);
+    // After a specular (GGX / dielectric) bounce, further path energy is specular-path.
+    bool pathIsSpecular = false;
     float rayConeWidth = 0.0;
     float rayConeSpread = max(primaryConeSpread, RAY_CONE_MIN_SPREAD);
     int maxBounces = int(pc.maxBounces);
@@ -665,7 +994,11 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
                 gv_motionUseRefracted = false;
                 gv_motionObjDisp = vec3(0.0); // sky is static
             }
-            L += throughput * sky; // escaped to sky
+            if (pathIsSpecular) {
+                acc.specular += throughput * sky;
+            } else {
+                acc.diffuseOther += throughput * sky;
+            }
             break;
         }
 
@@ -691,24 +1024,36 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
             vec3 glassTint = payload.albedo;
             float cosI = clamp(dot(-rd, n), 0.0, 1.0);
             float F = fresnelDielectric(cosI, 1.0, GLASS_IOR);
-            if (bounce == 0) { // primary glass hit: feed RR a smooth dielectric specular surface
+            if (bounce == 0) { // primary glass/ice: always both lobes (SPP-1 dark-ice fix)
                 gv_normal = n;
                 gv_rough = GLASS_GUIDE_ROUGH;
                 gv_specAlb = vec3(F);
-                gv_albedo = glassTint;            // demodulate by the transmission tint
+                gv_albedo = glassTint;
                 gv_hitCamRel = hitPos - pc.camOffset;
                 gv_motionHitCamRel = gv_hitCamRel;
                 gv_motionUseRefracted = false;
-                gv_motionObjDisp = payload.motionPrev; // 0 for static terrain
+                gv_motionObjDisp = payload.motionPrev;
+                acc.hitDistDiffuse = max(payload.hitT, 0.0);
+                acc.hitDistSpecular = max(payload.hitT, 0.0);
+                // Deterministic Fresnel split: reflection every frame + transmit with (1-F)*tint.
+                vec3 rdir = reflect(rd, n);
+                acc.specular += throughput * F
+                        * mirrorLobeRadiance(hitPos + n * SURF_BIAS, rdir, rayConeWidth, rayConeSpread);
+                throughput *= (1.0 - F) * glassTint;
+                ro = hitPos - n * GLASS_TRANSMIT_BIAS;
+                showCelestial = true;
+                pathIsSpecular = true;
+                continue;
             }
             if (rndf(seed) < F) {
                 rd = reflect(rd, n);
-                ro = hitPos + n * SURF_BIAS;       // reflected ray stays on the incidence side
+                ro = hitPos + n * SURF_BIAS;
             } else {
-                throughput *= glassTint;           // colored transmission
-                ro = hitPos - n * GLASS_TRANSMIT_BIAS; // cross to the far side without overshooting a close neighbour
+                throughput *= glassTint;
+                ro = hitPos - n * GLASS_TRANSMIT_BIAS;
             }
-            showCelestial = true;                  // specular interface: the continuation ray may see the disc
+            showCelestial = true;
+            pathIsSpecular = true;
             if (bounce >= rrStart) {
                 float q = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.02, 1.0);
                 if (rndf(seed) > q) {
@@ -745,8 +1090,14 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
             if (ndl > 0.0) {
                 vec3 shadowOrigin = hitPos + (signedNdl >= 0.0 ? n : -n) * SURF_BIAS;
                 vec3 vis = visibility(shadowOrigin, lightDir, 10000.0);
-                if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
-                    L += throughput * albedo * INV_PI * pc.lightRadiance.xyz * ndl * vis;
+                float sh = max(vis.r, max(vis.g, vis.b));
+                vec3 diffNee = throughput * albedo * INV_PI * pc.lightRadiance.xyz * ndl;
+                if (bounce == 0) {
+                    acc.primaryShadow = sh;
+                    // Unshadowed primary NEE (shadow applied in composite after FFX Shadow Denoiser).
+                    acc.unshadowedDirect += diffNee;
+                } else {
+                    acc.diffuseOther += diffNee * vis;
                 }
             }
 
@@ -758,15 +1109,14 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
             rd = cosineDir(n, seed);
             rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
             showCelestial = false; // diffuse receiver: direct sun/moon was handled by NEE above
+            pathIsSpecular = false;
             continue;
         }
 
-        // Water: smooth dielectric interface. Choose reflection or refraction stochastically by the
-        // Fresnel reflectance F — sampling by F leaves the throughput unchanged (lossless interface), so
-        // there is no diffuse albedo multiply and no sun NEE here (the surface is specular). Medium
-        // tracking decides air->water vs water->air from the path state, not the hit geometry, so the
-        // duplicated FluidRenderer back-faces don't confuse the orientation; the normal `n` already
-        // faces the incoming ray. The bounce cap bounds stacked refractions.
+        // Water: smooth dielectric interface. Secondary hits still choose reflect/refract by F
+        // (unbiased). Primary hits always evaluate BOTH lobes — SPP-1 looking down has F≈0.02 so
+        // pure stochastic sampling almost never shows sky reflections → black lakes. Medium
+        // tracking decides air↔water from path state, not hit geometry; `n` faces the ray.
         if (material == MATERIAL_WATER) {
             // Ripple the (near-flat) surface normal before any Fresnel/guide use → glints, broken
             // reflections, wobbling refraction. This water body's biome tint (carried in payload.albedo
@@ -778,35 +1128,69 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
             }
             waterExt = waterExtinction(payload.albedo);
             float cosI = clamp(dot(-rd, n), 0.0, 1.0);
-            if (bounce == 0) { // primary water hit: feed RR a smooth dielectric specular surface
-                gv_normal = n;
-                gv_rough = WATER_GUIDE_ROUGH;
-                gv_hitCamRel = hitPos - pc.camOffset; // depth + reflection start at the water surface
-                // Diffuse AND specular albedo + MV track the refracted hit (floor/shore seen through the
-                // surface) so refracted content stops ghosting; depth stays on the water surface. Water's
-                // own Fresnel reflectance is ignored here — it's a clear interface, not a demodulation target.
-                vec3 refractedAlbedo;
-                vec3 refractedSpecAlbedo;
-                refractedGuideHit(hitPos, rd, n, inWater, rayConeWidth, rayConeSpread,
-                        gv_motionHitCamRel, gv_motionObjDisp,
-                        gv_motionUseRefracted, refractedAlbedo, refractedSpecAlbedo);
-                gv_albedo = refractedAlbedo;
-                gv_specAlb = refractedSpecAlbedo;
-            }
             float etaI = inWater ? WATER_IOR : 1.0;
             float etaT = inWater ? 1.0 : WATER_IOR;
             float F = fresnelDielectric(cosI, etaI, etaT);
+
+            if (bounce == 0) {
+                gv_normal = n;
+                gv_rough = WATER_GUIDE_ROUGH;
+                gv_hitCamRel = hitPos - pc.camOffset;
+                // Surface MV (not refracted floor): NRD/TAA reproject the water *plane*. Tracking
+                // the underwater hit made reflections + the surface smear when the camera moved.
+                gv_motionHitCamRel = gv_hitCamRel;
+                gv_motionUseRefracted = false;
+                gv_motionObjDisp = vec3(0.0);
+                // Albedo guides still prefer the refracted content for RR demodulation detail.
+                vec3 refractedAlbedo;
+                vec3 refractedSpecAlbedo;
+                vec3 _mhc;
+                vec3 _mod;
+                bool _usedRefr;
+                refractedGuideHit(hitPos, rd, n, inWater, rayConeWidth, rayConeSpread,
+                        _mhc, _mod, _usedRefr, refractedAlbedo, refractedSpecAlbedo);
+                gv_albedo = max(refractedAlbedo, payload.albedo * 0.25);
+                gv_specAlb = max(refractedSpecAlbedo, vec3(max(F, 0.04)));
+                acc.hitDistDiffuse = max(payload.hitT, 0.0);
+                acc.hitDistSpecular = max(payload.hitT, 0.0);
+
+                // Always add Fresnel reflection (sky / shore) this frame.
+                vec3 rdir = reflect(rd, n);
+                acc.specular += throughput * F
+                        * mirrorLobeRadiance(hitPos + n * SURF_BIAS, rdir, rayConeWidth, rayConeSpread);
+
+                // Biome body fill: pure dielectric + deep absorption reads as vacuum black.
+                // A mild surface-ish term recovers vanilla-like blue without killing depth.
+                float bodyW = (1.0 - F) * 0.22;
+                vec3 bodyLit = max(pc.lightRadiance.xyz, vec3(0.0)) * 0.12 + vec3(0.035);
+                acc.diffuseOther += throughput * payload.albedo * bodyW * bodyLit;
+
+                // Continue only through refraction with residual weight (or TIR → done).
+                vec3 tdir = refract(rd, n, etaI / etaT);
+                if (dot(tdir, tdir) > 0.0) {
+                    rd = normalize(tdir);
+                    ro = hitPos - n * SURF_BIAS;
+                    inWater = !inWater;
+                    throughput *= (1.0 - F);
+                    showCelestial = true;
+                    pathIsSpecular = true;
+                    continue;
+                }
+                // Total internal reflection already counted in F≈1 reflection above.
+                break;
+            }
+
+            // Secondary water interfaces: unbiased stochastic choice.
             if (rndf(seed) < F) {
                 rd = reflect(rd, n);
-                ro = hitPos + n * SURF_BIAS; // reflected ray stays on the incidence side
+                ro = hitPos + n * SURF_BIAS;
             } else {
-                rd = refract(rd, n, etaI / etaT); // F < 1 here, so this is never total internal reflection
-                ro = hitPos - n * SURF_BIAS;       // transmitted ray crosses to the far side
+                rd = refract(rd, n, etaI / etaT);
+                ro = hitPos - n * SURF_BIAS;
                 inWater = !inWater;
             }
-            // Specular interface (mirror reflect / clear refract): the continuation ray should see the
-            // sun/moon disc directly — no NEE happened here to double-count it.
             showCelestial = true;
+            pathIsSpecular = true;
             if (bounce >= rrStart) {
                 float q = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.02, 1.0);
                 if (rndf(seed) > q) {
@@ -822,13 +1206,21 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
         vec3 p = hitPos + n * SURF_BIAS;
         vec3 v = -rd; // view direction (toward the camera / incoming ray)
 
-        // Material split. Metals tint F0 by albedo and have no diffuse lobe; dielectrics use a fixed 0.04 F0.
+        // Material split. Metals tint F0 by albedo and have no diffuse lobe; dielectrics use a fixed F0.
         // With PBR disabled this collapses to the Lambertian fallback.
         float rough = pbr ? clamp(payloadRoughness(), MIN_ROUGH, 1.0) : 1.0;
         float metal = pbr ? clamp(payloadMetalness(), 0.0, 1.0) : 0.0;
         vec3 diffAlb = albedo * (1.0 - metal);
-        // F0 comes from the chit: dielectric 0.04, a LabPBR custom/metal F0, or albedo for metals.
-        vec3 F0 = pbr ? payload.f0 : mix(vec3(0.04), albedo, metal);
+        // F0 from chit (dielectric / LabPBR / metal). Tone down dielectrics so sand/wood/stone
+        // don't read as plastic under desert sun (vanilla is almost purely diffuse).
+        vec3 F0 = pbr ? payload.f0 : mix(vec3(0.02), albedo, metal);
+        if (pbr && metal < 0.5) {
+            // Cap dielectric F0 (LabPBR green can be high) and use a lower default sheen.
+            F0 = min(F0, vec3(0.06)) * 0.55;
+            // Extra matte for rough terrain: sand/dirt/planks (rough~0.9) almost lose specular.
+            float matte = smoothstep(0.35, 0.95, rough);
+            F0 *= mix(1.0, 0.25, matte);
+        }
 
         if (bounce == 0) { // primary-visibility surface: capture the denoiser guide buffers
             gv_normal = n;
@@ -839,6 +1231,11 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
             gv_motionHitCamRel = gv_hitCamRel;
             gv_motionUseRefracted = false;
             gv_motionObjDisp = payload.motionPrev; // per-vertex world motion (0 for static terrain/sky)
+            acc.hitDistDiffuse = max(payload.hitT, 0.0); // NRD IN_DIFF hit distance
+        }
+        // First specular-path hit distance (for NRD IN_SPEC); keep primary if never went specular.
+        if (pathIsSpecular && acc.hitDistSpecular <= 0.0) {
+            acc.hitDistSpecular = max(payload.hitT, 0.0);
         }
 
         // Emissive surfaces (lava, glowstone, torches, ...) add radiance directly, colored by albedo.
@@ -847,11 +1244,13 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
         // converges static views.
         float emission = payloadEmission();
         if (emission > 0.0) {
-            L += throughput * albedo * emission * EMISSIVE_STRENGTH;
+            // Emissive is not modulated by the primary sun shadow mask.
+            acc.diffuseOther += throughput * albedo * emission * EMISSIVE_STRENGTH;
         }
 
         // NEE: direct light from the dominant celestial body (sun by day, moon by night) — Lambert diffuse
-        // + GGX specular, one shadow ray. The specular term gives the glint on water/metals/smooth blocks.
+        // + GGX specular, one shadow ray. Bounce-0 diffuse NEE is unshadowed (mask in gShadowHit);
+        // multi-bounce diffuse NEE keeps raw vis (cannot reuse primary shadow). Specular NEE always * vis.
         // Jitter the light direction within its square angular extent (pc.lightDir.w half-angle) so
         // the shadow ray samples the light's quad — soft penumbrae over accumulation. half-angle 0 = hard
         // shadow. The same sampled direction drives ndl, the shadow ray, and the specular half-vector.
@@ -869,19 +1268,56 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
             if (inWater && waterWaves && shadowVis.waterT > 0.0) {
                 vis *= waterCaustic(p + lightDir * shadowVis.waterT, lightDir, shadowVis.waterT);
             }
-            if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
-                vec3 brdf = diffAlb * INV_PI; // Lambertian diffuse (f = albedo/PI)
-                if (pbr) {
-                    vec3 h = normalize(lightDir + v);
-                    float ndh = max(0.0, dot(n, h));
-                    float ndv = max(1.0e-4, dot(n, v));
-                    float vdh = max(0.0, dot(v, h));
-                    float D = ggxD(ndh, rough);
-                    float G = ggxG1(ndv, rough) * ggxG1(ndl, rough); // separable Smith masking
-                    vec3 F = fresnelSchlick(vdh, F0);
-                    brdf += (D * G) * F / (4.0 * ndv * ndl); // Cook–Torrance specular
+            float sh = max(vis.r, max(vis.g, vis.b));
+            vec3 lightContrib = pc.lightRadiance.xyz * ndl;
+            vec3 diffNee = throughput * (diffAlb * INV_PI) * lightContrib;
+            if (bounce == 0) {
+                acc.primaryShadow = sh;
+                // Unshadowed primary direct (composite multiplies denoised shadow later).
+                acc.unshadowedDirect += diffNee;
+            } else {
+                // Secondary NEE: keep raw visibility (primary mask does not apply).
+                acc.diffuseOther += diffNee * vis;
+            }
+            if (pbr) {
+                vec3 h = normalize(lightDir + v);
+                float ndh = max(0.0, dot(n, h));
+                float ndv = max(1.0e-4, dot(n, v));
+                float vdh = max(0.0, dot(v, h));
+                float D = ggxD(ndh, rough);
+                float G = ggxG1(ndv, rough) * ggxG1(ndl, rough); // separable Smith masking
+                vec3 F = fresnelSchlick(vdh, F0);
+                // Rough dielectrics: kill leftover sun glints that still read as "wet sand".
+                if (metal < 0.5) {
+                    F *= mix(1.0, 0.35, smoothstep(0.4, 0.95, rough));
                 }
-                L += throughput * brdf * pc.lightRadiance.xyz * ndl * vis;
+                vec3 specBrdf = (D * G) * F / (4.0 * ndv * ndl); // Cook–Torrance specular
+                // Specular keeps raw shadow for now (Reflection Denoiser does not replace NEE shadow).
+                acc.specular += throughput * specBrdf * lightContrib * vis;
+            }
+        }
+
+        // ReSTIR DI: block lights (torches, lava, glowstone) — only on bounce 0 opaque surfaces
+        if (bounce == 0 && material == MATERIAL_OPAQUE && pc.blockLightCount > 0) {
+            uint selectedLight;
+            vec2 motion = vec2(0.0); // motion vector for temporal reprojection (TODO: use actual MV)
+            vec3 blockLightUnshadowed = evalBlockLightReSTIR(
+                ivec2(gl_LaunchIDEXT.xy),
+                ivec2(gl_LaunchSizeEXT.xy),
+                p, n, diffAlb,
+                motion, seed, selectedLight
+            );
+
+            // Apply visibility test to the selected light
+            if (selectedLight != 0xFFFFFFFFu) {
+                vec4 lightData = blockLights.lights[selectedLight];
+                vec3 lightPos = lightData.xyz;
+                vec3 toLight = lightPos - p;
+                float dist = length(toLight);
+                vec3 L = toLight / dist;
+                vec3 vis = visibility(p, L, dist);
+
+                acc.diffuseOther += blockLightUnshadowed * vis;
             }
         }
 
@@ -902,7 +1338,7 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
                 }
                 if (max(visB.r, max(visB.g, visB.b)) > 0.0) {
                     float cosT = dot(lightDir, rd);
-                    L += throughput * diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * backNdl * pc.lightRadiance.xyz * visB;
+                    acc.diffuseOther += throughput * diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * backNdl * pc.lightRadiance.xyz * visB;
                 }
             }
         }
@@ -925,16 +1361,19 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
                 rd = l;
                 rayConeSpread = max(rayConeSpread, rough * rough * RAY_CONE_GLOSSY_SPREAD_SCALE);
                 showCelestial = true; // specular lobe: this ray is a (glossy) mirror — show the disc
+                pathIsSpecular = true;
             } else {
                 throughput *= diffAlb / (1.0 - ps);
                 ro = p;
                 rd = cosineDir(n, seed);
                 rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
+                pathIsSpecular = false;
                 showCelestial = false; // diffuse lobe: disc covered by NEE, hide it (anti-firefly)
             }
         } else {
             throughput *= albedo; // Lambertian fallback (PI and cos cancel)
             showCelestial = false; // diffuse bounce: hide the disc (covered by NEE)
+            pathIsSpecular = false;
             ro = p;
             rd = cosineDir(n, seed);
             rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
@@ -949,13 +1388,29 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
             throughput /= q;
         }
     }
-    return L;
+    return acc;
 }
 
 void main() {
     pc = WorldPushRef(pcAddr.worldPushAddr).v; // load the per-frame push data from the BDA buffer
-    const ivec2 pix = ivec2(gl_LaunchIDEXT.xy);
-    const vec2 size = vec2(gl_LaunchSizeEXT.xy);
+    ivec2 pix = ivec2(gl_LaunchIDEXT.xy);
+    ivec2 launchSize = ivec2(gl_LaunchSizeEXT.xy);
+    ivec2 extent = imageSize(outImage);
+    extent = min(extent, imageSize(gNormal));
+    extent = min(extent, imageSize(gAlbedo));
+    extent = min(extent, imageSize(gDepth));
+    extent = min(extent, imageSize(gMotion));
+    extent = min(extent, imageSize(gSpecAlbedo));
+    extent = min(extent, imageSize(gSpecMotion));
+    extent = min(extent, imageSize(gShadowHit));
+    extent = min(extent, imageSize(gDiffuse));
+    extent = min(extent, imageSize(gReflection));
+    // Defense-in-depth for resize/fullscreen races: trace launch size should match the bound storage images,
+    // but if any stale descriptor has a smaller extent, never let imageStore scribble past it.
+    if (pix.x >= extent.x || pix.y >= extent.y) {
+        return;
+    }
+    vec2 size = vec2(launchSize);
     vec2 uv = (vec2(pix) + 0.5) / size;
     vec2 ndc = uv * 2.0 - 1.0; // unjittered pixel centre — the motion vector reprojects this
 
@@ -979,12 +1434,35 @@ void main() {
     uint seed = (uint(pix.x) * 1973u + uint(pix.y) * 9277u + 26699u) ^ (pc.frameIndex * 2654435761u);
 
     uint spp = max(pc.spp, 1u);
-    vec3 frameRadiance = vec3(0.0);
+    vec3 frameUnshadowedDirect = vec3(0.0);
+    vec3 frameDiffuseOther = vec3(0.0);
+    vec3 frameSpecular = vec3(0.0);
+    float frameShadow = 0.0;
+    float frameHitDiff = 0.0;
+    float frameHitSpec = 0.0;
     for (uint s = 0u; s < spp; s++) {
         seed = pcg(seed); // decorrelate per-sample paths (shared camera ray, no AA jitter yet)
-        frameRadiance += tracePath(origin, dir, rayConeSpread, seed);
+        PathAccum path = tracePath(origin, dir, rayConeSpread, seed);
+        frameUnshadowedDirect += path.unshadowedDirect;
+        frameDiffuseOther += path.diffuseOther;
+        frameSpecular += path.specular;
+        frameShadow += path.primaryShadow;
+        frameHitDiff += path.hitDistDiffuse;
+        frameHitSpec += path.hitDistSpecular > 0.0 ? path.hitDistSpecular : path.hitDistDiffuse;
     }
-    frameRadiance /= float(spp);
+    float invSpp = 1.0 / float(spp);
+    frameUnshadowedDirect *= invSpp;
+    frameDiffuseOther *= invSpp;
+    frameSpecular *= invSpp;
+    frameShadow *= invSpp;
+    frameHitDiff *= invSpp;
+    frameHitSpec *= invSpp;
+    // gDiffuse stores ONLY unshadowed primary direct (for shadow re-weight composite).
+    // GI/sky/emissive stay in beauty (outImage) so denoise never multiplies them by shadow.
+    //   beauty = unshadowedDirect * shadow + diffuseOther + specular
+    //   after denoise: beauty + unshadowedDirect * (shadowClean - shadowRaw)
+    vec3 frameDiffuse = frameUnshadowedDirect; // binding gDiffuse — not "full diffuse layer"
+    vec3 frameRadiance = frameUnshadowedDirect * frameShadow + frameDiffuseOther + frameSpecular;
 
     // Hardware (non-linear, reversed-Z) depth for DLSS-RR + Frame Generation: project the camera-relative
     // primary hit through the forward view-projection and take ndc z/w — exactly the value a rasterizer
@@ -1000,29 +1478,39 @@ void main() {
     imageStore(gSpecAlbedo, pix, vec4(gv_specAlb, 1.0)); // specular albedo for RR demodulation
 
     // Motion vector: reproject this guide point through the previous frame's view-projection.
-    // The primary ray was cast through the JITTERED ndc (jndc), so this hit's current screen position is
-    // jndc, NOT the pixel centre. Subtract jndc so the MV is jitter-free (= 0 when static), which is what
-    // DLSS expects with MVJittered unset. (Subtracting the unjittered centre leaked the per-frame jitter
-    // into the MV as a constant screen-wide offset = pc.jitter.) Scaled from NDC into render-pixel space.
+    // The current position is the UNJITTERED pixel centre — MVJittered=0 (DLSS-RR's
+    // FEATURE_FLAGS deliberately omits MV_JITTERED, FSR/XeSS use the same convention).
+    // Using `jndc` here would write `MV = -jitter_in_render_pixels` for every static
+    // surface, so FFX reproject / DLSS-RR / FSR / XeSS would sample history from a
+    // different screen position each frame and the temporal accumulator would never
+    // converge — visible as a moving-camera smear. `ndc` is the unjittered pixel
+    // centre in [-1,1] (computed at the top of main()).
     // For a dynamic surface, previous-frame position is the current point minus its world-space
     // displacement; subtracting gv_motionObjDisp de-cameras the MV.
     // gv_motionObjDisp is the chit's PER-VERTEX displacement barycentric-interpolated at the hit (exact
     // for rotation + skeletal/lid animation, not just rigid translation), and 0 for static terrain/sky.
-    vec4 prevClip = pc.prevViewProj * vec4(gv_motionHitCamRel + pc.camDelta - gv_motionObjDisp, 1.0);
-    vec2 prevNdc = prevClip.xy / prevClip.w;
-    vec2 curNdc = jndc; // primary hit's current screen position is exactly the jittered ray ndc
+    vec3 prevPosCamRel = gv_motionHitCamRel + pc.camDelta - gv_motionObjDisp;
+    vec4 prevClip = pc.prevViewProj * vec4(prevPosCamRel, 1.0);
+    vec2 prevNdc = prevClip.xy / max(prevClip.w, 1e-6);
+    vec2 curNdc = ndc; // unjittered pixel centre — MVJittered=0 contract (was `jndc`; ghosting fix v0.5.3)
     // Water MV guide: track the one-refraction hit (the floor seen through the
     // surface), not the water surface, so refracted content stops ghosting. We treat that hit as its own
     // feature: its screen motion is its own reprojection delta (prev - current projection). This is
-    // bit-exact zero when static and needs no Snell solve for the previous surface point. The constant
-    // per-frame refraction offset (hit's current projection vs jndc) cancels out of prev - current.
+    // bit-exact zero when static and needs no Snell solve for the previous surface point. The
+    // refracted-hit projection replaces curNdc so its own motion is captured (the per-frame
+    // sub-pixel jitter is NOT used here — the projection comes from the unjittered curViewProj).
     if (gv_motionUseRefracted) {
         vec4 curClipRefr = pc.curViewProj * vec4(gv_motionHitCamRel, 1.0);
-        curNdc = curClipRefr.xy / curClipRefr.w;
+        curNdc = curClipRefr.xy / max(curClipRefr.w, 1e-6);
     }
+    // 2D screen MV in pixels: NRD expects pixelUvPrev = pixelUv + mv.xy * scale (scale=1/res).
+    // z left 0 — 2.5D was disabled in NRD common settings (clip.w ≠ prepare viewZ).
     vec2 motion = (prevNdc - curNdc) * 0.5 * size;
+    if (length(gv_normal) < 0.5) {
+        motion = vec2(0.0);
+    }
     imageStore(gMotion, pix, vec4(motion, 0.0, 0.0));
-    vec2 specMotion = specularReflectionMotion(gv_hitCamRel + pc.camOffset, dir, jndc, size, rayConeSpread);
+    vec2 specMotion = specularReflectionMotion(gv_hitCamRel + pc.camOffset, dir, ndc, size, rayConeSpread);
     imageStore(gSpecMotion, pix, vec4(specMotion, 0.0, 0.0));
 
     // Debug guide-buffer visualization: bypass accumulation and show a guide directly.
@@ -1040,13 +1528,56 @@ void main() {
             dbg = gv_specAlb;                       // specular albedo
         } else if (pc.debugView == 7u) {
             dbg = vec3(clamp(0.5 + specMotion * 0.05, 0.0, 1.0), 0.5); // reflection motion
+        } else if (pc.debugView == 8u) {
+            dbg = vec3(frameShadow); // primary NEE shadow hit
+        } else if (pc.debugView == 9u) {
+            dbg = frameUnshadowedDirect; // unshadowed primary direct (shadow denoise input)
+        } else if (pc.debugView == 10u) {
+            dbg = frameSpecular; // reflection/specular split
         } else {
             dbg = vec3(clamp(0.5 + motion * 0.05, 0.0, 1.0), 0.5); // motion: red=+x, green=+y
         }
+        // Still write split buffers so denoise/debug tools can inspect them under any view.
+        imageStore(gShadowHit, pix, vec4(clamp(frameShadow, 0.0, 1.0), 0.0, 0.0, 0.0));
+        imageStore(gDiffuse, pix, vec4(frameUnshadowedDirect, frameHitDiff));
+        imageStore(gReflection, pix, vec4(frameSpecular, frameHitSpec));
         imageStore(outImage, pix, vec4(dbg, 1.0));
         return;
     }
 
     // Single noisy estimate; the denoiser (DLSS-RR) handles temporal convergence.
+    //
+    // Non-finite guard: a degenerate geometry hit (zero-area triangle, NaN t-hit
+    // from a missed intersection on a near-zero-determinant sub-tetra) can leave
+    // frameRadiance with NaN / +Inf / -Inf channels. fp16 imageStore saturates
+    // a random bit pattern that the FFX atrous colour-weight (sigma 0.55..3.4)
+    // cannot dampen, seeding a uniform-grid pattern of stuck-on orange pixels
+    // across the entire frame (poisoned history persists into subsequent frames
+    // too). Reset to zero — zero is FFX's "no current contribution" baseline,
+    // and the AgX tonemap can roll a near-zero radiance to black without an
+    // eye-stab. HDR magnitudes are deliberately NOT clamped here; the display
+    // pipeline's AgX owns HDR roll-off and the user-configurable exposure scale.
+    if (any(isnan(frameRadiance)) || any(isinf(frameRadiance))) {
+        frameRadiance = vec3(0.0);
+    }
+    if (any(isnan(frameUnshadowedDirect)) || any(isinf(frameUnshadowedDirect))) {
+        frameUnshadowedDirect = vec3(0.0);
+    }
+    if (any(isnan(frameSpecular)) || any(isinf(frameSpecular))) {
+        frameSpecular = vec3(0.0);
+    }
+    // HDR firefly squash: clamp the per-pixel radiance at MAX_HDR_RADIANCE so
+    // a single Cook–Torrance specular spike (see the comment on the constant)
+    // cannot survive into the FFX atrous colour weight as a stuck-on hot
+    // pixel. fp16 storage also floods to a near-uniform saturated value for
+    // any radiance > ~65504, which is the same failure mode visually.
+    frameRadiance = min(frameRadiance, vec3(MAX_HDR_RADIANCE));
+    frameUnshadowedDirect = min(frameUnshadowedDirect, vec3(MAX_HDR_RADIANCE));
+    frameSpecular = min(frameSpecular, vec3(MAX_HDR_RADIANCE));
     imageStore(outImage, pix, vec4(frameRadiance, 1.0));
+    imageStore(gShadowHit, pix, vec4(clamp(frameShadow, 0.0, 1.0), 0.0, 0.0, 0.0));
+    // rgb = unshadowed primary direct (FFX shadow re-weight); a = primary hitDist for NRD.
+    imageStore(gDiffuse, pix, vec4(frameUnshadowedDirect, frameHitDiff));
+    // rgb = specular; a = specular-path hitDist for NRD.
+    imageStore(gReflection, pix, vec4(frameSpecular, frameHitSpec));
 }

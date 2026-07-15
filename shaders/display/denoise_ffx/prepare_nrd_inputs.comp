@@ -1,0 +1,209 @@
+// Pack NRD REBLUR inputs AFTER FFX shadow+reflection prepass.
+//
+// REBLUR expects YCoCg + normalized hit distance (NRD.hlsli) and
+// NRD_FrontEnd_PackNormalAndRoughness (best-fit for RGBA16_SNORM / FP).
+//
+// Albedo demode: denoise irradiance, remultiply in compose so villager faces /
+// block textures survive strong spatial blur (MCVR/Radiance style).
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly  uniform image2D gBeautyRaw;
+layout(binding = 1, rgba16f) readonly  uniform image2D gUnshadowed;
+layout(binding = 2, r8)      readonly  uniform image2D gShadowRaw;
+layout(binding = 3, rg16f)   readonly  uniform image2D gShadowClean;
+layout(binding = 4, rgba16f) readonly  uniform image2D gSpecRaw;
+layout(binding = 5, rgba16f) readonly  uniform image2D gSpecClean;
+layout(binding = 6, r32f)    readonly  uniform image2D gDeviceDepth;
+layout(binding = 7, rgba16f) writeonly uniform image2D gNrdDiffuse;
+layout(binding = 8, rgba16f) writeonly uniform image2D gNrdSpecular;
+layout(binding = 9, r32f)    writeonly uniform image2D gViewZ;
+layout(binding = 10, rgba16f) readonly uniform image2D gDiffAlbedo;
+layout(binding = 11, rgba16f) readonly uniform image2D gSpecAlbedo;
+layout(binding = 12, rgba16f) readonly uniform image2D gNormalRough;
+// Packed normal+rough for NRD (RGBA16_SNORM encoding on FP16 storage).
+layout(binding = 13, rgba16f) writeonly uniform image2D gNrdNormalRough;
+
+layout(push_constant) uniform Push {
+    float cameraNear;
+    float hitA;
+    float hitB;
+    float hitC;
+    // 1 = NRD-only path: ignore FFX-cleaned layers (Sclean=Sraw, Rclean=Rraw).
+    // 0 = hybrid: use gShadowClean / gSpecClean from the FFX prepass.
+    float useRawLayers;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+} pc;
+
+vec3 linearToYCoCg(vec3 color) {
+    float Y  = dot(color, vec3(0.25, 0.5, 0.25));
+    float Co = dot(color, vec3(0.5, 0.0, -0.5));
+    float Cg = dot(color, vec3(-0.25, 0.5, -0.25));
+    return vec3(Y, Co, Cg);
+}
+
+// NRD_FrontEnd_PackNormalAndRoughness for RGBA16_SNORM / FP (NRD_NORMAL_ENCODING=4).
+// Best-fit: divide by max abs component so SNORM/FP uses full range.
+vec4 packNormalRoughness(vec3 N, float roughness) {
+    N = normalize(N + vec3(0.0, 1e-6, 0.0));
+    float m = max(abs(N.x), max(abs(N.y), abs(N.z)));
+    N /= max(m, 1e-6);
+    return vec4(N, clamp(roughness, 0.0, 1.0));
+}
+
+float specMagicCurve(float roughness) {
+    float f = 1.0 - exp2(-200.0 * roughness * roughness);
+    f *= pow(clamp(roughness, 0.0, 1.0), 0.5);
+    return f;
+}
+
+// Matches REBLUR_FrontEnd_GetNormHitDist (A,B,C,D with D unused here).
+float normHitDist(float hitDist, float viewZ, float roughness) {
+    float A = pc.hitA > 0.0 ? pc.hitA : 3.0;
+    float B = pc.hitB > 0.0 ? pc.hitB : 0.1;
+    float C = pc.hitC > 0.0 ? pc.hitC : 20.0;
+    float smc = specMagicCurve(roughness);
+    float f = (A + abs(viewZ) * B) * mix(C, 1.0, smc);
+    return clamp(hitDist / max(f, 1e-4), 0.0, 1.0);
+}
+
+// Demode floors — must match nrd_compose_beauty.comp remultiply floors.
+const vec3 kMinDiffAlb = vec3(0.04);
+const vec3 kMinSpecAlb = vec3(0.03);
+// Water / ice / glass use guide roughness well below this (WATER/GLASS_GUIDE_ROUGH=0.06).
+// Must match nrd_compose_beauty.comp.
+const float kSmoothDielectric = 0.12;
+
+vec3 safeDiv(vec3 a, vec3 b) {
+    return a / max(b, vec3(1e-3));
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(gNrdDiffuse);
+    if (pix.x >= size.x || pix.y >= size.y) {
+        return;
+    }
+
+    vec3 beauty = max(imageLoad(gBeautyRaw, pix).rgb, vec3(0.0));
+    vec4 U4 = imageLoad(gUnshadowed, pix);
+    vec3 U = max(U4.rgb, vec3(0.0));
+    float Sraw = clamp(imageLoad(gShadowRaw, pix).r, 0.0, 1.0);
+    vec4 Rraw4 = imageLoad(gSpecRaw, pix);
+    vec3 Rraw = max(Rraw4.rgb, vec3(0.0));
+    // NRD-only: feed raw shadow/spec so REBLUR owns all temporal (Radiance-style).
+    // Hybrid: FFX already cleaned S/R — use those so NRD does not re-fight binary noise.
+    float Sclean = (pc.useRawLayers > 0.5)
+        ? Sraw
+        : clamp(imageLoad(gShadowClean, pix).r, 0.0, 1.0);
+    vec3 Rclean = (pc.useRawLayers > 0.5)
+        ? Rraw
+        : max(imageLoad(gSpecClean, pix).rgb, vec3(0.0));
+
+    // Full radiance layers, then demode by guide albedo so REBLUR blurs lighting
+    // not texture (faces / wood grain / leaves stay sharp after remultiply).
+    vec3 G = max(beauty - U * Sraw - Rraw, vec3(0.0));
+    vec3 Dnrd = U * Sclean + G;
+    vec3 Spnrd = Rclean;
+
+    vec4 nr = imageLoad(gNormalRough, pix);
+    float rough = clamp(nr.w, 0.0, 1.0);
+    float nLen = length(nr.xyz);
+    bool sky = nLen < 0.5;
+    bool smoothDielectric = !sky && rough <= kSmoothDielectric;
+
+    vec3 diffAlbIn = max(imageLoad(gDiffAlbedo, pix).rgb, vec3(0.0));
+    vec3 specAlbIn = max(imageLoad(gSpecAlbedo, pix).rgb, vec3(0.0));
+    vec3 diffAlb = max(diffAlbIn, kMinDiffAlb);
+    vec3 specAlb = max(specAlbIn, kMinSpecAlb);
+
+    // Smooth dielectrics (water / ice / glass): the path tracer puts almost all energy in
+    // sparse SPP-1 mirror reflections + refracted GI. Splitting that into demoded DIFF/SPEC
+    // makes REBLUR's anti-firefly treat sky glints as outliers and zero them → black lakes.
+    // Feed the full (shadow/spec-cleaned) beauty as *pre-modulated* diffuse irradiance and
+    // leave specular empty so compose remultiply is a no-op (see nrd_compose_beauty.comp).
+    if (smoothDielectric) {
+        Dnrd = max(U * Sclean + G + Rclean, vec3(0.0));
+        Spnrd = vec3(0.0);
+    } else {
+        // Diffuse: always demode with floor (snow / blocks keep albedo detail).
+        Dnrd = safeDiv(Dnrd, diffAlb);
+
+        // Specular: demode only on rough surfaces. Tiny F0 demode on near-mirror metal still
+        // inflates fireflies; the smooth branch above already covers water/glass.
+        if (rough > 0.22) {
+            Spnrd = safeDiv(Spnrd, specAlb);
+        }
+    }
+
+    // Aggressive firefly clamp — leftover spikes become visible grain after REBLUR.
+    // Tighter thresholds for dark scenes (starfield fireflies at SPP=1).
+    Dnrd = clamp(Dnrd, vec3(0.0), vec3(4.5));
+    Spnrd = clamp(Spnrd, vec3(0.0), vec3(6.0));
+    float dL = max(Dnrd.r, max(Dnrd.g, Dnrd.b));
+    if (dL > 1.8) {
+        Dnrd *= (1.8 + 0.25 * (dL - 1.8)) / dL;
+    }
+    float sL = max(Spnrd.r, max(Spnrd.g, Spnrd.b));
+    if (sL > 2.2) {
+        Spnrd *= (2.2 + 0.25 * (sL - 2.2)) / sL;
+    }
+    if (any(isnan(Dnrd)) || any(isinf(Dnrd))) Dnrd = vec3(0.0);
+    if (any(isnan(Spnrd)) || any(isinf(Spnrd))) Spnrd = vec3(0.0);
+
+    // rgen: U.a / R.a = primary ray hitT (slant range), NOT view-space Z.
+    float primaryHit = U4.a > 1e-4 ? U4.a : 0.0;
+    float primarySpec = Rraw4.a > 1e-4 ? Rraw4.a : primaryHit;
+    if (primaryHit < 1e-3) primaryHit = 0.0;
+    if (primarySpec < 1e-3) primarySpec = 0.0;
+
+    // NRD wants positive linear view-space Z. HW depth is reverse-Z infinite:
+    //   near → deviceZ≈1, far → deviceZ→0  ⇒  viewZ ≈ near / deviceZ
+    // Prefer that over ray hitT (hitT is slant range and wrong for plane tests).
+    float deviceZ = imageLoad(gDeviceDepth, pix).r;
+    float nearZ = pc.cameraNear > 0.0 ? pc.cameraNear : 0.05;
+    float viewZ;
+    if (sky) {
+        viewZ = 65504.0;
+    } else if (deviceZ > 1e-5) {
+        viewZ = nearZ / max(deviceZ, 1e-5);
+    } else if (primaryHit > 1e-3) {
+        viewZ = max(primaryHit, nearZ); // last resort
+    } else {
+        viewZ = 100.0;
+    }
+
+    // Hit distance for REBLUR kernel (secondary length). Without true bounce length,
+    // use a modest fraction of primary range — not huge floors (mush) and not tiny
+    // constants that break tracking.
+    // Smooth dielectrics: energy is mostly mirror / single-interface, so secondary
+    // length ≈ primary range (not a small fraction that under-blurs and fireflies).
+    float bounceHitDiff;
+    float bounceHitSpec;
+    if (sky) {
+        bounceHitDiff = 0.0;
+        bounceHitSpec = 0.0;
+    } else if (smoothDielectric) {
+        float ph = max(primaryHit, primarySpec);
+        bounceHitDiff = clamp(ph * 0.55, 0.5, 40.0);
+        bounceHitSpec = clamp(ph * 0.85, 0.5, 60.0);
+    } else {
+        bounceHitDiff = clamp(primaryHit * 0.35, 0.25, 12.0);
+        bounceHitSpec = clamp(mix(primarySpec * 0.25, primarySpec * 0.6, rough), 0.15, 20.0);
+    }
+
+    float nHitDiff = sky ? 0.0 : normHitDist(bounceHitDiff, viewZ, 1.0);
+    float nHitSpec = sky ? 0.0 : normHitDist(bounceHitSpec, viewZ, rough);
+
+    imageStore(gNrdDiffuse, pix, vec4(linearToYCoCg(Dnrd), nHitDiff));
+    imageStore(gNrdSpecular, pix, vec4(linearToYCoCg(Spnrd), nHitSpec));
+    imageStore(gViewZ, pix, vec4(viewZ, 0.0, 0.0, 0.0));
+    if (sky) {
+        imageStore(gNrdNormalRough, pix, vec4(0.0, 1.0, 0.0, 1.0));
+    } else {
+        imageStore(gNrdNormalRough, pix, packNormalRoughness(nr.xyz, rough));
+    }
+}

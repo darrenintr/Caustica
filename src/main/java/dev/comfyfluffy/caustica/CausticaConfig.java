@@ -57,9 +57,9 @@ public final class CausticaConfig {
     public static void ensureRegistered() {
         @SuppressWarnings("unused")
         Object[] touch = {
-            Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Omm.ENABLED,
-            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED, Rt.Denoise.MODE, Rt.Denoise.SIGMA_DEPTH, Rt.Denoise.SIGMA_NORMAL, Rt.Denoise.SIGMA_COLOR, Rt.Denoise.TEMPORAL_MAX,
-            Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.FrameStats.ENABLED,
+            Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Composite.TEMPORAL_ACCUM, Rt.Composite.TEMPORAL_ALPHA, Rt.Composite.TEMPORAL_DISOCCLUSION, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Omm.ENABLED,
+            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED, Rt.Denoise.MODE,
+            Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.FrameStats.ENABLED, Rt.DebugOverlay.ENABLED,
             Rt.Hdr.ENABLED, Rt.Upscaler.MODE, Rt.Upscaler.QUALITY, Rt.Upscaler.SHARPEN, Rt.Upscaler.SHARPNESS,
             Rt.Fsr.PATH, Rt.Fsr.FORCE_FSR_3, Rt.FrameGen.MODE, Rt.FrameGen.MULTI_FRAME_COUNT,
             Rt.XeSs.PATH, Rt.XeSs.MODE,
@@ -634,13 +634,29 @@ public final class CausticaConfig {
 
         public static final class Composite {
             public static final IntSetting DEBUG_VIEW = intValue("caustica.rt.debugView", "composite.debug-view", 0);
-            public static final IntSetting SPP = intAtLeast("caustica.rt.spp", "composite.spp", 1, 1);
+            // Default held at 1 after the v0.5.3 firefly fix series. Pushing it to 2 or 4
+            // visibly cuts per-pixel MC variance but at 4× / 16× cost; on modest GPUs the
+            // resulting fps drop outweighs the visual gain (the FFX atrous sigma 0.55 / step
+            // 0.35 is tuned to clean SPP=1 inputs without per-frame hitching, so the
+            // visible difference between SPP=1 + FFX and SPP=4 + FFX is a trade between
+            // sharper-but-noisier (SPP=1) and softer-but-cleaner (SPP≥2) on textured
+            // surfaces). Reverted to 1 from the brief 2026-07-14 default=4 experiment
+            // because the user's hardware couldn't sustain SPP=4 frame pacing; do not
+            // raise the default again without explicit hardware-validation evidence.
+            // HDR / NaN / firefly clamps in world.rgen and the defensive history clamp
+            // in temporal_accumulate keep every valid SPP usable — they differ only in
+            // visual noise, not in safety.
+            // Quality default 4: REBLUR alone cannot invent missing samples. Higher SPP is the
+            // only free-noise input; 4 is the max-quality default (cost ~4× vs SPP-1).
+            public static final IntSetting SPP = intAtLeast("caustica.rt.spp", "composite.spp", 4, 1);
             public static final IntSetting MAX_BOUNCES =
                     clampedInt("caustica.rt.maxBounces", "composite.max-bounces", 4, 2, 8);
             public static final BooleanSetting WATER_WAVES =
                     bool("caustica.rt.waterWaves", "composite.water-waves", true);
+            // Real solar half-angle ≈ 0.27°. Larger values make soft penumbra look like fake
+            // "god rays" through 1-block roof holes (and NRD smears them into white shafts).
             public static final FloatSetting SUN_ANGULAR_RADIUS =
-                    radians("caustica.rt.sunAngularRadius", "composite.sun-angular-radius-deg", 0.6f);
+                    radians("caustica.rt.sunAngularRadius", "composite.sun-angular-radius-deg", 0.27f);
             public static final FloatSetting MOON_ANGULAR_RADIUS =
                     radians("caustica.rt.moonAngularRadius", "composite.moon-angular-radius-deg", 1.5f);
             public static final FloatSetting SUN_NOON_SOUTH_TILT =
@@ -649,6 +665,36 @@ public final class CausticaConfig {
                     finiteFloat("caustica.rt.jitterSignX", "composite.jitter-sign-x", 1.0f);
             public static final FloatSetting JITTER_SIGN_Y =
                     finiteFloat("caustica.rt.jitterSignY", "composite.jitter-sign-y", -1.0f);
+            // Temporal accumulation (TAA-style): each frame, reproject the previous frame's accumulated
+            // color along the per-pixel motion vector and blend it with the current noisy path-traced
+            // color (accumulated = mix(history, current, alpha)). The upscaler/denoise backend then
+            // receive the temporally-stabilised image instead of the raw per-frame trace, so a static
+            // camera converges to a near-noiseless image over a handful of frames ("actually can see"
+            // the accumulated result). Disabled when the resolved upscaler is DLSS-RR (its own temporal
+            // filter is superior; enabling both is wasted work) unless explicitly forced on.
+            //
+            // Default OFF in v0.5.2+: with the FFX denoiser converted to a whole-radiance denoiser,
+            // running TAA on top of it caused double temporal accumulation (FFX's reproject + this
+            // pass). On RDNA 3/4 the upscaler is FSR, which has its own temporal accumulator — TAA
+            // in front of FSR is wasted work and is what produced the "noise turns into a smearing
+            // trail" symptom. Re-enable per-config if a user wants the extra smoothing on a no-upscaler
+            // or bilateral-fallback path.
+            // Default ON: SPP-1 path tracing is unplayable without temporal reuse. The denoise
+            // backend only cleans shadow/specular layers — beauty TAA is what makes snow/terrain
+            // watchable. Users can still turn this off for raw-noise debugging.
+            public static final BooleanSetting TEMPORAL_ACCUM =
+                    bool("caustica.rt.temporalAccum", "composite.temporal-accum", true);
+            // Weight of the current frame in the new accumulated sample: 0.1 keeps ~90% history (slow,
+            // smooth), 1.0 disables accumulation (current frame only).
+            // Base current-frame weight when nearly static. Shader raises this further under motion
+            // (motion-adaptive) so walking does not smear. Static snow still converges in ~1s.
+            // After Official FFX (shadow+refl), beauty TAA can use a bit more history for GI/sky.
+            public static final FloatSetting TEMPORAL_ALPHA =
+                    clampedFloat("caustica.rt.temporalAlpha", "composite.temporal-alpha", 0.20f, 0.01f, 1.0f);
+            // Disocclusion reject threshold (relative reversed-Z). Slightly tighter than before so
+            // newly exposed geometry does not pull ghost history while walking.
+            public static final FloatSetting TEMPORAL_DISOCCLUSION =
+                    clampedFloat("caustica.rt.temporalDisocclusion", "composite.temporal-disocclusion", 0.03f, 0.0f, 1.0f);
 
             private Composite() {
             }
@@ -813,29 +859,30 @@ public final class CausticaConfig {
         }
 
         /**
-         * Caustica's internal SVGF-lite denoise pass. Default-on for any non-DLSS-RR path (FSR / XeSS
-         * don't have a path-tracing-specific denoise, so the input has to be cleaner for their
-         * temporal accumulators to lock on); off for DLSS-RR (which has its own denoise and would
-         * just pay the cost without quality gain). Set {@code mode = "off"} to disable; "svgf" forces
-         * on regardless of the upscaler.
+         * Image-domain denoise backend.
+         * <ul>
+         *   <li>{@code AUTO}/{@code HYBRID} — FFX shadow+reflection prepass, then NRD REBLUR</li>
+         *   <li>{@code NRD} — NRD REBLUR only (raw layers, no FFX; Radiance-style)</li>
+         *   <li>{@code FFX} — Official FFX shadow+reflection only</li>
+         *   <li>{@code OFF} — raw path-traced color</li>
+         * </ul>
+         *
+         * <p>Legacy aliases: {@code "svgf"} and {@code "on"} map to {@code FFX}; the
+         * legacy sigma/temporal config keys are dropped (each backend owns its tuning).
          */
         public static final class Denoise {
-            public static final StringSetting MODE = string("caustica.rt.denoise.mode", "denoise.mode", "auto",
-                    v -> {
-                        String s = v == null ? "auto" : v.toLowerCase();
-                        if (s.equals("auto") || s.equals("off") || s.equals("svgf") || s.equals("on")) {
-                            return s.equals("on") ? "svgf" : s; // "on" is a legacy alias for "svgf"
-                        }
-                        return "auto";
-                    });
-            public static final FloatSetting SIGMA_DEPTH = clampedFloat("caustica.rt.denoise.sigmaDepth",
-                    "denoise.sigma-depth", 0.05f, 0.001f, 1.0f);
-            public static final FloatSetting SIGMA_NORMAL = clampedFloat("caustica.rt.denoise.sigmaNormal",
-                    "denoise.sigma-normal", 0.1f, 0.01f, 1.0f);
-            public static final FloatSetting SIGMA_COLOR = clampedFloat("caustica.rt.denoise.sigmaColor",
-                    "denoise.sigma-color", 0.5f, 0.01f, 10.0f);
-            public static final FloatSetting TEMPORAL_MAX = clampedFloat("caustica.rt.denoise.temporalMax",
-                    "denoise.temporal-max", 0.85f, 0.0f, 0.99f);
+            public static final EnumSetting<DenoiserKind> MODE = enumSetting(
+                    "caustica.rt.denoise.mode", "denoise.mode",
+                    DenoiserKind.AUTO, DenoiserKind.class, DenoiserKind::fromKey);
+            // FFX-only tuning. Higher = more temporal smoothing on trusted static pixels.
+            // Default 0.82: enough for SPP-1 static convergence without the 0.95 "ghost trails
+            // while panning" regression (2026-07-14). Resolve still weights from variance +
+            // AABB clamp (not |curr-history| — that zeroed history on SPP-1).
+            // 0.5 = responsive (more grain), 0.95 = smooth static but pan-ghost risk.
+            // Range 0.0..1.0 inclusive; clamped at the binding.
+            public static final FloatSetting FFX_TEMPORAL_WEIGHT_MAX =
+                    clampedFloat("caustica.rt.denoise.ffxTemporalWeightMax", "denoise.ffx-temporal-weight-max",
+                            0.82f, 0.0f, 1.0f);
 
             private Denoise() {
             }
@@ -873,15 +920,28 @@ public final class CausticaConfig {
                     string("caustica.rt.exposure.mode", "exposure.mode", "auto", Exposure::sanitizeMode);
             public static final FloatSetting MANUAL_EV =
                     finiteFloat("caustica.rt.exposure.manualEv", "exposure.manual-ev", 0.0f);
-            public static final FloatSetting KEY = exposureScale("caustica.rt.exposure.key", "exposure.key", 0.18f);
+            // Radiance middleGrey-equivalent; 0.20 keeps indoor rooms readable without pumping
+            // outdoor-through-window into pure white (highlight shoulder also helps).
+            public static final FloatSetting KEY = exposureScale("caustica.rt.exposure.key", "exposure.key", 0.20f);
             public static final FloatSetting MIN_EV =
                     finiteFloat("caustica.rt.exposure.minEv", "exposure.min-ev", -1.5f);
             public static final FloatSetting MAX_EV =
-                    finiteFloat("caustica.rt.exposure.maxEv", "exposure.max-ev", 2.0f);
+                    finiteFloat("caustica.rt.exposure.maxEv", "exposure.max-ev", 1.75f);
             public static final FloatSetting ADAPT_UP =
-                    exposureScale("caustica.rt.exposure.adaptUp", "exposure.adapt-up", 0.12f);
+                    exposureScale("caustica.rt.exposure.adaptUp", "exposure.adapt-up", 0.14f);
             public static final FloatSetting ADAPT_DOWN =
-                    exposureScale("caustica.rt.exposure.adaptDown", "exposure.adapt-down", 0.35f);
+                    exposureScale("caustica.rt.exposure.adaptDown", "exposure.adapt-down", 0.28f);
+            // Drop darkest voids + brightest peaks (windows / snow) from the average.
+            public static final FloatSetting LOW_PERCENT =
+                    clampedFloat("caustica.rt.exposure.lowPercent", "exposure.low-percent", 0.10f, 0.0f, 0.45f);
+            public static final FloatSetting HIGH_PERCENT =
+                    clampedFloat("caustica.rt.exposure.highPercent", "exposure.high-percent", 0.88f, 0.55f, 1.0f);
+            // Center metering: interiors with a bright window are more stable when the
+            // histogram weights the room you're looking at, not the outdoor rectangle.
+            public static final BooleanSetting CENTER_METERING =
+                    bool("caustica.rt.exposure.centerMetering", "exposure.center-metering", true);
+            public static final FloatSetting CENTER_REGION =
+                    clampedFloat("caustica.rt.exposure.centerRegion", "exposure.center-region", 0.55f, 0.05f, 1.0f);
 
             private Exposure() {
             }
@@ -914,6 +974,20 @@ public final class CausticaConfig {
             public static final BooleanSetting ENABLED = bool("caustica.rt.frameStats", "frame-stats.enabled", false);
 
             private FrameStats() {
+            }
+        }
+
+        /**
+         * In-game debug overlay (top-left of the screen). Master switch for the {@code CausticaDebugOverlay}
+         * HUD draw — shows the live state of the ray-tracing pipeline (active upscaler, denoise mode,
+         * frame counter, last DLSS-RR return code, render/display resolution, per-stage timings) so a
+         * "weird" image can be diagnosed from a screenshot. Cheap to leave on; intended as a developer /
+         * power-user tool.
+         */
+        public static final class DebugOverlay {
+            public static final BooleanSetting ENABLED = bool("caustica.rt.debugOverlay", "debug-overlay.enabled", false);
+
+            private DebugOverlay() {
             }
         }
 
@@ -989,6 +1063,35 @@ public final class CausticaConfig {
             for (UpscalerMode m : values()) {
                 if (m.key.equalsIgnoreCase(s) || m.name().equalsIgnoreCase(s)) return m;
             }
+            return AUTO;
+        }
+    }
+
+    /** Denoise backend (config). Resolved to an FFx / NRD / Noop implementation by
+     *  {@code DenoiseBackendSelector}. */
+    public enum DenoiserKind {
+        OFF("off"),
+        /** FFX shadow+refl prepass → NRD REBLUR (default playable path). */
+        AUTO("auto"),
+        /** Official FFX shadow+reflection composite only. */
+        FFX("ffx"),
+        /** NRD REBLUR only — no FFX prepass (Radiance-style). */
+        NRD("nrd"),
+        /** Explicit hybrid cascade (same as AUTO). */
+        HYBRID("hybrid");
+
+        final String key;
+        DenoiserKind(String key) { this.key = key; }
+        public String key() { return key; }
+
+        public static DenoiserKind fromKey(String s) {
+            if (s == null) return AUTO;
+            String t = s.trim().toLowerCase();
+            for (DenoiserKind k : values()) {
+                if (k.key.equals(t) || k.name().equalsIgnoreCase(s)) return k;
+            }
+            if (t.equals("svgf") || t.equals("on") || t.equals("ffx-official")) return FFX;
+            if (t.equals("ffx-nrd") || t.equals("hybrid-ffx-nrd")) return HYBRID;
             return AUTO;
         }
     }

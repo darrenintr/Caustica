@@ -1,0 +1,60 @@
+// Official FFX Denoiser composite (Caustica-hosted).
+//
+// Energy-correct layer replacement (never multiplies GI/sky by shadow):
+//   beauty = unshadowed * shadowRaw + other + specularRaw
+//   result = beauty
+//          + unshadowed * (shadowClean - shadowRaw)     // shadow denoise
+//          + (specularClean - specularRaw)              // reflection denoise
+//
+// useFlags: bit0 = apply shadow delta, bit1 = apply reflection delta.
+// useFlags == 0 → pure beauty passthrough (fail-open seed).
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly  uniform image2D gUnshadowed;
+layout(binding = 1, r8)      readonly  uniform image2D gShadowRaw;
+layout(binding = 2, rg16f)   readonly  uniform image2D gShadowClean;
+layout(binding = 3, rgba16f) readonly  uniform image2D gBeauty;
+layout(binding = 4, rgba16f) readonly  uniform image2D gSpecRaw;
+layout(binding = 5, rgba16f) readonly  uniform image2D gSpecClean;
+layout(binding = 6, rgba16f) writeonly uniform image2D gOut;
+
+layout(push_constant) uniform Push {
+    int useFlags; // bit0 shadow, bit1 reflection
+    float pad0;
+    float pad1;
+    float pad2;
+} pc;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(gOut);
+    if (pix.x >= size.x || pix.y >= size.y) {
+        return;
+    }
+
+    vec3 beauty = imageLoad(gBeauty, pix).rgb;
+    vec3 color = beauty;
+
+    if ((pc.useFlags & 1) != 0) {
+        vec3 unshadowed = imageLoad(gUnshadowed, pix).rgb;
+        float rawS = clamp(imageLoad(gShadowRaw, pix).r, 0.0, 1.0);
+        float cleanS = clamp(imageLoad(gShadowClean, pix).r, 0.0, 1.0);
+        color += unshadowed * (cleanS - rawS);
+    }
+    if ((pc.useFlags & 2) != 0) {
+        vec3 specRaw = imageLoad(gSpecRaw, pix).rgb;
+        vec3 specClean = imageLoad(gSpecClean, pix).rgb;
+        color += (specClean - specRaw);
+    }
+
+    if (any(isnan(color)) || any(isinf(color))) {
+        color = beauty;
+        if (any(isnan(color)) || any(isinf(color))) {
+            color = vec3(0.0);
+        }
+    }
+    color = min(max(color, vec3(0.0)), vec3(64.0));
+    imageStore(gOut, pix, vec4(color, 1.0));
+}

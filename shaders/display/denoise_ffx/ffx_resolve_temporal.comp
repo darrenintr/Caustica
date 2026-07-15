@@ -1,0 +1,169 @@
+#version 460
+//
+// FFX Denoiser (whole-radiance) — pass 2: variance-aware temporal mix with
+// neighbourhood AABB clamp (anti-ghost).
+//
+// Weight history from variance + clamp amount — NOT from |curr - history|.
+// At SPP=1 a clean history always disagrees with the noisy current sample; using
+// colour difference as confidence zeroed temporal accumulation entirely.
+//
+// Ghosting balance (2026-07-14):
+//   - AABB is tight enough that mis-reprojected history gets clamped hard
+//   - high clampAmt kills trust (anti-ghost)
+//   - reproject raises variance on camera motion so pan frames prefer current
+//   - temporalWeightMax default ~0.82 (not 0.95) so trails die in a few frames
+//
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D inColor;
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D inNormal;
+layout(set = 0, binding = 2, rgba16f) readonly uniform image2D outReprojected;
+layout(set = 0, binding = 3, r32f)    readonly uniform image2D outVariance;
+layout(set = 0, binding = 4, rgba16f) readonly uniform image2D gSpecAlbedo; // unused, host-side compat
+layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D outDenoised;
+
+layout(push_constant) uniform FfxResolveParams {
+    float temporalWeightMax;
+    float varianceCutoff;
+    float minHistoryBlend;
+    float frameIndex;
+} pc;
+
+float ffxLuma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+bool ffxIsSkyByNormal(vec3 n) {
+    return length(n) < 0.5;
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inColor);
+    if (pos.x >= size.x || pos.y >= size.y) {
+        return;
+    }
+
+    vec3 normal = imageLoad(inNormal, pos).xyz;
+    vec3 currRadiance = imageLoad(inColor, pos).rgb;
+
+    // Sky: pass through (no temporal surface).
+    if (ffxIsSkyByNormal(normal)) {
+        imageStore(outDenoised, pos, vec4(currRadiance, 0.0));
+        return;
+    }
+
+    float variance = imageLoad(outVariance, pos).r;
+    vec3 history = imageLoad(outReprojected, pos).rgb;
+
+    // Hard disocclusion / first frame / bad MV / huge motion: variance≈1.
+    // Never blend toward black. Spatial firefly squash only.
+    if (variance > 0.9) {
+        vec3 nMin = currRadiance;
+        vec3 nMax = currRadiance;
+        vec3 nSum = currRadiance;
+        float nCount = 1.0;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                ivec2 np = pos + ivec2(dx, dy);
+                if (np.x < 0 || np.y < 0 || np.x >= size.x || np.y >= size.y) {
+                    continue;
+                }
+                vec3 n = imageLoad(inColor, np).rgb;
+                nMin = min(nMin, n);
+                nMax = max(nMax, n);
+                nSum += n;
+                nCount += 1.0;
+            }
+        }
+        vec3 nMean = nSum / nCount;
+        vec3 range = max(nMax - nMin, vec3(0.02));
+        vec3 clampedCurr = clamp(currRadiance, nMin - 0.35 * range, nMax + 0.35 * range);
+        float currL = ffxLuma(currRadiance);
+        float meanL = ffxLuma(nMean);
+        if (currL > meanL * 3.0 + 0.2) {
+            clampedCurr = mix(clampedCurr, nMean, 0.85);
+        }
+        imageStore(outDenoised, pos, vec4(max(clampedCurr, vec3(0.0)), 0.0));
+        return;
+    }
+
+    // 3x3 neighbourhood of the *current* noisy frame for AABB anti-ghost clamp.
+    vec3 nMin = currRadiance;
+    vec3 nMax = currRadiance;
+    vec3 nSum = currRadiance;
+    float nCount = 1.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+            ivec2 np = pos + ivec2(dx, dy);
+            if (np.x < 0 || np.y < 0 || np.x >= size.x || np.y >= size.y) {
+                continue;
+            }
+            vec3 n = imageLoad(inColor, np).rgb;
+            nMin = min(nMin, n);
+            nMax = max(nMax, n);
+            nSum += n;
+            nCount += 1.0;
+        }
+    }
+    vec3 nMean = nSum / nCount;
+
+    // Balanced AABB: wide enough for SPP-1 noise (so history can converge on
+    // static faces) but tight enough that a mis-reprojected ghost gets clamped
+    // hard and trust collapses via clampAmt.
+    float localL = max(ffxLuma(nMean), 0.05);
+    float expand = mix(0.10, 0.30, clamp(variance * 2.0, 0.0, 1.0)) * localL;
+    vec3 range = max(nMax - nMin, vec3(0.0));
+    vec3 boxMin = nMin - expand - 0.40 * range;
+    vec3 boxMax = nMax + expand + 0.40 * range;
+    // Tiny absolute floor so near-black pixels still have a box.
+    boxMin -= vec3(0.02);
+    boxMax += vec3(0.02);
+
+    vec3 historyRaw = history;
+    history = clamp(history, boxMin, boxMax);
+
+    // Large clamp → almost certainly a ghost. Kill trust hard.
+    float clampAmt = clamp(length(historyRaw - history)
+            / max(ffxLuma(historyRaw) + localL * 0.2, 0.05), 0.0, 1.0);
+
+    // Soft firefly reduction on current before mix.
+    float currL = ffxLuma(currRadiance);
+    float meanL = ffxLuma(nMean);
+    float maxN = ffxLuma(nMax);
+    if (currL > maxN * 2.0 + 0.1) {
+        currRadiance = mix(currRadiance, nMean, 0.80);
+    }
+
+    // History weight from variance (depth + motion from reproject) + clamp.
+    // variance 0.05 static → trust high
+    // variance ~0.5+ pan  → trust low
+    float trust = clamp(1.0 - variance / max(pc.varianceCutoff, 0.05), 0.0, 1.0);
+    trust *= (1.0 - 0.92 * clampAmt);
+    // Extra kill when clamp hit hard — don't let residual 8% trail linger.
+    if (clampAmt > 0.45) {
+        trust *= 0.25;
+    }
+
+    float wHistory = mix(pc.minHistoryBlend, pc.temporalWeightMax, trust);
+
+    // Firefly vs history: lean on history only when clamp was mild (trusted).
+    float histL = ffxLuma(history);
+    if (clampAmt < 0.25 && currL > histL * 3.0 + 0.15 && histL > 1e-4) {
+        wHistory = max(wHistory, pc.temporalWeightMax * 0.85);
+    }
+
+    vec3 mixed = mix(currRadiance, history, wHistory);
+    mixed = max(mixed, vec3(0.0));
+    if (any(isnan(mixed)) || any(isinf(mixed))) {
+        mixed = currRadiance;
+    }
+
+    imageStore(outDenoised, pos, vec4(mixed, 0.0));
+}

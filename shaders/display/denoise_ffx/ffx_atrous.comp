@@ -1,0 +1,114 @@
+#version 460
+//
+// FFX Denoiser (whole-radiance) — multi-pass à-trous / edge-stopping filter.
+// One dispatch = one SVGF-style step. Host runs 5 passes with stepSize =
+// 1,2,4,8,16 ping-ponging two rgba16f images.
+//
+// Edge stops: depth + normal ONLY. Colour weight is deliberately omitted —
+// at SPP=1, absolute/relative luma jumps between neighbours on the same face
+// routinely exceed any usable sigma and zeroed every spatial sample (the
+// filter became a no-op). Minecraft geometry is axis-aligned with hard depth
+// discontinuities at block edges; depth/normal is enough to keep silhouettes.
+//
+// Kernel: B3-spline weights on a 3x3 dilated grid (classic SVGF).
+//
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D inColor;   // original noisy (sky pass-through)
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D inNormal;
+layout(set = 0, binding = 2, r32f)    readonly uniform image2D inDepth;
+layout(set = 0, binding = 3, rgba16f) readonly uniform image2D inFiltered;  // previous pass result
+layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D outFiltered;
+
+layout(push_constant) uniform FfxAtrousParams {
+    float depthSigma;
+    float normalSigma;
+    float colorSigma; // retained for host push layout; unused (depth/normal only)
+    float stepSize;   // integer step as float (1,2,4,8,16)
+} pc;
+
+// B3 spline 1D weights for offsets -1,0,+1
+const float B3[3] = float[](0.25, 0.5, 0.25);
+
+bool ffxIsSkyByNormal(vec3 n) {
+    return length(n) < 0.5;
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inFiltered);
+    if (pos.x >= size.x || pos.y >= size.y) {
+        return;
+    }
+
+    vec3 centerNormal = imageLoad(inNormal, pos).xyz;
+    float centerDepth = imageLoad(inDepth, pos).r;
+
+    // Sky: keep original radiance (stars / sky gradient — don't smear).
+    if (ffxIsSkyByNormal(centerNormal)) {
+        vec3 sky = imageLoad(inColor, pos).rgb;
+        imageStore(outFiltered, pos, vec4(sky, centerDepth));
+        return;
+    }
+
+    vec3 center = imageLoad(inFiltered, pos).rgb;
+    // Poisoned input (NaN from a bad RT hit) would propagate through every pass
+    // and leave the display mapper with a black frame after AgX.
+    if (any(isnan(center)) || any(isinf(center))) {
+        center = imageLoad(inColor, pos).rgb;
+        if (any(isnan(center)) || any(isinf(center))) {
+            center = vec3(0.0);
+        }
+    }
+    int step = max(int(pc.stepSize + 0.5), 1);
+
+    // Do NOT loosen depth/normal with step size. Larger steps already reach
+    // farther; widening sigma made step-16/32 average across the whole frame
+    // into a dark sludge (black-screen regression on spatial-only path).
+    float depthSigma = max(pc.depthSigma, 1e-4);
+    float normalSigma = max(pc.normalSigma, 1e-4);
+
+    vec3 sum = vec3(0.0);
+    float weightSum = 0.0;
+
+    for (int iy = 0; iy < 3; ++iy) {
+        int dy = iy - 1;
+        for (int ix = 0; ix < 3; ++ix) {
+            int dx = ix - 1;
+            ivec2 np = pos + ivec2(dx, dy) * step;
+            if (np.x < 0 || np.y < 0 || np.x >= size.x || np.y >= size.y) {
+                continue;
+            }
+
+            vec3 neighborNormal = imageLoad(inNormal, np).xyz;
+            if (ffxIsSkyByNormal(neighborNormal)) {
+                continue;
+            }
+
+            vec3 neighbor = imageLoad(inFiltered, np).rgb;
+            float neighborDepth = imageLoad(inDepth, np).r;
+
+            float kernelW = B3[ix] * B3[iy];
+
+            // Depth edge stop (HW reversed-Z).
+            float depthJump = centerDepth - neighborDepth;
+            float depthWeight = exp(-(depthJump * depthJump) / (2.0 * depthSigma * depthSigma));
+
+            // Normal edge stop.
+            float ncos = clamp(dot(centerNormal, neighborNormal), -1.0, 1.0);
+            float ndiff = 1.0 - ncos;
+            float normalWeight = exp(-(ndiff * ndiff) / (2.0 * normalSigma * normalSigma));
+
+            float w = kernelW * depthWeight * normalWeight;
+            sum += neighbor * w;
+            weightSum += w;
+        }
+    }
+
+    vec3 result = (weightSum > 1e-6) ? (sum / weightSum) : center;
+    if (any(isnan(result)) || any(isinf(result))) {
+        result = center;
+    }
+    // Final store carries depth in .a for next-frame reproject.
+    imageStore(outFiltered, pos, vec4(max(result, vec3(0.0)), centerDepth));
+}

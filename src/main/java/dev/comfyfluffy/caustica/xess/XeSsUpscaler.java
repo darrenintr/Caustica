@@ -155,9 +155,6 @@ public final class XeSsUpscaler implements Upscaler {
 
     @Override
     public int[] queryOptimalRenderSize(int displayWidth, int displayHeight) {
-        if (!ready) {
-            return new int[] { displayWidth, displayHeight };
-        }
         // XeSS quality ratios: same as FSR / DLSS-RR. The SDK provides xessGetOptimalInputSize
         // for this, but we hardcode the stable ratios that match the SDK's published scales.
         int quality = CausticaConfig.Rt.Upscaler.QUALITY.value();
@@ -192,6 +189,12 @@ public final class XeSsUpscaler implements Upscaler {
                 lib.destroyContext(context);
                 context = MemorySegment.NULL;
             }
+            // Publish the requested sizes + quality BEFORE first build descriptor, same rationale as FSR.
+            featureRenderWidth = renderWidth;
+            featureRenderHeight = renderHeight;
+            featureDisplayWidth = displayWidth;
+            featureDisplayHeight = displayHeight;
+            featureQuality = effectiveQuality;
             try (Arena arena = Arena.ofConfined()) {
                 MemorySegment outHandle = arena.allocate(ValueLayout.ADDRESS);
                 int rc = lib.vkCreateContext(outHandle, device.vkDevice().address());
@@ -207,11 +210,6 @@ public final class XeSsUpscaler implements Upscaler {
                     throw new IllegalStateException("xessSetConfig failed: rc=" + rc);
                 }
             }
-            featureRenderWidth = renderWidth;
-            featureRenderHeight = renderHeight;
-            featureDisplayWidth = displayWidth;
-            featureDisplayHeight = displayHeight;
-            featureQuality = effectiveQuality;
             ready = true;
             LOGGER.info("XeSS upscaler context created: {}x{} -> {}x{} (quality={}, config={})",
                     renderWidth, renderHeight, displayWidth, displayHeight, effectiveQuality, configName(config));

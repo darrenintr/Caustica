@@ -28,6 +28,15 @@ public final class DlssRrUpscaler implements Upscaler {
                 return null;
             }
         }
+        // Hard probe: even if NGX initialised, DLSS-RR (DLSSD) may be unavailable on the current
+        // driver/GPU. The selector used to require isReady() == true here; when the lazy-upscaler fix
+        // dropped that gate, DLSS-RR would always be selected on NVIDIA and then latch a failure later.
+        // Probe via the same path the composite will use, and return null so the selector can fall
+        // through to FSR/XeSS/OFF in AUTO.
+        if (!dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr.dlssdProbeAvailable()) {
+            LOGGER.info("DLSS-RR (DLSSD) not available on this device; selector will pick a different upscaler");
+            return null;
+        }
         return new DlssRrUpscaler();
     }
 
@@ -67,5 +76,14 @@ public final class DlssRrUpscaler implements Upscaler {
     @Override
     public void destroy() {
         dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr.INSTANCE.destroy();
+    }
+
+    @Override
+    public void requestResetHistory() {
+        // Drop DLSS-RR's NGX internal temporal accumulator on the next evaluate.
+        // Wired from RtComposite.invalidateHistory() so hard cuts (teleport /
+        // dimension change / resource reload) don't smear the previous scene's
+        // colour palette into the new one.
+        dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr.INSTANCE.requestResetHistory();
     }
 }

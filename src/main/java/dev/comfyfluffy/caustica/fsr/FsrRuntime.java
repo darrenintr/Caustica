@@ -143,15 +143,35 @@ public final class FsrRuntime {
     }
 
     private static Path locateLoader() {
+        // 1) Explicit override (-Dcaustica.fsr.path or config)
         String override = CausticaConfig.Rt.Fsr.PATH.get();
         if (override != null && !override.isBlank()) {
             Path p = Path.of(override);
             if (Files.isDirectory(p)) {
                 p = p.resolve(PLATFORM_NATIVES.loaderName());
             }
-            return Files.isRegularFile(p) ? p : null;
+            if (Files.isRegularFile(p)) {
+                LOGGER.info("FSR loader from override path: {}", p.toAbsolutePath());
+                return p;
+            }
+            LOGGER.warn("FSR override path set but file missing: {}", p);
         }
-        return extractBundledLoader();
+        // 2) Extract/copy bundled natives into the game dir (always preferred for dlopen)
+        Path extracted = extractBundledLoader();
+        if (extracted != null) {
+            return extracted;
+        }
+        // 3) Dev-tree fallbacks (running from repo without jar packaging)
+        for (String rel : List.of(
+                "src/main/resources/caustica/natives/" + PLATFORM_NATIVES.platformDir(),
+                "build/resources/main/caustica/natives/" + PLATFORM_NATIVES.platformDir())) {
+            Path p = Path.of(rel).resolve(PLATFORM_NATIVES.loaderName()).toAbsolutePath().normalize();
+            if (Files.isRegularFile(p)) {
+                LOGGER.info("FSR loader from dev path: {}", p);
+                return p;
+            }
+        }
+        return null;
     }
 
     private static Path extractBundledLoader() {
@@ -159,28 +179,82 @@ public final class FsrRuntime {
                 .resolve("natives").resolve(PLATFORM_NATIVES.platformDir());
         try {
             Files.createDirectories(dir);
-            extractBundledNative(PLATFORM_NATIVES.loaderName(), dir.resolve(PLATFORM_NATIVES.loaderName()));
+            boolean ok = extractBundledNative(PLATFORM_NATIVES.loaderName(), dir.resolve(PLATFORM_NATIVES.loaderName()));
             extractBundledFeatureLibraries(dir);
-            return Files.isRegularFile(dir.resolve(PLATFORM_NATIVES.loaderName()))
-                    ? dir.resolve(PLATFORM_NATIVES.loaderName()) : null;
+            Path loader = dir.resolve(PLATFORM_NATIVES.loaderName());
+            if (!ok || !Files.isRegularFile(loader)) {
+                LOGGER.error(
+                        "Failed to extract {} into {} (classloader resource missing?). "
+                                + "Set -Dcaustica.fsr.path=/path/to/dir-with-libamd_fidelityfx_loader.so",
+                        PLATFORM_NATIVES.loaderName(), dir.toAbsolutePath());
+                return null;
+            }
+            long size = Files.size(loader);
+            // Stub upscaler is ~15KB; a real loader is hundreds of KB. Log so we can diagnose stubs.
+            LOGGER.info("FSR natives ready in {} (loader {} bytes)", dir.toAbsolutePath(), size);
+            Path up = dir.resolve("libamd_fidelityfx_upscaler.so");
+            if (Files.isRegularFile(up) && Files.size(up) < 50_000L) {
+                LOGGER.warn(
+                        "libamd_fidelityfx_upscaler.so is only {} bytes — this is the NO_PROVIDER stub. "
+                                + "Modular FSR 3/4 upscale will fail until a real Vulkan FSR provider is built "
+                                + "(see native/ffx_fsr2 and scripts/build_ffx_vk_linux.sh). "
+                                + "Caustica will fall back to TAA / classic FSR2 when available.",
+                        Files.size(up));
+            }
+            return loader;
         } catch (IOException e) {
             CausticaMod.LOGGER.warn("Could not extract bundled FSR natives to {}", dir, e);
             return null;
         }
     }
 
+    /**
+     * Copy a bundled native into {@code dst}. Tries several classloaders + Fabric mod roots so
+     * Prism/Fabric packaging cannot silently miss the resource.
+     */
     private static boolean extractBundledNative(String name, Path dst) throws IOException {
         String resource = "/caustica/natives/" + PLATFORM_NATIVES.platformDir() + "/" + name;
-        try (InputStream in = FsrRuntime.class.getResourceAsStream(resource)) {
-            if (in == null) {
-                return false;
-            }
-            byte[] bytes = in.readAllBytes();
-            if (!sameBytes(dst, bytes)) {
-                Files.write(dst, bytes);
-            }
-            return true;
+        byte[] bytes = readBundledBytes(name, resource);
+        if (bytes == null) {
+            LOGGER.warn("Bundled FSR native not found on classpath: {}", resource);
+            return false;
         }
+        if (!sameBytes(dst, bytes)) {
+            Files.write(dst, bytes);
+            dst.toFile().setExecutable(true);
+            LOGGER.info("Extracted FSR native {} ({} bytes) -> {}", name, bytes.length, dst.toAbsolutePath());
+        }
+        return true;
+    }
+
+    private static byte[] readBundledBytes(String name, String resource) throws IOException {
+        // 1) Class resource (works for most Fabric jars)
+        try (InputStream in = FsrRuntime.class.getResourceAsStream(resource)) {
+            if (in != null) {
+                return in.readAllBytes();
+            }
+        }
+        // 2) Context classloader
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        if (cl != null) {
+            try (InputStream in = cl.getResourceAsStream(resource.startsWith("/") ? resource.substring(1) : resource)) {
+                if (in != null) {
+                    return in.readAllBytes();
+                }
+            }
+        }
+        // 3) Fabric mod container root paths (handles nested jar FS)
+        var opt = FabricLoader.getInstance().getModContainer("caustica");
+        if (opt.isPresent()) {
+            String relative = "caustica/natives/" + PLATFORM_NATIVES.platformDir() + "/" + name;
+            for (Path root : opt.get().getRootPaths()) {
+                Path p = root.resolve(relative);
+                if (Files.isRegularFile(p)) {
+                    return Files.readAllBytes(p);
+                }
+            }
+        }
+        return null;
     }
 
     private static void extractBundledFeatureLibraries(Path dir) throws IOException {

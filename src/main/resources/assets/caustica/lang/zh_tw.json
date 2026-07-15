@@ -56,5 +56,29 @@
 	"caustica.options.rt.debugView.4": "粗糙度",
 	"caustica.options.rt.debugView.5": "運動",
 	"caustica.options.rt.debugView.6": "鏡面反射",
-	"caustica.options.rt.debugView.7": "鏡面運動"
+	"caustica.options.rt.debugView.7": "鏡面運動",
+	"caustica.options.rt.debugView.8": "陰影命中",
+	"caustica.options.rt.debugView.9": "漫反射拆分",
+	"caustica.options.rt.debugView.10": "反射拆分",
+
+	"caustica.options.rt.debugOverlay": "RT 偵錯疊加",
+	"caustica.options.rt.debugOverlay.tooltip": "在畫面左上角顯示即時光追管線狀態（升頻器、降噪模式、畫面計數、上次 DLSS-RR 傳回碼、各階段耗時）。畫面異常時方便診斷。",
+
+	"caustica.options.rt.upscalerMode": "升頻器",
+	"caustica.options.rt.upscalerMode.tooltip": "選擇升頻器。自動會依 GPU 挑選最合適的；其他選項強制使用指定後端。變更立即生效。",
+	"caustica.options.rt.upscalerMode.auto": "自動",
+	"caustica.options.rt.upscalerMode.off": "關閉 (1:1)",
+	"caustica.options.rt.upscalerMode.dlss-rr": "DLSS 光線重建 (NVIDIA)",
+	"caustica.options.rt.upscalerMode.fsr-3": "FSR 3",
+	"caustica.options.rt.upscalerMode.fsr-4": "FSR 4.1 INT8 (RDNA 3/4)",
+	"caustica.options.rt.upscalerMode.xess": "XeSS",
+
+	"caustica.options.rt.denoiseMode": "降噪",
+	"caustica.options.rt.denoiseMode.tooltip": "內建降噪。自動/混合：FFX 陰影+反射再接 NRD REBLUR。NRD：僅 REBLUR（無 FFX）。FFX：僅陰影+反射。關閉：原始路徑追蹤顆粒。",
+	"caustica.options.rt.denoiseMode.auto": "自動 (FFX→NRD)",
+	"caustica.options.rt.denoiseMode.ffx": "僅 FFX",
+	"caustica.options.rt.denoiseMode.nrd": "僅 NRD",
+	"caustica.options.rt.denoiseMode.hybrid": "混合 FFX→NRD",
+	"caustica.options.rt.denoiseMode.svgl": "SVGF (舊版 → FFX)",
+	"caustica.options.rt.denoiseMode.off": "關閉"
 }

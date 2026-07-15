@@ -104,9 +104,10 @@ public final class RtExposure {
             VK10.vkCmdFillBuffer(cmd, histogram.handle, 0, histogram.size, 0);
         }
         VulkanCommandEncoder.memoryBarrier(cmd, stack);
-        pipeline.dispatchHistogram(cmd, traceColor.width, traceColor.height);
+        AutoConfig cfg = autoConfig();
+        pipeline.dispatchHistogram(cmd, traceColor.width, traceColor.height, cfg);
         VulkanCommandEncoder.memoryBarrier(cmd, stack);
-        pipeline.dispatchResolve(cmd, Math.max(1, traceColor.width * traceColor.height), autoConfig(), frameTimeSeconds());
+        pipeline.dispatchResolve(cmd, Math.max(1, traceColor.width * traceColor.height), cfg, frameTimeSeconds());
     }
 
     private float frameTimeSeconds() {
@@ -134,11 +135,13 @@ public final class RtExposure {
         Mode mode = mode();
         AutoConfig autoConfig = autoConfig();
         String exposureText = mode == Mode.AUTO
-                ? "auto(key=" + autoConfig.key + ", minEv=" + autoConfig.minEv + ", maxEv=" + autoConfig.maxEv
+                ? "auto(key=" + autoConfig.key + ", low%=" + autoConfig.lowPercent
+                + ", high%=" + autoConfig.highPercent + ", center=" + autoConfig.centerMetering
+                + ", minEv=" + autoConfig.minEv + ", maxEv=" + autoConfig.maxEv
                 + ", adaptUp=" + autoConfig.adaptUp + ", adaptDown=" + autoConfig.adaptDown
                 + ", evBias=" + autoConfig.evBias + ")"
                 : Float.toString(manualExposureScale());
-        CausticaMod.LOGGER.info("RT display exposure: mode={}, exposure={}, tonemap=agx, DLSS-RR exposure=NGX auto",
+        CausticaMod.LOGGER.info("RT display exposure: mode={}, exposure={}, tonemap=agx (Radiance-style percentile AE)",
                 mode.configName, exposureText);
     }
 
@@ -157,10 +160,25 @@ public final class RtExposure {
                 CausticaConfig.Rt.Exposure.maxEv(),
                 CausticaConfig.Rt.Exposure.ADAPT_UP.value(),
                 CausticaConfig.Rt.Exposure.ADAPT_DOWN.value(),
-                manualEv());
+                manualEv(),
+                CausticaConfig.Rt.Exposure.LOW_PERCENT.value(),
+                CausticaConfig.Rt.Exposure.HIGH_PERCENT.value(),
+                CausticaConfig.Rt.Exposure.CENTER_METERING.value(),
+                CausticaConfig.Rt.Exposure.CENTER_REGION.value());
     }
 
-    record AutoConfig(float key, float minEv, float maxEv, float adaptUp, float adaptDown, float evBias) {
+    /** Radiance-style auto-exposure knobs (percentile hist + optional center metering). */
+    record AutoConfig(
+            float key,
+            float minEv,
+            float maxEv,
+            float adaptUp,
+            float adaptDown,
+            float evBias,
+            float lowPercent,
+            float highPercent,
+            boolean centerMetering,
+            float centerRegion) {
     }
 
     private enum Mode {

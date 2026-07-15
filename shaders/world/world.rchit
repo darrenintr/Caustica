@@ -51,8 +51,9 @@ layout(binding = 2, set = 0) uniform sampler2D blockAtlas;
 // Parallel LabPBR _s (specular) and _n (normal) atlases, stitched to mirror the block atlas
 // sprite layout (RtBlockMaterials), sampled at the SAME uv as blockAtlas. Read only when the prim is
 // flagged (pr.mat.z for _s, pr.mat.w for _n).
-layout(binding = 9, set = 0) uniform sampler2D blockSpecAtlas;
-layout(binding = 10, set = 0) uniform sampler2D blockNormalAtlas;
+// Bindings follow raygen extras (GUIDE_COUNT=9 → storage images at 3..11); materials start at 12.
+layout(binding = 12, set = 0) uniform sampler2D blockSpecAtlas;
+layout(binding = 13, set = 0) uniform sampler2D blockNormalAtlas;
 // Bindless entity textures — a runtime-sized array indexed per-prim (tint.w) by the entity
 // hit path. Slot 0 is a fallback. Entities use per-type texture files, so each RenderType gets a slot.
 layout(binding = 0, set = 1) uniform sampler2D entityTex[];
@@ -209,7 +210,11 @@ void decodeSpec(vec4 s, vec3 albedo, out float rough, out float metal, out vec3 
     float g = s.g * 255.0;
     if (g < 229.5) {
         metal = 0.0;
-        f0 = vec3(s.g);
+        // LabPBR stores F0 in green as 0..1 reflectance; keep natural blocks matte-ish.
+        f0 = vec3(min(s.g, 0.08));
+        // Many packs author sand/dirt too smooth (high red). Floor roughness so terrain
+        // doesn't turn plastic under desert sun.
+        rough = max(rough, 0.45);
     } else if (g < 237.5) {
         metal = 1.0;
         f0 = metalF0(int(g + 0.5) - 230);
@@ -361,7 +366,7 @@ void main() {
         vec3 albedo = textureLod(entityTex[nonuniformEXT(texSlot)], euvCoord, entityLod).rgb * pr.tint.rgb;
         float rough = pr.mat.x;          // heuristic material default
         float metal = pr.mat.y;
-        vec3 f0 = mix(vec3(0.04), albedo, metal);
+        vec3 f0 = mix(vec3(0.02), albedo, metal);
         float emission = 0.0;
         float ao = 1.0;
         float sss = 0.0;
@@ -452,7 +457,7 @@ void main() {
         payload.normal = n;
         payload.hitT = gl_HitTEXT;
         payload.motionPrev = vec3(0.0);
-        payload.f0 = vec3(0.04);
+        payload.f0 = vec3(0.02); // glass default sheen (matte dielectrics use this floor too)
         payloadSetPacked(MATERIAL_GLASS, 0.05, 0.0, 0.0, 0.0);
         return;
     }
@@ -476,7 +481,7 @@ void main() {
     // Heuristic defaults, overridden per-texel by LabPBR _s when present (flagged in mat.z).
     float rough = pr.mat.x;
     float metal = pr.mat.y;
-    vec3 f0 = mix(vec3(0.04), payload.albedo, metal);
+    vec3 f0 = mix(vec3(0.02), payload.albedo, metal);
     // normal.w packs the 0..1 block-light level plus a +2 offset flag for non-SOLID (cutout / translucent)
     // render layers, set at extraction so the hit can opt SOLID terrain out of SSS below.
     float ew = pr.normal.w;

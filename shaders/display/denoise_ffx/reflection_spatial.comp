@@ -1,0 +1,76 @@
+// FidelityFX Reflection Denoiser — spatial prefilter (Caustica-hosted SPIR-V).
+// Edge-stopping blur on specular RGB; roughness widens kernel / boosts blur.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly  uniform image2D gIn;     // rgb specular, a = count
+layout(binding = 1, r32f)    readonly  uniform image2D gDepth;
+layout(binding = 2, rgba16f) readonly  uniform image2D gNormal; // w = roughness
+layout(binding = 3, rgba16f) writeonly uniform image2D gOut;
+
+layout(push_constant) uniform Push {
+    int step;
+    float depthSigma;
+    float normalSigma;
+    float pad;
+} pc;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(gIn);
+    if (pix.x >= size.x || pix.y >= size.y) {
+        return;
+    }
+
+    vec4 center = imageLoad(gIn, pix);
+    vec3 cSpec = center.rgb;
+    float cCount = center.a;
+    float cDepth = imageLoad(gDepth, pix).r;
+    vec4 nPack = imageLoad(gNormal, pix);
+    vec3 cN = normalize(nPack.xyz + 1e-6);
+    float rough = clamp(nPack.w, 0.0, 1.0);
+
+    if (length(nPack.xyz) < 1e-4 || cDepth <= 1e-6 || rough > 0.95) {
+        imageStore(gOut, pix, vec4(cSpec, cCount));
+        return;
+    }
+
+    // Thin history / rough → stronger spatial (FFX prefilter idea).
+    float spatialBoost = mix(2.2, 1.0, clamp(cCount / 16.0, 0.0, 1.0));
+    spatialBoost *= mix(1.0, 1.8, rough);
+    float depthSigma = max(pc.depthSigma * spatialBoost, 1e-4);
+    float normalSigma = max(pc.normalSigma * mix(0.7, 1.3, rough), 1e-4);
+
+    const float k[3] = float[3](0.4, 0.25, 0.05);
+    float wSum = 0.0;
+    vec3 sSum = vec3(0.0);
+    int step = max(pc.step, 1);
+
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            ivec2 q = pix + ivec2(dx, dy) * step;
+            if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size))) {
+                continue;
+            }
+            vec3 s = imageLoad(gIn, q).rgb;
+            float d = imageLoad(gDepth, q).r;
+            vec3 n = normalize(imageLoad(gNormal, q).xyz + 1e-6);
+
+            float wSpatial = k[min(abs(dx), 2)] * k[min(abs(dy), 2)];
+            float wDepth = exp(-abs(cDepth - d) / (depthSigma * max(cDepth, 1e-3)));
+            float wNormal = exp(-max(0.0, 1.0 - dot(cN, n)) / normalSigma);
+            // Colour similarity — kill firefly neighbours (relative).
+            float lumC = max(dot(cSpec, vec3(0.2126, 0.7152, 0.0722)), 1e-3);
+            float lumS = max(dot(s, vec3(0.2126, 0.7152, 0.0722)), 1e-3);
+            float wColor = exp(-abs(lumC - lumS) / (lumC * mix(0.6, 1.5, rough) + 1e-3));
+            float w = wSpatial * wDepth * wNormal * wColor;
+            wSum += w;
+            sSum += s * w;
+        }
+    }
+
+    vec3 outSpec = (wSum > 1e-5) ? (sSum / wSum) : cSpec;
+    outSpec = min(max(outSpec, vec3(0.0)), vec3(32.0));
+    imageStore(gOut, pix, vec4(outSpec, cCount));
+}

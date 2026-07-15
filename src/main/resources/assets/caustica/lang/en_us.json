@@ -56,5 +56,29 @@
 	"caustica.options.rt.debugView.4": "Roughness",
 	"caustica.options.rt.debugView.5": "Motion",
 	"caustica.options.rt.debugView.6": "Specular",
-	"caustica.options.rt.debugView.7": "Specular Motion"
+	"caustica.options.rt.debugView.7": "Specular Motion",
+	"caustica.options.rt.debugView.8": "Shadow Hit",
+	"caustica.options.rt.debugView.9": "Diffuse Split",
+	"caustica.options.rt.debugView.10": "Reflection Split",
+
+	"caustica.options.rt.debugOverlay": "RT Debug Overlay",
+	"caustica.options.rt.debugOverlay.tooltip": "Show live ray-tracing pipeline state in the top-left of the screen (active upscaler, denoise mode, frame counter, last DLSS-RR return code, per-stage timings). Useful when an image looks wrong.",
+
+	"caustica.options.rt.upscalerMode": "Upscaler",
+	"caustica.options.rt.upscalerMode.tooltip": "Which upscaler to use. Auto picks the best one for the GPU; the rest force a specific backend. Changes take effect immediately.",
+	"caustica.options.rt.upscalerMode.auto": "Auto",
+	"caustica.options.rt.upscalerMode.off": "Off (1:1)",
+	"caustica.options.rt.upscalerMode.dlss-rr": "DLSS Ray Reconstruction (NVIDIA)",
+	"caustica.options.rt.upscalerMode.fsr-3": "FSR 3",
+	"caustica.options.rt.upscalerMode.fsr-4": "FSR 4.1 INT8 (RDNA 3/4)",
+	"caustica.options.rt.upscalerMode.xess": "XeSS",
+
+	"caustica.options.rt.denoiseMode": "Denoise",
+	"caustica.options.rt.denoiseMode.tooltip": "Internal denoise. Auto/Hybrid: FFX shadow+refl then NRD REBLUR. NRD: REBLUR only (no FFX). FFX: shadow+refl only. Off: raw path-traced grain.",
+	"caustica.options.rt.denoiseMode.auto": "Auto (FFX→NRD)",
+	"caustica.options.rt.denoiseMode.ffx": "FFX only",
+	"caustica.options.rt.denoiseMode.nrd": "NRD only",
+	"caustica.options.rt.denoiseMode.hybrid": "Hybrid FFX→NRD",
+	"caustica.options.rt.denoiseMode.svgl": "SVGF (legacy → FFX)",
+	"caustica.options.rt.denoiseMode.off": "Off"
 }

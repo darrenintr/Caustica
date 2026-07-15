@@ -157,9 +157,6 @@ public final class FsrUpscaler implements Upscaler {
 
     @Override
     public int[] queryOptimalRenderSize(int displayWidth, int displayHeight) {
-        if (!ready) {
-            return new int[] { displayWidth, displayHeight };
-        }
         // FSR 3 / FSR 4 use stable per-quality ratios; FSR doesn't have a runtime queryOptimal but does
         // document the expected scales. We hardcode the standard ratios; FSR 4 INT8 path uses the same
         // input grid. (FSR 4.0+ supports additional modes that change the scale, but the published
@@ -197,6 +194,15 @@ public final class FsrUpscaler implements Upscaler {
                 lib.destroyContext(context, MemorySegment.NULL);
                 context = MemorySegment.NULL;
             }
+            // Publish the requested sizes + quality BEFORE building the descriptor: the descriptor
+            // for the first frame reads featureRenderWidth/Height/DisplayWidth/Height off the upscaler
+            // to populate the FFX maxRender/maxDisplay fields. Without this, the first descriptor is
+            // built with 1×1 (the sentinel default) and FFX rejects the very first dispatch.
+            featureRenderWidth = renderWidth;
+            featureRenderHeight = renderHeight;
+            featureDisplayWidth = displayWidth;
+            featureDisplayHeight = displayHeight;
+            featureQuality = effectiveQuality;
             try (Arena arena = Arena.ofConfined()) {
                 MemorySegment ctxOut = arena.allocate(ValueLayout.ADDRESS);
                 MemorySegment desc = FsrDescriptors.buildCreateContextDescUpscaleVulkan(arena, this, /*probe=*/false);
@@ -209,11 +215,6 @@ public final class FsrUpscaler implements Upscaler {
                     throw new IllegalStateException("ffxCreateContext returned a null context");
                 }
             }
-            featureRenderWidth = renderWidth;
-            featureRenderHeight = renderHeight;
-            featureDisplayWidth = displayWidth;
-            featureDisplayHeight = displayHeight;
-            featureQuality = effectiveQuality;
             ready = true;
             LOGGER.info("FSR {} upscaler context created: {}x{} -> {}x{} (quality={}, model={})",
                     isFsr4 ? "4" : "3", renderWidth, renderHeight, displayWidth, displayHeight,

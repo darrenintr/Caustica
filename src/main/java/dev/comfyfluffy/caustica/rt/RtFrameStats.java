@@ -165,6 +165,33 @@ public final class RtFrameStats {
             counters[indexOf(counterNames, counterName)] += delta;
         }
 
+        /**
+         * Total nanoseconds spent in {@code stageName} over the current frame's accumulated scopes.
+         * Returns 0 when the profile is inactive, the stage name is unknown, or the stage hasn't run yet.
+         * Public read-only access is for the in-game debug overlay; callers must not mutate.
+         */
+        public long stageNanos(String stageName) {
+            if (!active) {
+                return 0L;
+            }
+            int idx = indexOfOrNegative(stageNames, stageName);
+            return idx < 0 ? 0L : stageNanos[idx];
+        }
+
+        /** Millisecond convenience wrapper for {@link #stageNanos(String)}. */
+        public long stageTotalMs(String stageName) {
+            return stageNanos(stageName) / 1_000_000L;
+        }
+
+        /** Current value of {@code counterName} for the in-progress (or last completed) frame. */
+        public long counterValue(String counterName) {
+            if (!active) {
+                return 0L;
+            }
+            int idx = indexOfOrNegative(counterNames, counterName);
+            return idx < 0 ? 0L : counters[idx];
+        }
+
         /** Finish the current frame: record it into the rolling median and log a hitch line if it's slow. */
         public void end() {
             if (!active) {
@@ -279,6 +306,19 @@ public final class RtFrameStats {
                 }
             }
             throw new IllegalArgumentException("Unknown RtFrameStats name: " + name);
+        }
+
+        /** Tolerant variant for the public debug-overlay getters: returns -1 on unknown / null name. */
+        private static int indexOfOrNegative(String[] arr, String name) {
+            if (name == null) {
+                return -1;
+            }
+            for (int i = 0; i < arr.length; i++) {
+                if (arr[i].equals(name)) {
+                    return i;
+                }
+            }
+            return -1;
         }
     }
 }

@@ -1,0 +1,129 @@
+// FidelityFX Shadow Denoiser — temporal reproject (Caustica-hosted SPIR-V).
+// Algorithm lineage: AMD FFX Denoiser 1.2 shadow tile classification / reproject
+// (disocclusion via depth, neighborhood clamp, variance boost on thin history).
+// Operates on a scalar shadow mask only — never touches beauty radiance.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, r8)    readonly  uniform image2D gShadowHit;   // raw per-pixel visibility [0,1]
+layout(binding = 1, r32f)  readonly  uniform image2D gDepth;       // HW reversed-Z
+layout(binding = 2, rgba16f) readonly uniform image2D gNormal;    // xyz world normal
+layout(binding = 3, rgba16f) readonly uniform image2D gMotion;      // xy = (prevNdc-curNdc)*0.5*size (px)
+layout(binding = 4, rg16f) readonly  uniform image2D gHistoryShadow; // r=shadow, g=sampleCount
+layout(binding = 5, rg16f) writeonly uniform image2D gOut;         // r=reprojected shadow, g=new count
+
+layout(push_constant) uniform Push {
+    float invW;
+    float invH;
+    float depthThreshold; // relative depth error to reject history (adaptive floor)
+    float reset;          // 1 = hard cut: ignore history
+} pc;
+
+float fetchShadow(ivec2 p, ivec2 size) {
+    p = clamp(p, ivec2(0), size - 1);
+    return imageLoad(gShadowHit, p).r;
+}
+
+float fetchDepth(ivec2 p, ivec2 size) {
+    p = clamp(p, ivec2(0), size - 1);
+    return imageLoad(gDepth, p).r;
+}
+
+vec3 fetchNormal(ivec2 p, ivec2 size) {
+    p = clamp(p, ivec2(0), size - 1);
+    return normalize(imageLoad(gNormal, p).xyz + 1e-6);
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(gShadowHit);
+    if (pix.x >= size.x || pix.y >= size.y) {
+        return;
+    }
+
+    float curShadow = fetchShadow(pix, size);
+    float curDepth = fetchDepth(pix, size);
+    vec3 curN = fetchNormal(pix, size);
+
+    // Sky / empty: keep raw (usually 1.0 from rgen primary miss).
+    bool noSurface = (length(imageLoad(gNormal, pix).xyz) < 1e-4) || (curDepth <= 1e-6);
+    if (noSurface || pc.reset > 0.5) {
+        imageStore(gOut, pix, vec4(curShadow, 1.0, 0.0, 0.0));
+        return;
+    }
+
+    // Motion is in render pixels: current → previous.
+    vec2 motionPx = imageLoad(gMotion, pix).xy;
+    vec2 prevUv = (vec2(pix) + 0.5 - motionPx) * vec2(pc.invW, pc.invH);
+    bool offscreen = any(lessThan(prevUv, vec2(0.0))) || any(greaterThanEqual(prevUv, vec2(1.0)));
+
+    float histShadow = curShadow;
+    float histCount = 0.0;
+    if (!offscreen) {
+        // Bilinear history sample in pixel space.
+        vec2 prevPx = prevUv * vec2(size) - 0.5;
+        ivec2 i0 = ivec2(floor(prevPx));
+        vec2 f = prevPx - vec2(i0);
+        float s00 = imageLoad(gHistoryShadow, clamp(i0, ivec2(0), size - 1)).r;
+        float s10 = imageLoad(gHistoryShadow, clamp(i0 + ivec2(1, 0), ivec2(0), size - 1)).r;
+        float s01 = imageLoad(gHistoryShadow, clamp(i0 + ivec2(0, 1), ivec2(0), size - 1)).r;
+        float s11 = imageLoad(gHistoryShadow, clamp(i0 + ivec2(1, 1), ivec2(0), size - 1)).r;
+        histShadow = mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
+
+        float c00 = imageLoad(gHistoryShadow, clamp(i0, ivec2(0), size - 1)).g;
+        float c10 = imageLoad(gHistoryShadow, clamp(i0 + ivec2(1, 0), ivec2(0), size - 1)).g;
+        float c01 = imageLoad(gHistoryShadow, clamp(i0 + ivec2(0, 1), ivec2(0), size - 1)).g;
+        float c11 = imageLoad(gHistoryShadow, clamp(i0 + ivec2(1, 1), ivec2(0), size - 1)).g;
+        histCount = mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+
+        // Depth disocclusion (reversed-Z: near≈1, far≈0). Compare relative |d-d_hist|/max(d,eps).
+        float histDepth = fetchDepth(clamp(i0, ivec2(0), size - 1), size);
+        float depthErr = abs(curDepth - histDepth) / max(curDepth, 1e-3);
+        // Adaptive threshold: looser at grazing angles (FFX doc).
+        float ndv = abs(curN.z); // approximate facing; good enough without view vector
+        float thresh = mix(pc.depthThreshold * 4.0, pc.depthThreshold, clamp(ndv, 0.0, 1.0));
+        if (depthErr > thresh) {
+            histCount = 0.0;
+            histShadow = curShadow;
+        }
+
+        // Normal discontinuity reject.
+        vec3 histN = fetchNormal(clamp(i0, ivec2(0), size - 1), size);
+        if (dot(curN, histN) < 0.5) {
+            histCount = 0.0;
+            histShadow = curShadow;
+        }
+    } else {
+        histCount = 0.0;
+        histShadow = curShadow;
+    }
+
+    // Local neighborhood mean/min/max for clamp (3x3) — ghosting control.
+    float nMin = curShadow;
+    float nMax = curShadow;
+    float nSum = 0.0;
+    float nW = 0.0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            float s = fetchShadow(pix + ivec2(dx, dy), size);
+            nMin = min(nMin, s);
+            nMax = max(nMax, s);
+            nSum += s;
+            nW += 1.0;
+        }
+    }
+    float nMean = nSum / max(nW, 1.0);
+    histShadow = clamp(histShadow, nMin - 0.05, nMax + 0.05);
+
+    // Temporal blend: more history when stable; boost spatial role when thin history
+    // (handled in spatial pass via sample count).
+    float alpha = histCount < 1.0 ? 1.0 : mix(0.2, 0.08, clamp(histCount / 16.0, 0.0, 1.0));
+    // When current disagrees hard with neighborhood mean, trust current more (moving shadow).
+    float disagree = abs(curShadow - nMean);
+    alpha = mix(alpha, 0.55, clamp(disagree * 2.0, 0.0, 1.0));
+
+    float outShadow = mix(histShadow, curShadow, alpha);
+    float outCount = min(histCount + 1.0, 64.0);
+    imageStore(gOut, pix, vec4(outShadow, outCount, 0.0, 0.0));
+}

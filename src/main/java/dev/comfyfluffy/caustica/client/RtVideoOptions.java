@@ -3,6 +3,7 @@ package dev.comfyfluffy.caustica.client;
 import com.mojang.serialization.Codec;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaConfig.BooleanSetting;
+import dev.comfyfluffy.caustica.CausticaConfig.EnumSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.FloatSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.IntSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.StringSetting;
@@ -40,10 +41,13 @@ public final class RtVideoOptions {
             entities(),
             particles(),
             waterWaves(),
+            upscalerMode(),
+            denoiseMode(),
             dlssQuality(),
             hdrEnabled(),
             hdrPaperWhite(),
             hdrPeak(),
+            debugOverlay(),
             debugView(),
         };
     }
@@ -170,6 +174,49 @@ public final class RtVideoOptions {
             nits -> setting.set(nits.floatValue()));
     }
 
+    private static OptionInstance<String> upscalerMode() {
+        EnumSetting<CausticaConfig.UpscalerMode> setting = CausticaConfig.Rt.Upscaler.MODE;
+        // User-facing list mirrors CausticaConfig.UpscalerMode in declared order; auto picks the best
+        // backend for the current GPU, the rest force one. The "off" entry shows up as "Off (1:1)".
+        List<String> values = List.of("auto", "off", "dlss-rr", "fsr-3", "fsr-4", "xess");
+        return new OptionInstance<>(
+            "caustica.options.rt.upscalerMode",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.upscalerMode.tooltip")),
+            (caption, value) -> Component.translatable("caustica.options.rt.upscalerMode." + value),
+            new OptionInstance.Enum<>(values, Codec.STRING),
+            setting.value().key(),
+            value -> {
+                setting.set(CausticaConfig.UpscalerMode.fromKey(value));
+                // Hot-reload: clear the resolved-once latch so the next composite() call re-runs
+                // UpscalerSelector.resolve() and the new backend takes effect on the next frame.
+                dev.comfyfluffy.caustica.rt.RtComposite.INSTANCE.invalidateUpscalerSelection();
+            });
+    }
+
+    private static OptionInstance<String> denoiseMode() {
+        EnumSetting<CausticaConfig.DenoiserKind> setting = CausticaConfig.Rt.Denoise.MODE;
+        List<String> values = List.of("auto", "ffx", "nrd", "off");
+        return new OptionInstance<>(
+            "caustica.options.rt.denoiseMode",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.denoiseMode.tooltip")),
+            (caption, value) -> Component.translatable("caustica.options.rt.denoiseMode." + value),
+            new OptionInstance.Enum<>(values, Codec.STRING),
+            setting.value().key(),
+            value -> {
+                setting.set(CausticaConfig.DenoiserKind.fromKey(value));
+                dev.comfyfluffy.caustica.rt.RtComposite.INSTANCE.invalidateDenoiseSelection();
+            });
+    }
+
+    private static OptionInstance<Boolean> debugOverlay() {
+        BooleanSetting setting = dev.comfyfluffy.caustica.CausticaConfig.Rt.DebugOverlay.ENABLED;
+        return OptionInstance.createBoolean(
+            "caustica.options.rt.debugOverlay",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.debugOverlay.tooltip")),
+            setting.value(),
+            setting::set);
+    }
+
     private static OptionInstance<Integer> debugView() {
         IntSetting setting = CausticaConfig.Rt.Composite.DEBUG_VIEW;
         return new OptionInstance<>(
@@ -178,8 +225,8 @@ public final class RtVideoOptions {
             // CycleButton (used for Enum values) already prepends "caption: " itself (DisplayState.
             // NAME_AND_VALUE), so this must return only the value's text, not caption + value again.
             (caption, value) -> Component.translatable("caustica.options.rt.debugView." + value),
-            new OptionInstance.Enum<>(List.of(0, 1, 2, 3, 4, 5, 6, 7), Codec.INT),
-            Math.clamp(setting.value(), 0, 7),
+            new OptionInstance.Enum<>(List.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10), Codec.INT),
+            Math.clamp(setting.value(), 0, 10),
             setting::set);
     }
 
