@@ -37,7 +37,8 @@ public final class UpscalerSelector {
         DLSS_RR("dlss-rr"),
         FSR_3("fsr-3"),
         FSR_4("fsr-4"),
-        XESS("xess");
+        XESS("xess"),
+        NIS("nis");
 
         final String key;
         Mode(String key) { this.key = key; }
@@ -118,6 +119,7 @@ public final class UpscalerSelector {
                 }
             }
             case XESS -> candidate = XeSsUpscaler.tryCreate();
+            case NIS -> candidate = NisUpscaler.tryCreate();
             case AUTO -> {
                 // Best-mode picker.
                 if (gpu.canRunDlss()) {
@@ -149,6 +151,13 @@ public final class UpscalerSelector {
                     candidate = XeSsUpscaler.tryCreate();
                     if (candidate != null) {
                         requestedReason = "auto: → XeSS";
+                    }
+                }
+                // Final fallback: NIS (always works, pure shader)
+                if (candidate == null) {
+                    candidate = NisUpscaler.tryCreate();
+                    if (candidate != null) {
+                        requestedReason = "auto: → NIS (cross-vendor fallback)";
                     }
                 }
             }

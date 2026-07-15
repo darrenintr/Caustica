@@ -1,0 +1,108 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// SVGF Step 1: Temporal Reprojection
+// Reproject previous frame using motion vectors and accumulate with current frame
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uColorCurrent;
+layout(set = 0, binding = 1) uniform sampler2D uColorHistory;
+layout(set = 0, binding = 2) uniform sampler2D uMomentHistory;  // RG = mean, BA = variance
+layout(set = 0, binding = 3) uniform sampler2D uMotion;
+layout(set = 0, binding = 4) uniform sampler2D uDepth;
+layout(set = 0, binding = 5) uniform sampler2D uNormal;
+
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D uColorOut;
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D uMomentOut;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 resolution;
+    float alpha;           // Temporal blend weight (0.1 = 90% history, 0.9 = 90% current)
+    float depthThreshold;  // Disocclusion threshold
+    float normalThreshold; // Normal similarity threshold
+    uint frameIndex;
+} pc;
+
+// Luminance calculation
+float luminance(vec3 rgb) {
+    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// Check if history sample is valid for reprojection
+bool isValidHistory(vec2 historyUV, float currentDepth, vec3 currentNormal) {
+    if (historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
+        return false;
+    }
+
+    // Sample history depth and normal (would need to store these)
+    // For now, just check UV bounds
+    return true;
+}
+
+void main() {
+    ivec2 pixelPos = ivec2(gl_GlobalInvocationID.xy);
+    if (pixelPos.x >= pc.resolution.x || pixelPos.y >= pc.resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixelPos) + 0.5) / vec2(pc.resolution);
+
+    // Sample current frame
+    vec3 colorCurrent = texture(uColorCurrent, uv).rgb;
+    float depth = texture(uDepth, uv).r;
+    vec3 normal = texture(uNormal, uv).xyz;
+
+    // Sample motion vector
+    vec2 motion = texture(uMotion, uv).rg;
+    vec2 historyUV = uv - motion;
+
+    // Initialize output with current frame
+    vec3 colorOut = colorCurrent;
+    float lumaCurrent = luminance(colorCurrent);
+
+    // Temporal accumulation
+    float alpha = pc.alpha;
+
+    if (isValidHistory(historyUV, depth, normal)) {
+        vec3 colorHistory = texture(uColorHistory, historyUV).rgb;
+        vec4 momentHistory = texture(uMomentHistory, historyUV);
+
+        float lumaHistory = momentHistory.r;
+        float variance = momentHistory.g;
+
+        // Clamp history to current neighborhood (reduce ghosting)
+        vec3 colorMin = colorCurrent;
+        vec3 colorMax = colorCurrent;
+
+        // 3x3 neighborhood clamping
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                vec2 sampleUV = uv + vec2(x, y) / vec2(pc.resolution);
+                vec3 colorNeighbor = texture(uColorCurrent, sampleUV).rgb;
+                colorMin = min(colorMin, colorNeighbor);
+                colorMax = max(colorMax, colorNeighbor);
+            }
+        }
+
+        colorHistory = clamp(colorHistory, colorMin, colorMax);
+
+        // Blend current and history
+        colorOut = mix(colorHistory, colorCurrent, alpha);
+
+        // Update moments for variance estimation
+        float lumaBlended = luminance(colorOut);
+        float moment1 = mix(lumaHistory, lumaCurrent, alpha);
+        float moment2 = mix(momentHistory.b, lumaCurrent * lumaCurrent, alpha);
+        variance = max(0.0, moment2 - moment1 * moment1);
+
+        imageStore(uMomentOut, pixelPos, vec4(moment1, variance, moment2, 0.0));
+    } else {
+        // Disoccluded pixel - reset history
+        float moment1 = lumaCurrent;
+        float moment2 = lumaCurrent * lumaCurrent;
+        imageStore(uMomentOut, pixelPos, vec4(moment1, 0.0, moment2, 0.0));
+    }
+
+    imageStore(uColorOut, pixelPos, vec4(colorOut, 1.0));
+}

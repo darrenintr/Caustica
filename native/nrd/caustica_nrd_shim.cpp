@@ -500,7 +500,7 @@ extern "C" int caustica_nrd_create(
     // Strategy: aggressive spatial blur on motion/disocclusion (fast coverage), then
     // temporal accumulation refines static areas. Motion blur > motion noise.
     nrd::ReblurSettings reblur{};
-    reblur.maxAccumulatedFrameNum = 48;          // ~0.8s @ 60fps — static rooms converge hard
+    reblur.maxAccumulatedFrameNum = 28;          // faster response for dim-lighting ghosting (was 48)
     reblur.maxFastAccumulatedFrameNum = 4;       // FAST converge on disocclusion (was 6)
     reblur.maxStabilizedFrameNum = 32;           // stabilize radiance for stills
     reblur.historyFixFrameNum = 2;               // minimal checkerboard (was 3)
@@ -511,12 +511,12 @@ extern "C" int caustica_nrd_create(
     reblur.usePrepassOnlyForSpecularMotionEstimation = false;
     reblur.minBlurRadius = 3.0f;                 // never below 3px (was 2.0)
     reblur.maxBlurRadius = 48.0f;                // wider max for disocclusion (was 32)
-    reblur.fastHistoryClampingSigmaScale = 2.2f; // tight clamp for fast path
+    reblur.fastHistoryClampingSigmaScale = 1.8f; // tighter variance rejection (was 2.2)
     reblur.lobeAngleFraction = 0.20f;            // wider lobe = more spatial reuse (was 0.15)
     reblur.roughnessFraction = 0.20f;            // looser roughness match (was 0.15)
     reblur.planeDistanceSensitivity = 0.03f;     // looser plane check = more blur (was 0.02)
     reblur.minHitDistanceWeight = 0.08f;         // less hit-dist modulation (was 0.12)
-    reblur.fireflySuppressorMinRelativeScale = 2.5f; // aggressive: kill bright outliers in dark
+    reblur.fireflySuppressorMinRelativeScale = 3.5f; // stronger outlier rejection (was 2.5)
     reblur.enableAntiFirefly = true;
     reblur.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_3X3;
     // Responsive accumulation: trigger fast blur on rough surfaces (motion-blur style).
@@ -524,7 +524,7 @@ extern "C" int caustica_nrd_create(
     reblur.responsiveAccumulationSettings.minAccumulatedFrameNum = 2;
     // Antilag: moderate — too strong kills temporal benefit, too weak leaves trails.
     reblur.antilagSettings.luminanceSigmaScale = 1.8f;
-    reblur.antilagSettings.luminanceSensitivity = 2.2f;
+    reblur.antilagSettings.luminanceSensitivity = 3.0f; // aggressive ghosting/firefly rejection (was 2.2)
     reblur.convergenceSettings.s = 1.0f;
     reblur.convergenceSettings.b = 0.2f;
     reblur.convergenceSettings.p = 0.85f;

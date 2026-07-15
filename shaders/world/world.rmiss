@@ -63,7 +63,7 @@ float pow2(float x) { return x * x; }
 // transmittanceToSpace(dir) at draw time (same extinction as the in-scatter march), so at noon the sun
 // reads warm-white and at the horizon it reddens on exactly the sky's own sunset curve.
 const vec3 SUN_DISC_RADIANCE  = vec3(24.0, 23.0, 21.5);
-const vec3 MOON_DISC_RADIANCE = vec3(1.7, 1.85, 2.2);   // lit-side moon (HDR, reads bright at night exposure)
+const vec3 MOON_DISC_RADIANCE = vec3(1.2, 1.3, 1.5);   // lit-side moon (HDR, reads bright at night exposure)
 // Vibrance applied to the atmosphere in-scatter only (not discs/stars/night ambient): luminance-preserving,
 // so GI energy is unchanged — the noon zenith gets a deeper blue and sunsets richer oranges.
 const float SKY_SATURATION = 1.2;
@@ -72,8 +72,8 @@ const float SKY_SATURATION = 1.2;
 const float SUN_DISC_HALF_ANGLE  = 0.29146; // atan(30/100), vanilla sun size
 const float MOON_DISC_HALF_ANGLE = 0.19740; // atan(20/100), vanilla moon size
 // Faint night-sky ambient so the night isn't pure black where the atmosphere in-scatter falls to zero.
-const vec3 NIGHT_ZENITH  = vec3(0.004, 0.008, 0.022) / 2.0;
-const vec3 NIGHT_HORIZON = vec3(0.015, 0.022, 0.045) / 2.0;
+const vec3 NIGHT_ZENITH  = vec3(0.002, 0.004, 0.012) / 2.0;
+const vec3 NIGHT_HORIZON = vec3(0.008, 0.012, 0.025) / 2.0;
 
 // ---- Physically-based atmosphere (Nishita / O'Neil single scattering). A view ray is marched through
 // the atmospheric shell; at each step the transmittance toward the sun is integrated (a second, shorter

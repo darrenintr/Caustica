@@ -1,0 +1,103 @@
+// Spatial bilateral filter for transparent materials (glass, water, ice).
+// 5x5 kernel with relaxed depth/normal thresholds to handle water waves and refraction.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly uniform image2D gInColor;
+layout(binding = 1, rgba16f) readonly uniform image2D gInNormal;
+layout(binding = 2, r32f) readonly uniform image2D gInDepth;
+layout(binding = 3, r8) readonly uniform image2D gTransparencyMask;
+layout(binding = 4, rgba16f) writeonly uniform image2D gOutColor;
+
+layout(push_constant) uniform Push {
+    float depthSigma;   // 0.15 (relaxed for water waves)
+    float normalSigma;  // 0.35 (relaxed for refraction)
+    float colorSigma;   // 1.5 (preserve high-freq reflections)
+    float _pad;
+} pc;
+
+// 5x5 Gaussian weights (separable would be better but this is simpler)
+const float kernel[25] = float[](
+    1.0/256.0,  4.0/256.0,  6.0/256.0,  4.0/256.0, 1.0/256.0,
+    4.0/256.0, 16.0/256.0, 24.0/256.0, 16.0/256.0, 4.0/256.0,
+    6.0/256.0, 24.0/256.0, 36.0/256.0, 24.0/256.0, 6.0/256.0,
+    4.0/256.0, 16.0/256.0, 24.0/256.0, 16.0/256.0, 4.0/256.0,
+    1.0/256.0,  4.0/256.0,  6.0/256.0,  4.0/256.0, 1.0/256.0
+);
+
+float luminance(vec3 rgb) {
+    return dot(rgb, vec3(0.299, 0.587, 0.114));
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(gOutColor);
+    if (pix.x >= size.x || pix.y >= size.y) {
+        return;
+    }
+
+    float mask = imageLoad(gTransparencyMask, pix).r;
+
+    // If not transparent (mask < 0.5), pass through unchanged
+    if (mask < 0.5) {
+        vec4 original = imageLoad(gInColor, pix);
+        imageStore(gOutColor, pix, original);
+        return;
+    }
+
+    // Center pixel
+    vec3 centerColor = imageLoad(gInColor, pix).rgb;
+    vec4 centerNR = imageLoad(gInNormal, pix);
+    vec3 centerNormal = normalize(centerNR.xyz);
+    float centerDepth = imageLoad(gInDepth, pix).r;
+    float centerLuma = luminance(centerColor);
+
+    // Edge case: sky or invalid geometry
+    if (length(centerNormal) < 0.5 || centerDepth < 1e-5) {
+        imageStore(gOutColor, pix, vec4(centerColor, 1.0));
+        return;
+    }
+
+    // 5x5 bilateral filter
+    vec3 sum = vec3(0.0);
+    float weightSum = 0.0;
+
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            ivec2 samplePos = pix + ivec2(dx, dy);
+            if (samplePos.x < 0 || samplePos.x >= size.x ||
+                samplePos.y < 0 || samplePos.y >= size.y) {
+                continue;
+            }
+
+            vec3 sampleColor = imageLoad(gInColor, samplePos).rgb;
+            vec3 sampleNormal = normalize(imageLoad(gInNormal, samplePos).xyz);
+            float sampleDepth = imageLoad(gInDepth, samplePos).r;
+            float sampleLuma = luminance(sampleColor);
+
+            // Spatial weight (Gaussian)
+            int kernelIdx = (dy + 2) * 5 + (dx + 2);
+            float spatialW = kernel[kernelIdx];
+
+            // Depth weight (relaxed for water waves)
+            float depthDelta = abs(sampleDepth - centerDepth) / max(centerDepth, 1e-4);
+            float depthW = exp(-depthDelta * depthDelta / (2.0 * pc.depthSigma * pc.depthSigma));
+
+            // Normal weight (relaxed for refraction)
+            float normalDot = max(dot(centerNormal, sampleNormal), 0.0);
+            float normalW = pow(normalDot, 1.0 / max(pc.normalSigma, 0.01));
+
+            // Color weight (preserve high-frequency reflections)
+            float colorDelta = abs(sampleLuma - centerLuma);
+            float colorW = exp(-colorDelta * colorDelta / (2.0 * pc.colorSigma * pc.colorSigma));
+
+            float weight = spatialW * depthW * normalW * colorW;
+            sum += sampleColor * weight;
+            weightSum += weight;
+        }
+    }
+
+    vec3 filtered = weightSum > 1e-6 ? sum / weightSum : centerColor;
+    imageStore(gOutColor, pix, vec4(filtered, 1.0));
+}

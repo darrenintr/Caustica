@@ -72,6 +72,7 @@
 	"caustica.options.rt.upscalerMode.fsr-3": "FSR 3",
 	"caustica.options.rt.upscalerMode.fsr-4": "FSR 4.1 INT8 (RDNA 3/4)",
 	"caustica.options.rt.upscalerMode.xess": "XeSS",
+	"caustica.options.rt.upscalerMode.nis": "NIS (NVIDIA Image Scaling)",
 
 	"caustica.options.rt.denoiseMode": "Denoise",
 	"caustica.options.rt.denoiseMode.tooltip": "Internal denoise. Auto/Hybrid: FFX shadow+refl then NRD REBLUR. NRD: REBLUR only (no FFX). FFX: shadow+refl only. Off: raw path-traced grain.",

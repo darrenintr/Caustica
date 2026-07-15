@@ -1091,13 +1091,19 @@ public final class RtComposite {
             }
             reservoirImages.ensureSized(ctx, renderW, renderH);
 
-            // Add test lights (4 torches in a square for initial testing)
-            if (blockLightTracker != null) {
-                blockLightTracker.addLight(new BlockPos(0, 70, 0), 14, 0xFFCC66);
-                blockLightTracker.addLight(new BlockPos(10, 70, 0), 14, 0xFFCC66);
-                blockLightTracker.addLight(new BlockPos(0, 70, 10), 14, 0xFFCC66);
-                blockLightTracker.addLight(new BlockPos(10, 70, 10), 14, 0xFFCC66);
-                CausticaMod.LOGGER.info("ReSTIR DI: Added {} test lights", blockLightTracker.getLightCount());
+            // Add test lights around camera position (only once after tracker creation)
+            if (blockLightTracker != null && blockLightTracker.getLightCount() == 0) {
+                int camBlockX = Mth.floor(camX);
+                int camBlockY = Mth.floor(camY);
+                int camBlockZ = Mth.floor(camZ);
+
+                // Add 4 torches in a square around the player (5 blocks away, at eye level)
+                blockLightTracker.addLight(new BlockPos(camBlockX - 5, camBlockY, camBlockZ - 5), 14, 0xFFCC66);
+                blockLightTracker.addLight(new BlockPos(camBlockX + 5, camBlockY, camBlockZ - 5), 14, 0xFFCC66);
+                blockLightTracker.addLight(new BlockPos(camBlockX - 5, camBlockY, camBlockZ + 5), 14, 0xFFCC66);
+                blockLightTracker.addLight(new BlockPos(camBlockX + 5, camBlockY, camBlockZ + 5), 14, 0xFFCC66);
+                CausticaMod.LOGGER.info("ReSTIR DI: Added {} test lights around player at ({}, {}, {})",
+                    blockLightTracker.getLightCount(), camBlockX, camBlockY, camBlockZ);
             }
         }
 
@@ -1264,9 +1270,9 @@ public final class RtComposite {
                 // For now, append at a safe offset after breaking data (432 + MAX_BREAKING*16 = 560)
                 int restirOffset = BREAKING_OFFSET + MAX_BREAKING * 16;
                 push.putInt(restirOffset, blockLightTracker.getLightCount()); // blockLightCount
-                push.putInt(restirOffset + 4, 8);      // restirCandidates
-                push.putFloat(restirOffset + 8, 20.0f); // restirMaxMTemporal
-                push.putFloat(restirOffset + 12, 100.0f); // restirMaxMSpatial
+                push.putInt(restirOffset + 4, 12);      // restirCandidates (8→12: more light samples)
+                push.putFloat(restirOffset + 8, 30.0f); // restirMaxMTemporal (20→30: more temporal reuse)
+                push.putFloat(restirOffset + 12, 150.0f); // restirMaxMSpatial (100→150: more spatial reuse)
             }
 
             // Upload any entity textures registered this frame into the bindless set before the trace.
@@ -1412,7 +1418,7 @@ public final class RtComposite {
                     temporalAccum.ensureSized(renderW, renderH);
                     try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "beauty temporal (TAA)");
                          RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.temporalAccum")) {
-                        float taaAlpha = Math.min(temporalAlpha(), lastDenoiseOn ? 0.20f : 0.22f);
+                        float taaAlpha = Math.min(temporalAlpha(), lastDenoiseOn ? 0.40f : 0.45f);
                         if (lastDenoiseOn) {
                             lastDenoisePath = lastDenoisePath + " + beauty TAA";
                         }

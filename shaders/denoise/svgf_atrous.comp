@@ -1,0 +1,98 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// SVGF Step 3: À-Trous Wavelet Filter
+// Edge-preserving spatial filter guided by depth, normal, and luminance
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uColor;
+layout(set = 0, binding = 1) uniform sampler2D uDepth;
+layout(set = 0, binding = 2) uniform sampler2D uNormal;
+layout(set = 0, binding = 3) uniform sampler2D uVariance;
+
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D uColorOut;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 resolution;
+    int stepSize;          // Wavelet step size (1, 2, 4, 8, 16)
+    float sigmaDepth;      // Depth similarity weight
+    float sigmaNormal;     // Normal similarity weight
+    float sigmaLuminance;  // Luminance similarity weight
+} pc;
+
+// 5x5 Gaussian kernel weights
+const float kernel[3][3] = {
+    { 1.0/16.0, 2.0/16.0, 1.0/16.0 },
+    { 2.0/16.0, 4.0/16.0, 2.0/16.0 },
+    { 1.0/16.0, 2.0/16.0, 1.0/16.0 }
+};
+
+float luminance(vec3 rgb) {
+    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 pixelPos = ivec2(gl_GlobalInvocationID.xy);
+    if (pixelPos.x >= pc.resolution.x || pixelPos.y >= pc.resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixelPos) + 0.5) / vec2(pc.resolution);
+
+    // Sample center pixel
+    vec4 colorVar = texture(uColor, uv);
+    vec3 colorCenter = colorVar.rgb;
+    float varianceCenter = colorVar.a;
+    float depthCenter = texture(uDepth, uv).r;
+    vec3 normalCenter = normalize(texture(uNormal, uv).xyz);
+    float lumaCenter = luminance(colorCenter);
+
+    // Variance-guided sigma (more variance = more blur)
+    float sigma = sqrt(max(0.0, varianceCenter)) * pc.sigmaLuminance;
+
+    vec3 sumColor = vec3(0.0);
+    float sumWeight = 0.0;
+
+    // À-Trous wavelet filter with edge-stopping
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 offset = ivec2(x, y) * pc.stepSize;
+            vec2 sampleUV = (vec2(pixelPos + offset) + 0.5) / vec2(pc.resolution);
+
+            if (sampleUV.x < 0.0 || sampleUV.x > 1.0 || sampleUV.y < 0.0 || sampleUV.y > 1.0) {
+                continue;
+            }
+
+            vec3 colorSample = texture(uColor, sampleUV).rgb;
+            float depthSample = texture(uDepth, sampleUV).r;
+            vec3 normalSample = normalize(texture(uNormal, sampleUV).xyz);
+            float lumaSample = luminance(colorSample);
+
+            // Depth weight (exponential falloff)
+            float depthDiff = abs(depthCenter - depthSample);
+            float wDepth = exp(-depthDiff / (pc.sigmaDepth * abs(depthCenter) + 1e-6));
+
+            // Normal weight (cosine similarity)
+            float normalSim = max(0.0, dot(normalCenter, normalSample));
+            float wNormal = pow(normalSim, pc.sigmaNormal);
+
+            // Luminance weight
+            float lumaDiff = abs(lumaCenter - lumaSample);
+            float wLuma = exp(-lumaDiff / (sigma + 1e-6));
+
+            // Gaussian kernel weight
+            float wKernel = kernel[y + 1][x + 1];
+
+            // Combined weight
+            float weight = wDepth * wNormal * wLuma * wKernel;
+
+            sumColor += colorSample * weight;
+            sumWeight += weight;
+        }
+    }
+
+    vec3 colorOut = sumWeight > 1e-6 ? sumColor / sumWeight : colorCenter;
+
+    imageStore(uColorOut, pixelPos, vec4(colorOut, 1.0));
+}

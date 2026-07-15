@@ -43,14 +43,14 @@ import net.minecraft.client.renderer.RenderPipelines;
 public final class RtUiOverlay {
     private static final Vector4f TRANSPARENT = new Vector4f(0.0f, 0.0f, 0.0f, 0.0f);
 
-    /** Fullscreen blit that composites the premultiplied overlay over the destination (premultiplied-over). */
+    /** Fullscreen blit that composites the overlay over the destination (straight alpha blend). */
     private static final RenderPipeline COMPOSITE_PIPELINE = RenderPipeline.builder(RenderPipelines.GLOBALS_SNIPPET)
             .withLocation("pipeline/caustica_ui_overlay_composite")
             .withVertexShader("core/screenquad")
             .withFragmentShader("core/blit_screen")
             .withBindGroupLayout(BindGroupLayouts.IN_SAMPLER)
             .withColorTargetState(new ColorTargetState(
-                    Optional.of(BlendFunction.TRANSLUCENT_PREMULTIPLIED_ALPHA), GpuFormat.RGBA8_UNORM, ColorTargetState.WRITE_COLOR))
+                    Optional.of(BlendFunction.TRANSLUCENT), GpuFormat.RGBA8_UNORM, ColorTargetState.WRITE_COLOR))
             .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
             .build();
 

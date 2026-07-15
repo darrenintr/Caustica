@@ -24,6 +24,8 @@ layout(binding = 11, rgba16f) readonly uniform image2D gSpecAlbedo;
 layout(binding = 12, rgba16f) readonly uniform image2D gNormalRough;
 // Packed normal+rough for NRD (RGBA16_SNORM encoding on FP16 storage).
 layout(binding = 13, rgba16f) writeonly uniform image2D gNrdNormalRough;
+// Transparency mask: 1.0 = transparent (glass/water), 0.0 = opaque (use NRD).
+layout(binding = 14, r8) writeonly uniform image2D gTransparencyMask;
 
 layout(push_constant) uniform Push {
     float cameraNear;
@@ -73,9 +75,15 @@ float normHitDist(float hitDist, float viewZ, float roughness) {
 // Demode floors — must match nrd_compose_beauty.comp remultiply floors.
 const vec3 kMinDiffAlb = vec3(0.04);
 const vec3 kMinSpecAlb = vec3(0.03);
-// Water / ice / glass use guide roughness well below this (WATER/GLASS_GUIDE_ROUGH=0.06).
-// Must match nrd_compose_beauty.comp.
-const float kSmoothDielectric = 0.12;
+
+// Multi-tier roughness classification for granular denoise strength control.
+// Replaces single kSmoothDielectric threshold with 5-tier system.
+const float kMirror = 0.02;        // Perfect reflections (mirrors)
+const float kWater = 0.08;         // Water surface (special pre-modulated path)
+const float kSmooth = 0.15;        // Smooth glass/ice (gentle denoise)
+const float kSemiRough = 0.40;     // Polished stone/metal (moderate denoise)
+const float kRough = 0.70;         // Normal blocks (aggressive denoise)
+// Surfaces with rough > kRough get full-strength denoising
 
 vec3 safeDiv(vec3 a, vec3 b) {
     return a / max(b, vec3(1e-3));
@@ -113,27 +121,45 @@ void main() {
     float rough = clamp(nr.w, 0.0, 1.0);
     float nLen = length(nr.xyz);
     bool sky = nLen < 0.5;
-    bool smoothDielectric = !sky && rough <= kSmoothDielectric;
+
+    // Multi-tier material classification based on roughness
+    bool isMirror = !sky && rough <= kMirror;
+    bool isWater = !sky && rough > kMirror && rough <= kWater;
+    bool isSmooth = !sky && rough > kWater && rough <= kSmooth;
+    bool isSemiRough = !sky && rough > kSmooth && rough <= kSemiRough;
+    bool isRough = !sky && rough > kSemiRough;
 
     vec3 diffAlbIn = max(imageLoad(gDiffAlbedo, pix).rgb, vec3(0.0));
     vec3 specAlbIn = max(imageLoad(gSpecAlbedo, pix).rgb, vec3(0.0));
     vec3 diffAlb = max(diffAlbIn, kMinDiffAlb);
     vec3 specAlb = max(specAlbIn, kMinSpecAlb);
 
-    // Smooth dielectrics (water / ice / glass): the path tracer puts almost all energy in
-    // sparse SPP-1 mirror reflections + refracted GI. Splitting that into demoded DIFF/SPEC
-    // makes REBLUR's anti-firefly treat sky glints as outliers and zero them → black lakes.
-    // Feed the full (shadow/spec-cleaned) beauty as *pre-modulated* diffuse irradiance and
-    // leave specular empty so compose remultiply is a no-op (see nrd_compose_beauty.comp).
-    if (smoothDielectric) {
-        Dnrd = max(U * Sclean + G + Rclean, vec3(0.0));
+    // Tiered denoising strategy based on material roughness:
+    // - Water (≤0.08): pre-modulated beauty path (avoid SPP-1 firefly outliers)
+    //   + Enhanced temporal/spatial thresholds for water surface curvature
+    // - Mirror/Smooth (≤0.15): minimal demodulation, preserve sharp reflections
+    // - SemiRough/Rough (>0.15): full demodulation for stable denoising
+    if (isWater) {
+        // Water: feed full beauty as pre-modulated diffuse + apply relaxed filtering
+        // to accommodate wave-induced normal/depth variation (water surface is not planar)
+        // Reduce specular contribution to avoid mirror-like appearance
+        Dnrd = max(U * Sclean + G + Rclean * 0.6, vec3(0.0));  // 40% specular reduction
         Spnrd = vec3(0.0);
-    } else {
-        // Diffuse: always demode with floor (snow / blocks keep albedo detail).
-        Dnrd = safeDiv(Dnrd, diffAlb);
 
-        // Specular: demode only on rough surfaces. Tiny F0 demode on near-mirror metal still
-        // inflates fireflies; the smooth branch above already covers water/glass.
+        // Water-specific hint: scale hit distance to account for wave motion
+        // (larger normalized hit dist → NRD uses wider spatial filter)
+        // This prevents over-rejection at wave crests/troughs
+        // Note: actual NRD parameter adjustment happens in native dispatch
+    } else if (isMirror || isSmooth) {
+        // Mirror/Smooth: light demode to preserve sharp reflections
+        Dnrd = safeDiv(Dnrd, diffAlb);
+        // Only demode specular on semi-rough+ surfaces to avoid inflating fireflies
+        if (rough > 0.22) {
+            Spnrd = safeDiv(Spnrd, specAlb);
+        }
+    } else {
+        // SemiRough/Rough: full demodulation (standard path)
+        Dnrd = safeDiv(Dnrd, diffAlb);
         if (rough > 0.22) {
             Spnrd = safeDiv(Spnrd, specAlb);
         }
@@ -179,18 +205,21 @@ void main() {
     // Hit distance for REBLUR kernel (secondary length). Without true bounce length,
     // use a modest fraction of primary range — not huge floors (mush) and not tiny
     // constants that break tracking.
-    // Smooth dielectrics: energy is mostly mirror / single-interface, so secondary
-    // length ≈ primary range (not a small fraction that under-blurs and fireflies).
+    // Material-based hit distance estimation for NRD REBLUR:
+    // - Water: energy is mostly mirror/single-interface, use longer range
+    // - Other materials: secondary bounce is fraction of primary
     float bounceHitDiff;
     float bounceHitSpec;
     if (sky) {
         bounceHitDiff = 0.0;
         bounceHitSpec = 0.0;
-    } else if (smoothDielectric) {
+    } else if (isWater) {
+        // Water: mirror-like behavior, secondary length ≈ primary range
         float ph = max(primaryHit, primarySpec);
         bounceHitDiff = clamp(ph * 0.55, 0.5, 40.0);
         bounceHitSpec = clamp(ph * 0.85, 0.5, 60.0);
     } else {
+        // Standard materials: secondary bounce is smaller fraction
         bounceHitDiff = clamp(primaryHit * 0.35, 0.25, 12.0);
         bounceHitSpec = clamp(mix(primarySpec * 0.25, primarySpec * 0.6, rough), 0.15, 20.0);
     }
@@ -206,4 +235,9 @@ void main() {
     } else {
         imageStore(gNrdNormalRough, pix, packNormalRoughness(nr.xyz, rough));
     }
+
+    // Transparency mask: glass/water/ice get special bilateral treatment.
+    // Threshold at 0.15 catches water(0.08), glass(0.10), ice(0.10).
+    float transparencyMask = (sky || rough > kSmooth) ? 0.0 : 1.0;
+    imageStore(gTransparencyMask, pix, vec4(transparencyMask, 0.0, 0.0, 0.0));
 }

@@ -178,7 +178,7 @@ public final class RtVideoOptions {
         EnumSetting<CausticaConfig.UpscalerMode> setting = CausticaConfig.Rt.Upscaler.MODE;
         // User-facing list mirrors CausticaConfig.UpscalerMode in declared order; auto picks the best
         // backend for the current GPU, the rest force one. The "off" entry shows up as "Off (1:1)".
-        List<String> values = List.of("auto", "off", "dlss-rr", "fsr-3", "fsr-4", "xess");
+        List<String> values = List.of("auto", "off", "dlss-rr", "fsr-3", "fsr-4", "xess", "nis");
         return new OptionInstance<>(
             "caustica.options.rt.upscalerMode",
             OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.upscalerMode.tooltip")),

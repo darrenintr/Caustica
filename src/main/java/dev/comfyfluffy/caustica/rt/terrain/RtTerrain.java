@@ -2209,7 +2209,13 @@ public final class RtTerrain {
             q.cutout = quad.materialInfo().layer() != ChunkSectionLayer.SOLID;
             // TRANSLUCENT (stained glass, ice, honey, slime, nether portal): a colored-transmission
             // dielectric resolved in the path tracer (tint.w == 2), excluded from the binary alpha cutout.
-            q.translucent = quad.materialInfo().layer() == ChunkSectionLayer.TRANSLUCENT;
+            // Plain glass blocks use CUTOUT layer but should be treated as translucent too.
+            boolean isPlainGlass = false;
+            if (state != null && quad.materialInfo().layer() == ChunkSectionLayer.CUTOUT) {
+                String blockName = state.getBlock().getDescriptionId();
+                isPlainGlass = blockName.contains("glass") && !blockName.contains("pane");
+            }
+            q.translucent = quad.materialInfo().layer() == ChunkSectionLayer.TRANSLUCENT || isPlainGlass;
 
             // Biome tint: tintIndex >= 0 means biome-colored (grass/foliage). In 26.2 the color comes from a
             // BlockTintSource; colorInWorld blends the biome color at this pos. Untinted quads stay white.

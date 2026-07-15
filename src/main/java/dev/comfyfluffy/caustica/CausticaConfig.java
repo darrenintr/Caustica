@@ -690,7 +690,7 @@ public final class CausticaConfig {
             // (motion-adaptive) so walking does not smear. Static snow still converges in ~1s.
             // After Official FFX (shadow+refl), beauty TAA can use a bit more history for GI/sky.
             public static final FloatSetting TEMPORAL_ALPHA =
-                    clampedFloat("caustica.rt.temporalAlpha", "composite.temporal-alpha", 0.20f, 0.01f, 1.0f);
+                    clampedFloat("caustica.rt.temporalAlpha", "composite.temporal-alpha", 0.35f, 0.01f, 1.0f);
             // Disocclusion reject threshold (relative reversed-Z). Slightly tighter than before so
             // newly exposed geometry does not pull ghost history while walking.
             public static final FloatSetting TEMPORAL_DISOCCLUSION =
@@ -776,7 +776,7 @@ public final class CausticaConfig {
 
         public static final class Overlay {
             public static final BooleanSetting BLOCK_OUTLINE_ENABLED =
-                    bool("caustica.rt.blockOutline", "overlay.block-outline.enabled", true);
+                    bool("caustica.rt.blockOutline", "overlay.block-outline.enabled", false);
 
             private Overlay() {
             }

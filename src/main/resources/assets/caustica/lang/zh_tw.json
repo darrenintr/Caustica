@@ -72,6 +72,7 @@
 	"caustica.options.rt.upscalerMode.fsr-3": "FSR 3",
 	"caustica.options.rt.upscalerMode.fsr-4": "FSR 4.1 INT8 (RDNA 3/4)",
 	"caustica.options.rt.upscalerMode.xess": "XeSS",
+	"caustica.options.rt.upscalerMode.nis": "NIS (NVIDIA 影像縮放)",
 
 	"caustica.options.rt.denoiseMode": "降噪",
 	"caustica.options.rt.denoiseMode.tooltip": "內建降噪。自動/混合：FFX 陰影+反射再接 NRD REBLUR。NRD：僅 REBLUR（無 FFX）。FFX：僅陰影+反射。關閉：原始路徑追蹤顆粒。",
