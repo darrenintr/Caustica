@@ -96,6 +96,10 @@ jobs:
       # Symlink the SDK's glslangValidator + spirv-val into /usr/local/bin
       # so they shadow the system versions on PATH (compileShaders'
       # resolveVulkanTool() falls through to PATH for the binary lookup).
+      # DON'T set VULKAN_SDK in GITHUB_ENV here — that would affect the Gradle
+      # step later, and build.gradle's resolveVulkanTool() tries ${VULKAN_SDK}/Bin/
+      # (capital B, Windows-only path) which breaks on Linux. Instead, rely on
+      # PATH symlinks + per-step VULKAN_SDK env for the NGX shim build only.
       - name: Install LunarG Vulkan SDK
         env:
           VULKAN_SDK_VERSION: ${{ env.VULKAN_SDK_VERSION }}
@@ -108,10 +112,9 @@ jobs:
           echo "${VULKAN_SDK_SHA256}  ${archive}" | sha256sum --check
           mkdir -p "${RUNNER_TEMP}/vulkan-sdk"
           tar -xf "${archive}" -C "${RUNNER_TEMP}/vulkan-sdk"
-          echo "VULKAN_SDK=${sdk_root}" >> "${GITHUB_ENV}"
           echo "${sdk_root}/bin" >> "${GITHUB_PATH}"
-          ln -sf "${sdk_root}/bin/glslangValidator" /usr/local/bin/glslangValidator
-          ln -sf "${sdk_root}/bin/spirv-val" /usr/local/bin/spirv-val
+          sudo ln -sf "${sdk_root}/bin/glslangValidator" /usr/local/bin/glslangValidator
+          sudo ln -sf "${sdk_root}/bin/spirv-val" /usr/local/bin/spirv-val
           glslangValidator --version
           spirv-val --version
 
@@ -168,8 +171,9 @@ jobs:
           XESS_SDK: ${{ github.workspace }}/third_party/xess
         # VULKAN_SDK is intentionally NOT set — build.gradle's resolveVulkanTool()
         # tries ${VULKAN_SDK}/Bin/ (Windows-style capital B) which never matches
-        # on Linux; the PATH fallback to /usr/bin/{glslangValidator,spirv-val}
-        # (apt: glslang-tools, spirv-tools) is what we want.
+        # on Linux; the PATH fallback (to /usr/local/bin via symlinks from step
+        # "Install LunarG Vulkan SDK") is what we want — this gives us the LunarG
+        # glslang 16.3.0 that permits GL_EXT_shader_invocation_reorder.
         # `chmod +x ./gradlew` defends against git ever dropping the +x bit on
         # checkout (core.fileMode is false by default — same trap compile.yml
         # hit on its first run; see `Ensure gradlew is executable` there).

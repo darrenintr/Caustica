@@ -197,7 +197,9 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/vulkan-sdk"
           tar -xf "${archive}" -C "${RUNNER_TEMP}/vulkan-sdk"
 
-          echo "VULKAN_SDK=${sdk_root}" >> "${GITHUB_ENV}"
+          # Don't set VULKAN_SDK in GITHUB_ENV — build.gradle's resolveVulkanTool()
+          # tries ${VULKAN_SDK}/Bin/ (capital B, Windows-only) which breaks on Linux.
+          # Just add to PATH so resolveVulkanTool()'s fallback finds the tools.
           echo "${sdk_root}/bin" >> "${GITHUB_PATH}"
           "${sdk_root}/bin/glslangValidator" --version
           "${sdk_root}/bin/spirv-val" --version
