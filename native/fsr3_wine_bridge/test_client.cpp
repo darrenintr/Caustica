@@ -10,6 +10,7 @@
 // Function pointers matching the C API
 typedef void* (*CreateFn)(void*, void*, void*);
 typedef int (*CreateContextFn)(void*, uint32_t, uint32_t, uint32_t, uint32_t);
+typedef int (*DispatchFn)(void*, void*, void*, void*, void*, uint32_t, uint32_t, float, float);
 typedef void (*DestroyFn)(void*);
 
 int main() {
@@ -18,7 +19,7 @@ int main() {
 
     // Load the client library
     printf("Loading libfsr3_wine_client.so...\n");
-    void* lib = dlopen("./libfsr3_wine_client.so", RTLD_LAZY);
+    void* lib = dlopen("/tmp/fsr3_test/libfsr3_wine_client.so", RTLD_LAZY);
     if (!lib) {
         printf("ERROR: Failed to load library: %s\n", dlerror());
         return 1;
@@ -57,6 +58,20 @@ int main() {
         printf("✓ FSR3 context created successfully!\n\n");
     } else {
         printf("✗ FSR3 context creation failed\n\n");
+    }
+
+    // Test dispatch
+    printf("Testing FSR3 dispatch (720p -> 1080p, jitter=0.5)...\n");
+    auto dispatchFn = (DispatchFn)dlsym(lib, "fsr3_wine_bridge_dispatch");
+    if (dispatchFn) {
+        result = dispatchFn(bridge,
+                         (void*)0, (void*)0, (void*)0, (void*)0,  // Null memory handles for test
+                         1280, 720, 0.5f, 0.5f);
+        if (result == 0) {
+            printf("✓ FSR3 dispatch completed!\n\n");
+        } else {
+            printf("✗ FSR3 dispatch failed\n\n");
+        }
     }
 
     // Cleanup

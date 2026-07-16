@@ -14,12 +14,12 @@ fi
 
 mkdir -p $BUILD_DIR
 
-# Compile Windows server
+# Compile Windows server (Unix Socket version)
 echo "Compiling Windows server (runs under Wine)..."
 $MINGW_COMPILER -o $BUILD_DIR/fsr3_server.exe \
-    fsr3_wine_server_full.cpp \
+    fsr3_server_socket.cpp \
     -static-libgcc -static-libstdc++ \
-    -ld3d12 -ldxgi -luuid \
+    -ld3d12 -ldxgi -luuid -lws2_32 \
     -DUNICODE -D_UNICODE
 
 if [ $? -ne 0 ]; then
@@ -27,13 +27,12 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# Compile Linux client
+# Compile Linux client (Unix Socket version)
 echo "Compiling Linux client..."
 g++ -o $BUILD_DIR/libfsr3_wine_client.so \
-    fsr3_wine_client_full.cpp \
+    fsr3_client_socket.cpp \
     -shared -fPIC \
     -lvulkan \
-    -lrt \
     -std=c++17
 
 if [ $? -ne 0 ]; then
