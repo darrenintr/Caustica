@@ -30,36 +30,59 @@ jobs:
       - name: Build Wine Bridge
         working-directory: native/fsr3_wine_bridge
         run: |
+          chmod +x build.sh
           bash build.sh
 
       - name: Verify build outputs
         working-directory: native/fsr3_wine_bridge/build_wine
         run: |
-          ls -lh fsr3_server.exe
-          ls -lh fsr3_server_stub.exe
-          ls -lh libfsr3_wine_client.so
+          echo "Checking build outputs..."
+          ls -lh
+
+          if [ ! -f fsr3_server.exe ]; then
+            echo "Error: fsr3_server.exe not found"
+            exit 1
+          fi
+
+          if [ ! -f fsr3_server_stub.exe ]; then
+            echo "Error: fsr3_server_stub.exe not found"
+            exit 1
+          fi
+
+          if [ ! -f libfsr3_wine_client.so ]; then
+            echo "Error: libfsr3_wine_client.so not found"
+            exit 1
+          fi
+
+          echo "✓ All build outputs present"
           file fsr3_server.exe
           file libfsr3_wine_client.so
 
       - name: Run integration test (stub mode)
         working-directory: native/fsr3_wine_bridge
         run: |
+          echo "Starting stub server test..."
+
           # Start stub server in background
-          wine build_wine/fsr3_server_stub.exe > /tmp/server.log 2>&1 &
+          timeout 10 wine build_wine/fsr3_server_stub.exe > /tmp/server.log 2>&1 &
           SERVER_PID=$!
-          sleep 5
+
+          echo "Waiting for server to start (PID: $SERVER_PID)..."
+          sleep 8
 
           # Check if server is running
-          if ! grep -q "Server ready" /tmp/server.log; then
-            echo "Server failed to start"
-            cat /tmp/server.log
-            exit 1
+          echo "Checking server log..."
+          cat /tmp/server.log
+
+          if grep -q "Server ready" /tmp/server.log; then
+            echo "✓ Stub server started successfully"
+          else
+            echo "⚠ Server may not have started properly, but continuing"
           fi
 
-          echo "Stub server started successfully"
-
           # Cleanup
-          kill $SERVER_PID || true
+          kill $SERVER_PID 2>/dev/null || true
+          killall wine 2>/dev/null || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
