@@ -1,0 +1,123 @@
+name: FSR3 Integration - Windows
+
+on:
+  push:
+    paths:
+      - 'native/fsr3_wine_bridge/**'
+      - '.github/workflows/fsr3-windows.yml'
+  pull_request:
+    paths:
+      - 'native/fsr3_wine_bridge/**'
+
+jobs:
+  build-windows:
+    name: Build FSR3 Windows Integration
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install Vulkan SDK
+        run: |
+          choco install vulkan-sdk -y
+
+      - name: Setup environment
+        run: |
+          echo "VULKAN_SDK=C:\VulkanSDK\1.3.290.0" >> $env:GITHUB_ENV
+          echo "C:\VulkanSDK\1.3.290.0\Bin" >> $env:GITHUB_PATH
+
+      - name: Verify dependencies
+        shell: pwsh
+        run: |
+          Write-Host "Checking MSVC..."
+          cl.exe /? | Select-Object -First 3
+
+          Write-Host "Checking Vulkan SDK..."
+          if (Test-Path "$env:VULKAN_SDK\Include\vulkan\vulkan.h") {
+            Write-Host "✓ Vulkan SDK found"
+          } else {
+            Write-Error "Vulkan SDK not found"
+            exit 1
+          }
+
+      - name: Build Windows FSR3 integration
+        working-directory: native/fsr3_wine_bridge
+        shell: pwsh
+        run: |
+          # Create build directory
+          New-Item -ItemType Directory -Force -Path build_windows
+
+          # Compile with MSVC
+          cl.exe /O2 /MD /LD `
+            fsr3_windows.cpp `
+            /I"$env:VULKAN_SDK\Include" `
+            /link `
+            /OUT:build_windows\fsr3_windows.dll `
+            d3d12.lib dxgi.lib vulkan-1.lib `
+            /LIBPATH:"$env:VULKAN_SDK\Lib"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Build failed"
+            exit 1
+          }
+
+      - name: Verify build outputs
+        working-directory: native/fsr3_wine_bridge/build_windows
+        shell: pwsh
+        run: |
+          if (Test-Path "fsr3_windows.dll") {
+            Write-Host "✓ fsr3_windows.dll built successfully"
+            Get-Item fsr3_windows.dll | Format-List
+          } else {
+            Write-Error "Build output not found"
+            exit 1
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsr3-windows-integration
+          path: |
+            native/fsr3_wine_bridge/build_windows/fsr3_windows.dll
+            native/fsr3_wine_bridge/fsr3_windows.h
+          retention-days: 7
+
+      - name: Create release notes
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: native/fsr3_wine_bridge
+        shell: pwsh
+        run: |
+          $notes = @"
+          # FSR3 Windows Integration Build
+
+          ## Build Information
+          - Commit: ${{ github.sha }}
+          - Branch: ${{ github.ref_name }}
+          - Date: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+
+          ## Files
+          - fsr3_windows.dll - Windows FSR3 integration library
+          - fsr3_windows.h - C API header
+
+          ## Requirements
+          - Windows 10+
+          - Vulkan SDK
+          - AMD FidelityFX Upscaler DLL (amd_fidelityfx_upscaler_dx12.dll)
+
+          ## Usage
+          See CROSS_PLATFORM_GUIDE.md for integration instructions.
+          "@
+
+          $notes | Out-File -FilePath build_windows\README.txt -Encoding UTF8
+
+      - name: Upload release notes
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsr3-windows-release-notes
+          path: native/fsr3_wine_bridge/build_windows/README.txt
+          retention-days: 30

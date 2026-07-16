@@ -1,0 +1,80 @@
+name: FSR3 Integration - Linux
+
+on:
+  push:
+    paths:
+      - 'native/fsr3_wine_bridge/**'
+      - '.github/workflows/fsr3-linux.yml'
+  pull_request:
+    paths:
+      - 'native/fsr3_wine_bridge/**'
+
+jobs:
+  build-linux:
+    name: Build FSR3 Wine Bridge (Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mingw-w64 \
+            wine64 \
+            libvulkan-dev \
+            vulkan-headers
+
+      - name: Build Wine Bridge
+        working-directory: native/fsr3_wine_bridge
+        run: |
+          bash build.sh
+
+      - name: Verify build outputs
+        working-directory: native/fsr3_wine_bridge/build_wine
+        run: |
+          ls -lh fsr3_server.exe
+          ls -lh fsr3_server_stub.exe
+          ls -lh libfsr3_wine_client.so
+          file fsr3_server.exe
+          file libfsr3_wine_client.so
+
+      - name: Run integration test (stub mode)
+        working-directory: native/fsr3_wine_bridge
+        run: |
+          # Start stub server in background
+          wine build_wine/fsr3_server_stub.exe > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+          sleep 5
+
+          # Check if server is running
+          if ! grep -q "Server ready" /tmp/server.log; then
+            echo "Server failed to start"
+            cat /tmp/server.log
+            exit 1
+          fi
+
+          echo "Stub server started successfully"
+
+          # Cleanup
+          kill $SERVER_PID || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsr3-linux-bridge
+          path: |
+            native/fsr3_wine_bridge/build_wine/fsr3_server.exe
+            native/fsr3_wine_bridge/build_wine/fsr3_server_stub.exe
+            native/fsr3_wine_bridge/build_wine/libfsr3_wine_client.so
+          retention-days: 7
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsr3-linux-logs
+          path: /tmp/server.log
+          retention-days: 3
