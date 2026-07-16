@@ -3,11 +3,18 @@
  * Vulkan <-> D3D12 interop for FSR3 on Windows
  */
 
-#include "fsr3_windows.h"
 #include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <vulkan/vulkan.h>
+#include <vulkan/vulkan_win32.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <map>
+
+#include "ffx_api.h"
+#include "fsr3_windows.h"
 
 // Vulkan external memory extensions
 static PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR = nullptr;
