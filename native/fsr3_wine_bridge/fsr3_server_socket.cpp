@@ -122,22 +122,33 @@ bool InitD3D12() {
 
         hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device));
         if (SUCCEEDED(hr)) {
-            wprintf(L"Using adapter: %s\n", desc.Description);
+            wprintf(L"✓ Using adapter: %s (Feature Level 12_0)\n", desc.Description);
             foundAdapter = true;
             adapter->Release();
             break;
         }
 
+        // Wine typically only supports Feature Level 11_0
+        hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&g_device));
+        if (SUCCEEDED(hr)) {
+            wprintf(L"✓ Using adapter: %s (Feature Level 11_0)\n", desc.Description);
+            foundAdapter = true;
+            adapter->Release();
+            break;
+        }
+
+        printf("  Failed to create device on this adapter\n");
         adapter->Release();
     }
 
     if (!foundAdapter) {
-        printf("No hardware adapter, trying software device...\n");
+        printf("No hardware adapter, trying WARP (software fallback)...\n");
         hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&g_device));
         if (FAILED(hr)) {
-            printf("Software device creation failed: 0x%08X\n", hr);
+            printf("WARP device creation failed: 0x%08X\n", hr);
             return false;
         }
+        printf("⚠ Using WARP software rasterizer\n");
     }
 
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
