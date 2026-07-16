@@ -16,9 +16,9 @@
 #include "ffx_api.h"
 #include "fsr3_windows.h"
 
-// Vulkan external memory extensions
-static PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR = nullptr;
-static PFN_vkGetSemaphoreWin32HandleKHR vkGetSemaphoreWin32HandleKHR = nullptr;
+// Vulkan external memory function pointers (will be loaded dynamically)
+static PFN_vkGetMemoryWin32HandleKHR pfn_vkGetMemoryWin32HandleKHR = nullptr;
+static PFN_vkGetSemaphoreWin32HandleKHR pfn_vkGetSemaphoreWin32HandleKHR = nullptr;
 
 // Internal structure
 struct FSR3WindowsContext {
@@ -62,12 +62,12 @@ struct FSR3WindowsContext {
 
 // Helper: Load Vulkan function pointers
 static bool LoadVulkanFunctions(VkInstance instance) {
-    vkGetMemoryWin32HandleKHR = (PFN_vkGetMemoryWin32HandleKHR)
+    pfn_vkGetMemoryWin32HandleKHR = (PFN_vkGetMemoryWin32HandleKHR)
         vkGetInstanceProcAddr(instance, "vkGetMemoryWin32HandleKHR");
-    vkGetSemaphoreWin32HandleKHR = (PFN_vkGetSemaphoreWin32HandleKHR)
+    pfn_vkGetSemaphoreWin32HandleKHR = (PFN_vkGetSemaphoreWin32HandleKHR)
         vkGetInstanceProcAddr(instance, "vkGetSemaphoreWin32HandleKHR");
 
-    return vkGetMemoryWin32HandleKHR && vkGetSemaphoreWin32HandleKHR;
+    return pfn_vkGetMemoryWin32HandleKHR && pfn_vkGetSemaphoreWin32HandleKHR;
 }
 
 // Helper: Initialize D3D12 device
