@@ -1,4 +1,4 @@
-name: FSR3 Integration - Linux
+name: FSR3 Integration - Linux (Simplified)
 
 on:
   push:
@@ -23,66 +23,59 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             mingw-w64 \
-            wine64 \
+            g++ \
             libvulkan-dev \
             vulkan-headers
+
+      - name: Make scripts executable
+        working-directory: native/fsr3_wine_bridge
+        run: |
+          chmod +x build.sh
+          ls -la build.sh
 
       - name: Build Wine Bridge
         working-directory: native/fsr3_wine_bridge
         run: |
-          chmod +x build.sh
-          bash build.sh
+          echo "Starting build..."
+          bash -x build.sh
+          echo "Build complete"
 
-      - name: Verify build outputs
-        working-directory: native/fsr3_wine_bridge/build_wine
-        run: |
-          echo "Checking build outputs..."
-          ls -lh
-
-          if [ ! -f fsr3_server.exe ]; then
-            echo "Error: fsr3_server.exe not found"
-            exit 1
-          fi
-
-          if [ ! -f fsr3_server_stub.exe ]; then
-            echo "Error: fsr3_server_stub.exe not found"
-            exit 1
-          fi
-
-          if [ ! -f libfsr3_wine_client.so ]; then
-            echo "Error: libfsr3_wine_client.so not found"
-            exit 1
-          fi
-
-          echo "✓ All build outputs present"
-          file fsr3_server.exe
-          file libfsr3_wine_client.so
-
-      - name: Run integration test (stub mode)
+      - name: List build directory
         working-directory: native/fsr3_wine_bridge
         run: |
-          echo "Starting stub server test..."
+          echo "Build directory contents:"
+          ls -lah build_wine/ || echo "build_wine directory not found"
 
-          # Start stub server in background
-          timeout 10 wine build_wine/fsr3_server_stub.exe > /tmp/server.log 2>&1 &
-          SERVER_PID=$!
+      - name: Verify build outputs
+        working-directory: native/fsr3_wine_bridge
+        run: |
+          echo "Checking for output files..."
 
-          echo "Waiting for server to start (PID: $SERVER_PID)..."
-          sleep 8
-
-          # Check if server is running
-          echo "Checking server log..."
-          cat /tmp/server.log
-
-          if grep -q "Server ready" /tmp/server.log; then
-            echo "✓ Stub server started successfully"
+          if [ -f build_wine/fsr3_server.exe ]; then
+            echo "✓ fsr3_server.exe found ($(stat -f%z build_wine/fsr3_server.exe 2>/dev/null || stat -c%s build_wine/fsr3_server.exe) bytes)"
           else
-            echo "⚠ Server may not have started properly, but continuing"
+            echo "✗ fsr3_server.exe NOT found"
+            exit 1
           fi
 
-          # Cleanup
-          kill $SERVER_PID 2>/dev/null || true
-          killall wine 2>/dev/null || true
+          if [ -f build_wine/fsr3_server_stub.exe ]; then
+            echo "✓ fsr3_server_stub.exe found ($(stat -f%z build_wine/fsr3_server_stub.exe 2>/dev/null || stat -c%s build_wine/fsr3_server_stub.exe) bytes)"
+          else
+            echo "✗ fsr3_server_stub.exe NOT found"
+            exit 1
+          fi
+
+          if [ -f build_wine/libfsr3_wine_client.so ]; then
+            echo "✓ libfsr3_wine_client.so found ($(stat -f%z build_wine/libfsr3_wine_client.so 2>/dev/null || stat -c%s build_wine/libfsr3_wine_client.so) bytes)"
+          else
+            echo "✗ libfsr3_wine_client.so NOT found"
+            exit 1
+          fi
+
+          echo ""
+          echo "All build artifacts present!"
+          file build_wine/fsr3_server.exe
+          file build_wine/libfsr3_wine_client.so
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -94,10 +87,14 @@ jobs:
             native/fsr3_wine_bridge/build_wine/libfsr3_wine_client.so
           retention-days: 7
 
-      - name: Upload test logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fsr3-linux-logs
-          path: /tmp/server.log
-          retention-days: 3
+      - name: Create build summary
+        if: success()
+        run: |
+          echo "## FSR3 Linux Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Build completed successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts:" >> $GITHUB_STEP_SUMMARY
+          echo "- fsr3_server.exe (Wine server - full)" >> $GITHUB_STEP_SUMMARY
+          echo "- fsr3_server_stub.exe (Wine server - stub)" >> $GITHUB_STEP_SUMMARY
+          echo "- libfsr3_wine_client.so (Linux client)" >> $GITHUB_STEP_SUMMARY

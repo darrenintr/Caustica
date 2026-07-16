@@ -1,4 +1,4 @@
-name: FSR3 Integration - Windows
+name: FSR3 Integration - Windows (Simplified)
 
 on:
   push:
@@ -18,88 +18,145 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup MSVC
-        uses: microsoft/setup-msbuild@v2
-
-      - name: Setup Visual Studio environment
+      - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Verify MSVC
+        shell: pwsh
+        run: |
+          Write-Host "Checking MSVC compiler..."
+          cl.exe 2>&1 | Select-Object -First 3
+          Write-Host "MSVC ready"
 
       - name: Install Vulkan SDK
         shell: pwsh
         run: |
-          Write-Host "Installing Vulkan SDK..."
+          Write-Host "Installing Vulkan SDK via Chocolatey..."
           choco install vulkan-sdk -y --no-progress
 
-          # Wait for installation
-          Start-Sleep -Seconds 10
+          Write-Host "`nWaiting for installation to complete..."
+          Start-Sleep -Seconds 15
 
-          # Find installed Vulkan SDK
-          $vulkanPath = Get-ChildItem "C:\VulkanSDK" -Directory | Select-Object -First 1
-          if ($vulkanPath) {
-            Write-Host "Found Vulkan SDK at: $($vulkanPath.FullName)"
-            echo "VULKAN_SDK=$($vulkanPath.FullName)" >> $env:GITHUB_ENV
-          } else {
-            Write-Error "Vulkan SDK not found after installation"
-            exit 1
-          }
-
-      - name: Verify dependencies
+      - name: Find and configure Vulkan SDK
         shell: pwsh
         run: |
-          Write-Host "Checking MSVC..."
-          cl.exe 2>&1 | Select-Object -First 2
+          Write-Host "Searching for Vulkan SDK..."
 
-          Write-Host "`nChecking Vulkan SDK..."
-          Write-Host "VULKAN_SDK = $env:VULKAN_SDK"
+          $vulkanPaths = @(
+            "C:\VulkanSDK",
+            "$env:HOMEDRIVE\VulkanSDK"
+          )
 
-          if (Test-Path "$env:VULKAN_SDK\Include\vulkan\vulkan.h") {
-            Write-Host "✓ Vulkan SDK found"
+          $foundPath = $null
+          foreach ($basePath in $vulkanPaths) {
+            if (Test-Path $basePath) {
+              $sdkDir = Get-ChildItem $basePath -Directory | Select-Object -First 1
+              if ($sdkDir) {
+                $foundPath = $sdkDir.FullName
+                break
+              }
+            }
+          }
+
+          if ($foundPath) {
+            Write-Host "✓ Found Vulkan SDK at: $foundPath"
+            echo "VULKAN_SDK=$foundPath" >> $env:GITHUB_ENV
+
+            # Verify critical files
+            $headerPath = Join-Path $foundPath "Include\vulkan\vulkan.h"
+            $libPath = Join-Path $foundPath "Lib\vulkan-1.lib"
+
+            if (Test-Path $headerPath) {
+              Write-Host "✓ Vulkan headers found"
+            } else {
+              Write-Error "Headers not found at: $headerPath"
+              exit 1
+            }
+
+            if (Test-Path $libPath) {
+              Write-Host "✓ Vulkan library found"
+            } else {
+              Write-Error "Library not found at: $libPath"
+              exit 1
+            }
           } else {
-            Write-Error "Vulkan SDK headers not found"
-            Get-ChildItem "$env:VULKAN_SDK" -Recurse -Depth 2 | Select-Object FullName
+            Write-Error "Vulkan SDK not found in common locations"
+            Write-Host "Searched paths:"
+            $vulkanPaths | ForEach-Object { Write-Host "  - $_" }
             exit 1
           }
 
-      - name: Build Windows FSR3 integration
+      - name: Build FSR3 Windows integration
         working-directory: native/fsr3_wine_bridge
         shell: pwsh
         run: |
-          # Create build directory
-          New-Item -ItemType Directory -Force -Path build_windows
-
-          Write-Host "Building fsr3_windows.dll..."
+          Write-Host "=== Building FSR3 Windows Integration ==="
           Write-Host "VULKAN_SDK = $env:VULKAN_SDK"
 
-          # Compile with MSVC
-          cl.exe /nologo /O2 /MD /EHsc /std:c++17 /LD `
-            /I"$env:VULKAN_SDK\Include" `
-            /I. `
-            /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE `
+          # Create build directory
+          New-Item -ItemType Directory -Force -Path build_windows | Out-Null
+
+          # Compile
+          $includeFlags = @(
+            "/I$env:VULKAN_SDK\Include",
+            "/I."
+          )
+
+          $compileFlags = @(
+            "/nologo",
+            "/O2",
+            "/MD",
+            "/EHsc",
+            "/std:c++17",
+            "/LD",
+            "/DWIN32",
+            "/D_WINDOWS",
+            "/DUNICODE",
+            "/D_UNICODE"
+          )
+
+          $linkLibs = @(
+            "d3d12.lib",
+            "dxgi.lib",
+            "uuid.lib",
+            "vulkan-1.lib"
+          )
+
+          $linkFlags = @(
+            "/link",
+            "/DLL",
+            "/LIBPATH:$env:VULKAN_SDK\Lib"
+          )
+
+          Write-Host "`nCompiling fsr3_windows.cpp..."
+
+          & cl.exe @compileFlags @includeFlags `
             fsr3_windows.cpp `
             /Fe:build_windows\fsr3_windows.dll `
-            /link `
-            /DLL `
-            d3d12.lib dxgi.lib uuid.lib `
-            vulkan-1.lib `
-            /LIBPATH:"$env:VULKAN_SDK\Lib" `
-            /LIBPATH:"C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22621.0\um\x64"
+            @linkFlags @linkLibs
 
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "Build failed with exit code $LASTEXITCODE"
+            Write-Error "Compilation failed with exit code $LASTEXITCODE"
             exit 1
           }
 
-          Write-Host "✓ Build completed successfully"
+          Write-Host "`n✓ Build completed successfully"
 
-      - name: Verify build outputs
+      - name: Verify build output
         working-directory: native/fsr3_wine_bridge/build_windows
         shell: pwsh
         run: |
+          Write-Host "Checking build outputs..."
+
           if (Test-Path "fsr3_windows.dll") {
-            Write-Host "✓ fsr3_windows.dll built successfully"
-            Get-Item fsr3_windows.dll | Format-List
+            $dll = Get-Item "fsr3_windows.dll"
+            Write-Host "✓ fsr3_windows.dll"
+            Write-Host "  Size: $($dll.Length) bytes"
+            Write-Host "  Modified: $($dll.LastWriteTime)"
           } else {
-            Write-Error "Build output not found"
+            Write-Error "fsr3_windows.dll not found!"
+            Write-Host "`nDirectory contents:"
+            Get-ChildItem | Format-Table Name, Length, LastWriteTime
             exit 1
           }
 
@@ -110,40 +167,18 @@ jobs:
           path: |
             native/fsr3_wine_bridge/build_windows/fsr3_windows.dll
             native/fsr3_wine_bridge/fsr3_windows.h
+            native/fsr3_wine_bridge/ffx_api.h
           retention-days: 7
 
-      - name: Create release notes
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        working-directory: native/fsr3_wine_bridge
+      - name: Create build summary
+        if: success()
         shell: pwsh
         run: |
-          $notes = @"
-          # FSR3 Windows Integration Build
-
-          ## Build Information
-          - Commit: ${{ github.sha }}
-          - Branch: ${{ github.ref_name }}
-          - Date: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-
-          ## Files
-          - fsr3_windows.dll - Windows FSR3 integration library
-          - fsr3_windows.h - C API header
-
-          ## Requirements
-          - Windows 10+
-          - Vulkan SDK
-          - AMD FidelityFX Upscaler DLL (amd_fidelityfx_upscaler_dx12.dll)
-
-          ## Usage
-          See CROSS_PLATFORM_GUIDE.md for integration instructions.
-          "@
-
-          $notes | Out-File -FilePath build_windows\README.txt -Encoding UTF8
-
-      - name: Upload release notes
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v4
-        with:
-          name: fsr3-windows-release-notes
-          path: native/fsr3_wine_bridge/build_windows/README.txt
-          retention-days: 30
+          echo "## FSR3 Windows Build Summary" >> $env:GITHUB_STEP_SUMMARY
+          echo "" >> $env:GITHUB_STEP_SUMMARY
+          echo "✅ Build completed successfully" >> $env:GITHUB_STEP_SUMMARY
+          echo "" >> $env:GITHUB_STEP_SUMMARY
+          echo "### Artifacts:" >> $env:GITHUB_STEP_SUMMARY
+          echo "- fsr3_windows.dll (Windows FSR3 integration)" >> $env:GITHUB_STEP_SUMMARY
+          echo "- fsr3_windows.h (C API header)" >> $env:GITHUB_STEP_SUMMARY
+          echo "- ffx_api.h (FFX API definitions)" >> $env:GITHUB_STEP_SUMMARY
