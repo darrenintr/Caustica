@@ -127,9 +127,9 @@ public final class TransparentMaterialDenoiser {
                     stack.longs(spatialSet), null);
             ByteBuffer push = stack.malloc(16);
             // Relaxed thresholds for transparent materials
-            push.putFloat(0, 0.15f);  // depthSigma (was 0.04 for opaque)
-            push.putFloat(4, 0.35f);  // normalSigma (was 0.18 for opaque)
-            push.putFloat(8, 1.5f);   // colorSigma (preserve high-freq reflections)
+            push.putFloat(0, 0.15f);  // depthSigma (relaxed for water waves)
+            push.putFloat(4, 0.35f);  // normalSigma (relaxed for refraction)
+            push.putFloat(8, 0.8f);   // colorSigma (tighter to reject fireflies)
             push.putFloat(12, 0.0f);  // unused
             VK10.vkCmdPushConstants(cmd, spatialLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
@@ -146,8 +146,8 @@ public final class TransparentMaterialDenoiser {
             ByteBuffer push = stack.malloc(16);
             push.putFloat(0, mvScaleX);
             push.putFloat(4, mvScaleY);
-            push.putFloat(8, firstFrame ? 0.0f : 0.35f);  // temporalAlpha (0.35 = keep 35% history, balanced)
-            push.putFloat(12, 0.08f);  // disocclusionThreshold (tight, reject on small depth delta)
+            push.putFloat(8, firstFrame ? 0.0f : 0.65f);  // temporalAlpha (0.65 = keep 65% history, aggressive for noise suppression)
+            push.putFloat(12, 0.12f);  // disocclusionThreshold (relaxed to allow more history accumulation)
             VK10.vkCmdPushConstants(cmd, temporalLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
         }

@@ -75,14 +75,12 @@ void main() {
         result = current;
     } else {
         // Accumulate: blend current with history
-        // Mix in a bit of ambient/diffuse to reduce specular noise
-        float ambientFactor = 0.15;  // 15% ambient floor to mask fireflies
-        vec3 ambient = current * ambientFactor;
-        result = mix(current, history, pc.temporalAlpha) + ambient * (1.0 - pc.temporalAlpha);
+        // Standard lerp without extra ambient (that was adding brightness)
+        result = mix(current, history, pc.temporalAlpha);
     }
 
-    // Clamp result to reasonable range (firefly suppression)
-    result = clamp(result, vec3(0.0), vec3(10.0));
+    // Aggressive firefly clamp for transparent materials (tighter than opaque)
+    result = clamp(result, vec3(0.0), vec3(6.0));
 
     imageStore(gOutColor, pix, vec4(result, 1.0));
     imageStore(gHistoryColor, pix, vec4(result, 1.0));
