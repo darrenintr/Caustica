@@ -4,6 +4,8 @@ build/
 run/
 out/
 *.log
+*.log.*
+.caustica-artifact/
 *.class
 third_party/
 bin/
