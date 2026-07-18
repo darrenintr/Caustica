@@ -33,7 +33,9 @@ public interface CausticaDenoiseBackend {
      * <p>Idempotent: safe to call multiple times in a row, or when no reset is actually needed.
      * Does not allocate or destroy — only clears the in-flight history surfaces.
      */
-    void resetHistory();
+    default void resetHistory() {
+        // Backends without temporal history do not need to do anything.
+    }
 
     void destroy();
 
