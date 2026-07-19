@@ -16,6 +16,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
+import java.util.Arrays;
 
 /**
  * TAAU - Temporal Anti-Aliasing Upsampler.
@@ -54,7 +55,8 @@ public final class TaaUpscaler implements Upscaler {
     private long pipelineLayout;
     private long pipeline;
     private long descriptorPool;
-    private long descriptorSet;
+    private final long[] descriptorSets = new long[2];
+    private final long[][] boundViews = new long[2][8];
     private long sampler;
 
     // History at display resolution (two ping-pong slots)
@@ -162,8 +164,10 @@ public final class TaaUpscaler implements Upscaler {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             RtImage prevHistory = historyAIsCurrent ? historyA : historyB;
             RtImage newHistory = historyAIsCurrent ? historyB : historyA;
+            int setIndex = historyAIsCurrent ? 0 : 1;
 
-            bindDescriptors(stack, cmd, color, depth, motion, normals, diffuseAlbedo, prevHistory, newHistory, out);
+            bindDescriptors(stack, setIndex, color, depth, motion, normals, diffuseAlbedo,
+                    prevHistory, newHistory, out);
 
             ByteBuffer push = stack.malloc(56);
             push.putFloat(0, (float) renderWidth);
@@ -196,7 +200,7 @@ public final class TaaUpscaler implements Upscaler {
             VkCommandBuffer cb = new VkCommandBuffer(cmd, vkDevice.vkDevice());
             VK10.vkCmdBindPipeline(cb, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
             VK10.vkCmdBindDescriptorSets(cb, VK10.VK_PIPELINE_BIND_POINT_COMPUTE,
-                    pipelineLayout, 0, stack.longs(descriptorSet), null);
+                    pipelineLayout, 0, stack.longs(descriptorSets[setIndex]), null);
             VK10.vkCmdPushConstants(cb, pipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
 
             int groupsX = (displayWidth + 7) / 8;
@@ -232,6 +236,10 @@ public final class TaaUpscaler implements Upscaler {
         if (descriptorPool != 0L) {
             VK10.vkDestroyDescriptorPool(vkDevice.vkDevice(), descriptorPool, null);
             descriptorPool = 0L;
+        }
+        Arrays.fill(descriptorSets, 0L);
+        for (long[] views : boundViews) {
+            Arrays.fill(views, 0L);
         }
         if (sampler != 0L) {
             VK10.vkDestroySampler(vkDevice.vkDevice(), sampler, null);
@@ -275,21 +283,23 @@ public final class TaaUpscaler implements Upscaler {
             descriptorSetLayout = pDsl.get(0);
 
             VkDescriptorPoolSize.Buffer sizes = VkDescriptorPoolSize.calloc(2, stack);
-            sizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(7);
-            sizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1);
+            sizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(14);
+            sizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(2);
             LongBuffer pPool = stack.mallocLong(1);
             VK10.vkCreateDescriptorPool(vkDevice.vkDevice(),
                     VkDescriptorPoolCreateInfo.calloc(stack).sType$Default()
-                            .maxSets(1).pPoolSizes(sizes),
+                            .maxSets(2).pPoolSizes(sizes),
                     null, pPool);
             descriptorPool = pPool.get(0);
 
-            LongBuffer pSet = stack.mallocLong(1);
+            LongBuffer pSet = stack.mallocLong(2);
             VK10.vkAllocateDescriptorSets(vkDevice.vkDevice(),
                     VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
-                            .descriptorPool(descriptorPool).pSetLayouts(stack.longs(descriptorSetLayout)),
+                            .descriptorPool(descriptorPool)
+                            .pSetLayouts(stack.longs(descriptorSetLayout, descriptorSetLayout)),
                     pSet);
-            descriptorSet = pSet.get(0);
+            descriptorSets[0] = pSet.get(0);
+            descriptorSets[1] = pSet.get(1);
 
             // Push constants: 56 bytes (vec2 srcSize, vec2 dstSize, float motionX/Y, float alpha,
             //                  float disocclusion, float sharpness, float varianceClipGamma,
@@ -346,9 +356,23 @@ public final class TaaUpscaler implements Upscaler {
         }
     }
 
-    private void bindDescriptors(MemoryStack stack, long cmd, RtImage inColorLow, RtImage inDepthLow,
+    private void bindDescriptors(MemoryStack stack, int setIndex, RtImage inColorLow, RtImage inDepthLow,
                                   RtImage inMotionLow, RtImage inNormalLow, RtImage inAlbedoLow,
                                   RtImage prevHistory, RtImage newHistory, RtImage out) {
+        long descriptorSet = descriptorSets[setIndex];
+        long[] views = {
+                inColorLow.view,
+                inDepthLow.view,
+                inMotionLow.view,
+                (inNormalLow != null ? inNormalLow : inColorLow).view,
+                (inAlbedoLow != null ? inAlbedoLow : inColorLow).view,
+                prevHistory.view,
+                out.view,
+                newHistory.view
+        };
+        if (Arrays.equals(boundViews[setIndex], views)) {
+            return;
+        }
         VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(8, stack);
         // 0..4: storage images (inColorLow, inDepthLow, inMotionLow, inNormalLow, inAlbedoLow).
         // Normal / albedo may be null (legacy callers); bind a placeholder view (any image view)
@@ -367,7 +391,7 @@ public final class TaaUpscaler implements Upscaler {
         }
         // 5: combined image sampler for prevHistory
         VkDescriptorImageInfo.Buffer histInfo = VkDescriptorImageInfo.calloc(1, stack);
-        histInfo.get(0).imageView(prevHistory.view).imageLayout(VK10.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+        histInfo.get(0).imageView(prevHistory.view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
                 .sampler(sampler);
         writes.get(5).sType$Default().dstSet(descriptorSet).dstBinding(5)
                 .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
@@ -385,6 +409,7 @@ public final class TaaUpscaler implements Upscaler {
                 .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                 .pImageInfo(histOutInfo);
         VK10.vkUpdateDescriptorSets(vkDevice.vkDevice(), writes, null);
+        System.arraycopy(views, 0, boundViews[setIndex], 0, views.length);
     }
 
     private void clearImage(long cmd, RtImage image) {

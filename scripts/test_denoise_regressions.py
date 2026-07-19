@@ -880,6 +880,17 @@ def test_multi_dispatch_passes_do_not_mutate_one_descriptor_set() -> None:
     assert "long[] convSets" in fsr and "convSets[setIndex]" in fsr, (
         "FSR pack and unpack must use distinct descriptor sets"
     )
+    cas = read("src/main/java/dev/comfyfluffy/caustica/display/CasSharpenPass.java")
+    cas_dispatch = method_body(cas, "public boolean dispatchInPlace")
+    assert cas_dispatch.count("vkCmdDispatch(") == 1 and "vkCmdCopyImage(" in cas, (
+        "CAS must not rebind one descriptor set for copy-back in the same command buffer"
+    )
+    assert "boundViews" in cas, "CAS must not update a stable descriptor set every frame"
+    taau = read("src/main/java/dev/comfyfluffy/caustica/upscale/TaaUpscaler.java")
+    assert "long[] descriptorSets" in taau and "descriptorSets[setIndex]" in taau, (
+        "TAAU history ping-pong directions must use distinct descriptor sets"
+    )
+    assert "boundViews" in taau, "TAAU must not update stable descriptor sets while in flight"
 
 
 if __name__ == "__main__":

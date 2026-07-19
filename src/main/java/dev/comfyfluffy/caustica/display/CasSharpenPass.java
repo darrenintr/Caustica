@@ -18,6 +18,7 @@ import org.lwjgl.vulkan.VkDescriptorSetAllocateInfo;
 import org.lwjgl.vulkan.VkDescriptorSetLayoutBinding;
 import org.lwjgl.vulkan.VkDescriptorSetLayoutCreateInfo;
 import org.lwjgl.vulkan.VkDevice;
+import org.lwjgl.vulkan.VkImageCopy;
 import org.lwjgl.vulkan.VkImageMemoryBarrier2;
 import org.lwjgl.vulkan.VkPipelineLayoutCreateInfo;
 import org.lwjgl.vulkan.VkPipelineShaderStageCreateInfo;
@@ -29,6 +30,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
+import java.util.Arrays;
 
 import static dev.comfyfluffy.caustica.rt.RtContext.check;
 
@@ -48,6 +50,7 @@ public final class CasSharpenPass {
     private long layout;
     private long pipeline;
     private RtImage temp;
+    private final long[] boundViews = new long[2];
 
     public void ensureSized(int width, int height) {
         RtContext ctx = RtContext.get();
@@ -111,24 +114,7 @@ public final class CasSharpenPass {
             VK10.vkCmdPushConstants(cmd, layout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
         }
-        barrier(stack, cmd, temp.image);
-
-        // temp → image
-        bind(ctx, temp, image);
-        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "cas copy-back")) {
-            // Reuse CAS with sharpness=0 as a cheap copy would still sample 3x3; do image blit via 0-sharpness
-            // path: dispatch with sharpness 0 copies center sample only.
-            VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-            VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, stack.longs(set), null);
-            ByteBuffer push = stack.malloc(16);
-            push.putInt(0, width);
-            push.putInt(4, height);
-            push.putFloat(8, 0f);
-            push.putFloat(12, 0f);
-            VK10.vkCmdPushConstants(cmd, layout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
-            VK10.vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
-        }
-        barrier(stack, cmd, image.image);
+        copyBack(stack, cmd, temp, image);
         return true;
     }
 
@@ -146,6 +132,7 @@ public final class CasSharpenPass {
             temp = null;
         }
         pipeline = layout = pool = dsl = set = 0L;
+        Arrays.fill(boundViews, 0L);
         ready = false;
         width = height = 0;
     }
@@ -197,6 +184,9 @@ public final class CasSharpenPass {
     }
 
     private void bind(RtContext ctx, RtImage in, RtImage out) {
+        if (boundViews[0] == in.view && boundViews[1] == out.view) {
+            return;
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(2, stack);
             VkDescriptorImageInfo.Buffer inInfo = VkDescriptorImageInfo.calloc(1, stack);
@@ -208,22 +198,58 @@ public final class CasSharpenPass {
             writes.get(1).sType$Default().dstSet(set).dstBinding(1).descriptorCount(1)
                     .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(outInfo);
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
+            boundViews[0] = in.view;
+            boundViews[1] = out.view;
         }
     }
 
-    private static void barrier(MemoryStack stack, VkCommandBuffer cmd, long image) {
-        VkImageMemoryBarrier2.Buffer barriers = VkImageMemoryBarrier2.calloc(1, stack);
+    private void copyBack(MemoryStack stack, VkCommandBuffer cmd, RtImage source, RtImage destination) {
+        VkImageMemoryBarrier2.Buffer barriers = VkImageMemoryBarrier2.calloc(2, stack);
         barriers.get(0).sType$Default()
                 .srcStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
                 .srcAccessMask(VK10.VK_ACCESS_SHADER_WRITE_BIT)
-                .dstStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
-                .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                .dstStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
+                .dstAccessMask(VK10.VK_ACCESS_TRANSFER_READ_BIT)
                 .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
                 .newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
-                .image(image)
+                .image(source.image)
+                .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
+        barriers.get(1).sType$Default()
+                .srcStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                .srcAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                .dstStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
+                .dstAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                .newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                .image(destination.image)
                 .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
                         .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
         VkDependencyInfo dep = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers);
+        KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, dep);
+
+        VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
+        region.get(0)
+                .srcSubresource(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .mipLevel(0).baseArrayLayer(0).layerCount(1))
+                .dstSubresource(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .mipLevel(0).baseArrayLayer(0).layerCount(1))
+                .extent(it -> it.width(width).height(height).depth(1));
+        VK10.vkCmdCopyImage(cmd,
+                source.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
+                destination.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
+                region);
+
+        barriers.get(0)
+                .srcStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
+                .srcAccessMask(VK10.VK_ACCESS_TRANSFER_READ_BIT)
+                .dstStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                .dstAccessMask(VK10.VK_ACCESS_SHADER_WRITE_BIT);
+        barriers.get(1)
+                .srcStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
+                .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                .dstStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT);
         KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, dep);
     }
 
