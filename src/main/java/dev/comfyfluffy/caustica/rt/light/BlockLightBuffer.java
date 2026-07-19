@@ -5,6 +5,7 @@ import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import org.lwjgl.system.MemoryUtil;
 
 import java.nio.FloatBuffer;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -16,6 +17,8 @@ public final class BlockLightBuffer {
     private static final int MAX_LIGHTS = 4096;
 
     private RtBuffer buffer;
+    /** Buffers replaced while older submitted frames may still reference them. */
+    private final List<RtBuffer> retiredBuffers = new ArrayList<>();
     private int count;
     private long uploadedRevision = Long.MIN_VALUE;
 
@@ -35,7 +38,10 @@ public final class BlockLightBuffer {
         // Create or grow buffer if needed (never shrink mid-frame — avoids thrash).
         if (buffer == null || buffer.size < requiredSize) {
             if (buffer != null) {
-                buffer.destroy();
+                // The composite command buffer is submitted later and may still read this
+                // descriptor. Destroying it immediately is a use-after-free on the GPU and
+                // presents as VK_ERROR_DEVICE_LOST on AMD during the next swapchain acquire.
+                retiredBuffers.add(buffer);
             }
             // The full 64 KiB capacity is tiny and avoids buffer replacement + descriptor churn as
             // the player enters a light-dense area.
@@ -67,6 +73,10 @@ public final class BlockLightBuffer {
             buffer.destroy();
             buffer = null;
         }
+        for (RtBuffer retired : retiredBuffers) {
+            retired.destroy();
+        }
+        retiredBuffers.clear();
         count = 0;
         uploadedRevision = Long.MIN_VALUE;
     }
