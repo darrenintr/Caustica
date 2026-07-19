@@ -79,7 +79,7 @@ jobs:
           name: nrd-linux-x64
           path: src/main/resources/caustica/natives/linux-x64
       - name: Build jar with freshly compiled NRD natives
-        run: ./gradlew build
+        run: bash ./gradlew build
       - uses: actions/upload-artifact@v4
         with:
           name: caustica-nrd-bundled-jar
