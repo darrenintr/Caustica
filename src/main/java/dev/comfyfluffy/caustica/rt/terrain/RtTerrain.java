@@ -1591,8 +1591,14 @@ public final class RtTerrain {
         for (PreparedSection ps : prepared) {
             blasBuilds.add(ps.blas());
         }
-        RtContext.AsyncSubmit op = ctx.submitAsync(cmd -> RtAccel.recordBlasBuilds(ctx, cmd, blasBuilds));
-        pending = new Pending(op, blasBuilds, new ArrayList<>(prepared), new ArrayList<>(removed), rebase, rbx, rby, rbz);
+        // AMD drivers can lose the device while a terrain BLAS batch is submitted asynchronously. The
+        // failure is commonly observed when streaming toward water, but the trigger is the new section
+        // build rather than the water shader itself. Keep the build and publication on one completed
+        // graphics-queue submission until the terrain resource/queue ownership path is hardened; NRD and
+        // TAAU remain enabled because this only changes terrain upload scheduling.
+        ctx.submitSync(cmd -> RtAccel.recordBlasBuilds(ctx, cmd, blasBuilds));
+        RtAccel.freeBlasScratch(blasBuilds);
+        applyBuildChanges(ctx, prepared, removed, rebase, rbx, rby, rbz);
     }
 
     /** Swap a completed async build in: retire old table + removed sections, publish the new instances/table. */
