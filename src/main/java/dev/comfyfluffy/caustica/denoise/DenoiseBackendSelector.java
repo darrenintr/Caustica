@@ -70,11 +70,12 @@ public final class DenoiseBackendSelector {
         // AMD's current Windows driver path can lose the Vulkan device after a few frames
         // when the NRD native dispatch is active (the crash is reported later by swapchain
         // acquire, so it is otherwise easy to misattribute to presentation). Keep AMD on the
-        // pure-Java/Vulkan bilateral path until the native AMD path has an explicit fix.
+        // raw passthrough until the native AMD path has an explicit fix; a broken fallback
+        // denoiser must never replace a valid RT frame with black output.
         if (gpu.vendor == GpuVendor.Vendor.AMD
                 && (mode == CausticaConfig.DenoiserKind.NRD || mode == CausticaConfig.DenoiserKind.HYBRID)) {
-            CausticaMod.LOGGER.warn("{} requested on AMD; using Vulkan bilateral fallback to avoid device loss", mode.key());
-            return new BilateralDenoiseBackend();
+            CausticaMod.LOGGER.warn("{} requested on AMD; using raw passthrough to avoid NRD device loss", mode.key());
+            return NoopDenoiseBackend.INSTANCE;
         }
         // SVGF: pure shader denoiser (cross-vendor, no SDK dependency)
         if (mode == CausticaConfig.DenoiserKind.SVGF) {
