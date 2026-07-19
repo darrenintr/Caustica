@@ -5,6 +5,7 @@ import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.nrd.NrdRuntime;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
+import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
@@ -353,7 +354,10 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         try {
             long dev = ctx.vk().address();
             long phys = ctx.vk().getPhysicalDevice().address();
-            NrdRuntime.INSTANCE.ensureContext(dev, phys, width, height);
+            int graphicsFamily = ctx.device().graphicsQueue().queueFamilyIndex();
+            int computeFamily = RtDeviceBringup.asyncComputeAvailable()
+                    ? RtDeviceBringup.computeQueueFamilyIndex() : -1;
+            NrdRuntime.INSTANCE.ensureContext(dev, phys, graphicsFamily, computeFamily, width, height);
         } catch (Throwable t) {
             CausticaMod.LOGGER.warn("NRD ensureContext at resize failed", t);
         }
@@ -483,7 +487,10 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
             try {
                 long dev = ctx.vk().address();
                 long phys = ctx.vk().getPhysicalDevice().address();
-                if (!NrdRuntime.INSTANCE.ensureContext(dev, phys, width, height)) {
+                int graphicsFamily = ctx.device().graphicsQueue().queueFamilyIndex();
+                int computeFamily = RtDeviceBringup.asyncComputeAvailable()
+                        ? RtDeviceBringup.computeQueueFamilyIndex() : -1;
+                if (!NrdRuntime.INSTANCE.ensureContext(dev, phys, graphicsFamily, computeFamily, width, height)) {
                     throw new IllegalStateException("NRD context not ready");
                 }
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "hybrid NRD REBLUR")) {

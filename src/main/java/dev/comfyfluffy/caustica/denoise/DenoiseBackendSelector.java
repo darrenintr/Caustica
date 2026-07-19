@@ -2,6 +2,7 @@ package dev.comfyfluffy.caustica.denoise;
 
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
+import dev.comfyfluffy.caustica.nrd.NrdRuntime;
 import dev.comfyfluffy.caustica.vendor.GpuVendor;
 
 /**
@@ -102,17 +103,17 @@ public final class DenoiseBackendSelector {
             case AMD -> {
                 // Stable cross-vendor baseline until the disabled FFX path is proven again.
                 CausticaMod.LOGGER.info("  → NRD-only (AMD AUTO baseline; FFX bypassed)");
-                yield tryCreate(new HybridFfxNrdBackend(true), gpu, true);
+                yield tryCreateNrdAuto(new HybridFfxNrdBackend(true), gpu);
             }
             case NVIDIA -> {
                 // Hybrid: FFX shadow/reflection + NRD REBLUR = best quality on RTX
                 CausticaMod.LOGGER.info("  → Hybrid FFX+NRD (NVIDIA optimized)");
-                yield tryCreate(new HybridFfxNrdBackend(false), gpu, true);
+                yield tryCreateNrdAuto(new HybridFfxNrdBackend(false), gpu);
             }
             case INTEL -> {
                 // NRD-only: XMX accelerated REBLUR on Arc, skip FFX prepass
                 CausticaMod.LOGGER.info("  → NRD-only (Intel Arc XMX optimized)");
-                yield tryCreate(new HybridFfxNrdBackend(true), gpu, true);
+                yield tryCreateNrdAuto(new HybridFfxNrdBackend(true), gpu);
             }
             default -> {
                 // Unknown GPU: FFX with Bilateral fallback for Windows compatibility
@@ -120,6 +121,15 @@ public final class DenoiseBackendSelector {
                 yield tryCreate(new OfficialFfxDenoiseBackend(), gpu, true);
             }
         };
+    }
+
+    private static CausticaDenoiseBackend tryCreateNrdAuto(CausticaDenoiseBackend candidate, GpuVendor gpu) {
+        if (NrdRuntime.INSTANCE.tryLoad().isEmpty()) {
+            CausticaMod.LOGGER.warn("AUTO candidate {} has no compatible NRD native; using bilateral fallback",
+                    candidate.name());
+            return tryCreate(new BilateralDenoiseBackend(), gpu, false);
+        }
+        return tryCreate(candidate, gpu, true);
     }
 
     /**

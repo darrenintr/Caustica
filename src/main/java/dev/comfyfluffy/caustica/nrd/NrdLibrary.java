@@ -9,11 +9,14 @@ import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.nio.file.Path;
 
-/** FFM bindings to {@code libnrd_caustica.so}. */
+/** FFM bindings to the platform NRD shim. */
 public final class NrdLibrary {
     private static final Linker LINKER = Linker.nativeLinker();
 
     private final MethodHandle probe;
+    private final MethodHandle abiVersion;
+    private final MethodHandle normalEncoding;
+    private final MethodHandle roughnessEncoding;
     private final MethodHandle create;
     private final MethodHandle destroy;
     private final MethodHandle resize;
@@ -21,9 +24,13 @@ public final class NrdLibrary {
 
     private NrdLibrary(SymbolLookup lookup) {
         this.probe = req(lookup, "caustica_nrd_probe", FunctionDescriptor.of(ValueLayout.JAVA_INT));
-        this.create = req(lookup, "caustica_nrd_create",
+        this.abiVersion = req(lookup, "caustica_nrd_abi_version", FunctionDescriptor.of(ValueLayout.JAVA_INT));
+        this.normalEncoding = req(lookup, "caustica_nrd_normal_encoding", FunctionDescriptor.of(ValueLayout.JAVA_INT));
+        this.roughnessEncoding = req(lookup, "caustica_nrd_roughness_encoding", FunctionDescriptor.of(ValueLayout.JAVA_INT));
+        this.create = req(lookup, "caustica_nrd_create_v2",
                 FunctionDescriptor.of(ValueLayout.JAVA_INT,
                         ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                        ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
                         ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
         this.destroy = req(lookup, "caustica_nrd_destroy",
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
@@ -70,9 +77,31 @@ public final class NrdLibrary {
         }
     }
 
-    public int create(long device, long physical, long getDeviceProcAddr, int w, int h, MemorySegment outCtx) {
+    public int abiVersion() {
+        return invokeInt(abiVersion, "caustica_nrd_abi_version");
+    }
+
+    public int normalEncoding() {
+        return invokeInt(normalEncoding, "caustica_nrd_normal_encoding");
+    }
+
+    public int roughnessEncoding() {
+        return invokeInt(roughnessEncoding, "caustica_nrd_roughness_encoding");
+    }
+
+    private static int invokeInt(MethodHandle handle, String name) {
         try {
-            return (int) create.invokeExact(device, physical, getDeviceProcAddr, w, h, outCtx);
+            return (int) handle.invokeExact();
+        } catch (Throwable t) {
+            throw new IllegalStateException(name + " failed", t);
+        }
+    }
+
+    public int create(long device, long physical, long getDeviceProcAddr, int w, int h,
+                      int graphicsQueueFamily, int computeQueueFamily, MemorySegment outCtx) {
+        try {
+            return (int) create.invokeExact(device, physical, getDeviceProcAddr, w, h,
+                    graphicsQueueFamily, computeQueueFamily, outCtx);
         } catch (Throwable t) {
             throw new IllegalStateException(t);
         }

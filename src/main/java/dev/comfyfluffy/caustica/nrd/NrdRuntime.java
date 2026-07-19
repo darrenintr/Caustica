@@ -13,18 +13,22 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.OptionalInt;
 
-/** Loads {@code libnrd_caustica.so} and owns the REBLUR context. */
+/** Loads the platform NRD shim and owns the REBLUR context. */
 public final class NrdRuntime {
     public static final NrdRuntime INSTANCE = new NrdRuntime();
 
-    private static final String RESOURCE = "/caustica/natives/linux-x64/libnrd_caustica.so";
-    private static final String LIB_NAME = "libnrd_caustica.so";
+    private static final int EXPECTED_ABI = 2;
+    private static final int EXPECTED_NRD_MAJOR = 4;
+    private static final int EXPECTED_NORMAL_ENCODING = 4;
+    private static final int EXPECTED_ROUGHNESS_ENCODING = 1;
 
     private NrdLibrary lib;
     private MemorySegment ctx = MemorySegment.NULL;
     private boolean failed;
     private int version = -1;
     private int width, height;
+    private long device, physical;
+    private int graphicsQueueFamily = -1, computeQueueFamily = -1;
 
     private NrdRuntime() {
     }
@@ -37,15 +41,35 @@ public final class NrdRuntime {
             return OptionalInt.of(version);
         }
         try {
-            Path so = resolve();
-            if (so == null) {
-                CausticaMod.LOGGER.info("NRD native {} not found; hybrid stays FFX-only", LIB_NAME);
+            NativePlatform platform = NativePlatform.current();
+            if (platform == null) {
+                CausticaMod.LOGGER.info("NRD native unavailable on {} / {}", System.getProperty("os.name"),
+                        System.getProperty("os.arch"));
                 failed = true;
                 return OptionalInt.empty();
             }
-            lib = NrdLibrary.load(so);
+            Path nativePath = resolve(platform);
+            if (nativePath == null || !Files.isRegularFile(nativePath)) {
+                CausticaMod.LOGGER.info("NRD native {} not found; NRD path disabled", platform.libraryName());
+                failed = true;
+                return OptionalInt.empty();
+            }
+            lib = NrdLibrary.load(nativePath); // Resolves caustica_nrd_probe and every ABI v2 symbol.
             version = lib.probe();
-            CausticaMod.LOGGER.info("NRD native loaded (probe={}) from {}", version, so);
+            int major = version / 10_000;
+            int abi = lib.abiVersion();
+            int normal = lib.normalEncoding();
+            int roughness = lib.roughnessEncoding();
+            if (major != EXPECTED_NRD_MAJOR || abi != EXPECTED_ABI
+                    || normal != EXPECTED_NORMAL_ENCODING || roughness != EXPECTED_ROUGHNESS_ENCODING) {
+                throw new IllegalStateException("incompatible NRD native: version=" + version
+                        + ", abi=" + abi + ", normal=" + normal + ", roughness=" + roughness
+                        + " (expected major=" + EXPECTED_NRD_MAJOR + ", abi=" + EXPECTED_ABI
+                        + ", normal=" + EXPECTED_NORMAL_ENCODING + ", roughness="
+                        + EXPECTED_ROUGHNESS_ENCODING + ")");
+            }
+            CausticaMod.LOGGER.info("NRD native loaded (version={}, ABI={}, normal={}, roughness={}) from {}",
+                    version, abi, normal, roughness, nativePath);
             return OptionalInt.of(version);
         } catch (Throwable t) {
             failed = true;
@@ -59,13 +83,23 @@ public final class NrdRuntime {
         return lib != null && !failed;
     }
 
-    public synchronized boolean ensureContext(long vkDevice, long vkPhysical, int w, int h) {
+    public synchronized boolean ensureContext(long vkDevice, long vkPhysical, int graphicsFamily,
+                                              int computeFamily, int w, int h) {
         if (!isAvailable() || w <= 0 || h <= 0) {
             return false;
         }
         try {
-            if (!ctx.equals(MemorySegment.NULL) && width == w && height == h) {
-                return true;
+            boolean sameDevice = device == vkDevice && physical == vkPhysical
+                    && graphicsQueueFamily == graphicsFamily && computeQueueFamily == computeFamily;
+            if (!ctx.equals(MemorySegment.NULL) && sameDevice) {
+                if (width == w && height == h) return true;
+                int rc = lib.resize(ctx, w, h);
+                if (rc == 0) {
+                    width = w;
+                    height = h;
+                    return true;
+                }
+                CausticaMod.LOGGER.warn("caustica_nrd_resize failed rc={}; recreating context", rc);
             }
             if (!ctx.equals(MemorySegment.NULL)) {
                 lib.destroy(ctx);
@@ -74,9 +108,10 @@ public final class NrdRuntime {
             long gdpa = APIUtil.apiGetFunctionAddress(VK.getFunctionProvider(), "vkGetDeviceProcAddr");
             try (Arena arena = Arena.ofConfined()) {
                 MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
-                int rc = lib.create(vkDevice, vkPhysical, gdpa, w, h, out);
+                int rc = lib.create(vkDevice, vkPhysical, gdpa, w, h,
+                        graphicsFamily, computeFamily, out);
                 if (rc != 0) {
-                    CausticaMod.LOGGER.warn("caustica_nrd_create failed rc={}", rc);
+                    CausticaMod.LOGGER.warn("caustica_nrd_create failed rc={} ({})", rc, createError(rc));
                     return false;
                 }
                 ctx = out.get(ValueLayout.ADDRESS, 0);
@@ -86,6 +121,10 @@ public final class NrdRuntime {
             }
             width = w;
             height = h;
+            device = vkDevice;
+            physical = vkPhysical;
+            graphicsQueueFamily = graphicsFamily;
+            computeQueueFamily = computeFamily;
             CausticaMod.LOGGER.info("NRD REBLUR context {}x{}", w, h);
             return true;
         } catch (Throwable t) {
@@ -144,6 +183,8 @@ public final class NrdRuntime {
             ctx = MemorySegment.NULL;
         }
         width = height = 0;
+        device = physical = 0;
+        graphicsQueueFamily = computeQueueFamily = -1;
     }
 
     private static MemorySegment copyFloats(Arena arena, float[] src) {
@@ -154,27 +195,52 @@ public final class NrdRuntime {
         return seg;
     }
 
-    private static Path resolve() throws Exception {
+    private static String createError(int rc) {
+        return switch (rc) {
+            case -3 -> "selected graphics/compute queue family lacks compute support";
+            case -7 -> "shaderStorageImageExtendedFormats is unavailable";
+            case -8 -> "an NRD internal format lacks sampled/storage image support";
+            default -> "native initialization error";
+        };
+    }
+
+    private static Path resolve(NativePlatform platform) throws Exception {
         String override = System.getProperty("caustica.nrd.path");
         if (override != null && !override.isBlank()) {
             Path p = Path.of(override);
             return Files.isRegularFile(p) ? p : null;
         }
         Path cache = FabricLoader.getInstance().getGameDir()
-                .resolve(".caustica").resolve("natives").resolve("linux-x64");
+                .resolve(".caustica").resolve("natives").resolve(platform.resourceDirectory());
         Files.createDirectories(cache);
-        Path target = cache.resolve(LIB_NAME);
-        try (InputStream in = NrdRuntime.class.getResourceAsStream(RESOURCE)) {
+        Path target = cache.resolve(platform.libraryName());
+        try (InputStream in = NrdRuntime.class.getResourceAsStream(platform.resourcePath())) {
             if (in != null) {
                 byte[] bytes = in.readAllBytes();
                 if (!Files.isRegularFile(target) || Files.size(target) != bytes.length) {
                     Files.write(target, bytes);
-                    target.toFile().setExecutable(true);
+                    if (!platform.windows()) target.toFile().setExecutable(true);
                 }
                 return target;
             }
         }
-        Path dev = Path.of("src/main/resources/caustica/natives/linux-x64").resolve(LIB_NAME);
+        Path dev = Path.of("src/main/resources/caustica/natives")
+                .resolve(platform.resourceDirectory()).resolve(platform.libraryName());
         return Files.isRegularFile(dev) ? dev.toAbsolutePath() : null;
+    }
+
+    private record NativePlatform(String resourceDirectory, String libraryName, boolean windows) {
+        String resourcePath() {
+            return "/caustica/natives/" + resourceDirectory + "/" + libraryName;
+        }
+
+        static NativePlatform current() {
+            String arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT);
+            if (!(arch.equals("amd64") || arch.equals("x86_64") || arch.equals("x64"))) return null;
+            String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+            if (os.contains("win")) return new NativePlatform("windows-x64", "nrd_caustica.dll", true);
+            if (os.contains("linux")) return new NativePlatform("linux-x64", "libnrd_caustica.so", false);
+            return null;
+        }
     }
 }

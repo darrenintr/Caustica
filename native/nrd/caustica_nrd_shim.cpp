@@ -17,7 +17,15 @@
 #define VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR 0x00000001
 #endif
 
+#ifndef CAUSTICA_NRD_NORMAL_ENCODING
+#define CAUSTICA_NRD_NORMAL_ENCODING 4
+#endif
+#ifndef CAUSTICA_NRD_ROUGHNESS_ENCODING
+#define CAUSTICA_NRD_ROUGHNESS_ENCODING 1
+#endif
+
 #define NRD_ARRAYSIZE(x) (sizeof(x) / sizeof(*(x)))
+static constexpr uint32_t FALLBACK_FRAME_SLOTS = 4;
 
 static const VkFormat g_NRDFormatToVkFormat[] = {
     VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT,
@@ -68,6 +76,10 @@ struct CausticaNrd {
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     PFN_vkGetDeviceProcAddr getDeviceProcAddr = nullptr;
     PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSetKHR = nullptr;
+    uint32_t queueFamilies[2] = {VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED};
+    uint32_t queueFamilyCount = 0;
+    bool poolsNeedInit = false;
+    uint64_t descriptorFrame = 0;
 
     nrd::Instance* instance = nullptr;
     uint32_t width = 0, height = 0;
@@ -87,6 +99,7 @@ struct CausticaNrd {
     VkDescriptorSetLayout samplerSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool samplerPool = VK_NULL_HANDLE;
     VkDescriptorSet samplerSet = VK_NULL_HANDLE;
+    std::array<VkDescriptorPool, FALLBACK_FRAME_SLOTS> resourcePools{};
 
     std::vector<NrdPipe> pipelines;
 };
@@ -121,6 +134,11 @@ static int createTex(CausticaNrd* c, GpuTex& t, uint32_t w, uint32_t h, VkFormat
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (c->queueFamilyCount > 1) {
+        ici.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        ici.queueFamilyIndexCount = c->queueFamilyCount;
+        ici.pQueueFamilyIndices = c->queueFamilies;
+    }
     if (vkCreateImage(c->device, &ici, nullptr, &t.image) != VK_SUCCESS) return -1;
     VkMemoryRequirements mr{};
     vkGetImageMemoryRequirements(c->device, t.image, &mr);
@@ -243,7 +261,8 @@ static int createPipelines(CausticaNrd* c) {
             }
         }
         VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        setInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        setInfo.flags = c->cmdPushDescriptorSetKHR
+            ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
         setInfo.bindingCount = (uint32_t)setBinds.size();
         setInfo.pBindings = setBinds.data();
         NrdPipe& pipe = c->pipelines[p];
@@ -277,6 +296,21 @@ static int createPipelines(CausticaNrd* c) {
         }
         vkDestroyShaderModule(c->device, mod, nullptr);
     }
+
+    if (!c->cmdPushDescriptorSetKHR) {
+        const nrd::DescriptorPoolDesc& dp = iDesc->descriptorPoolDesc;
+        for (VkDescriptorPool& pool : c->resourcePools) {
+            VkDescriptorPoolSize sizes[] = {
+                {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, dp.totalTexturesNum},
+                {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dp.totalStorageTexturesNum},
+            };
+            VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            pci.maxSets = dp.setsMaxNum;
+            pci.poolSizeCount = 2;
+            pci.pPoolSizes = sizes;
+            if (vkCreateDescriptorPool(c->device, &pci, nullptr, &pool) != VK_SUCCESS) return -25;
+        }
+    }
     return 0;
 }
 
@@ -303,72 +337,15 @@ static int recreatePools(CausticaNrd* c, uint32_t w, uint32_t h) {
         c->transient.push_back(tex);
     }
 
-    // Clear permanent pool (history buffers) to avoid uninitialized GPU memory artifacts.
-    // NRD REBLUR reads previous-frame accumulators on first dispatch; without this clear,
-    // left-half or checkerboard garbage pixels appear until history converges (30+ frames).
-    if (!c->permanent.empty()) {
-        VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-        cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-        cpci.queueFamilyIndex = 0; // assume graphics queue 0 (Caustica main queue)
-        VkCommandPool pool = VK_NULL_HANDLE;
-        if (vkCreateCommandPool(c->device, &cpci, nullptr, &pool) != VK_SUCCESS) return -32;
-
-        VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cbai.commandPool = pool;
-        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbai.commandBufferCount = 1;
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        if (vkAllocateCommandBuffers(c->device, &cbai, &cmd) != VK_SUCCESS) {
-            vkDestroyCommandPool(c->device, pool, nullptr);
-            return -33;
-        }
-
-        VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd, &cbbi);
-
-        for (auto& tex : c->permanent) {
-            VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            barrier.srcAccessMask = 0;
-            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barrier.image = tex.image;
-            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-            VkClearColorValue clear{};
-            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            vkCmdClearColorImage(cmd, tex.image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
-
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
-        }
-
-        vkEndCommandBuffer(cmd);
-
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cmd;
-        VkQueue queue = VK_NULL_HANDLE;
-        vkGetDeviceQueue(c->device, 0, 0, &queue);
-        if (vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) {
-            vkQueueWaitIdle(queue);
-        }
-
-        vkDestroyCommandPool(c->device, pool, nullptr);
-    }
-
+    c->poolsNeedInit = true;
     return 0;
 }
 
 static void destroyAll(CausticaNrd* c) {
     if (!c) return;
+    for (VkDescriptorPool pool : c->resourcePools) {
+        if (pool) vkDestroyDescriptorPool(c->device, pool, nullptr);
+    }
     for (auto& p : c->pipelines) {
         if (p.pipeline) vkDestroyPipeline(c->device, p.pipeline, nullptr);
         if (p.layout) vkDestroyPipelineLayout(c->device, p.layout, nullptr);
@@ -389,6 +366,49 @@ static void destroyAll(CausticaNrd* c) {
     }
 }
 
+static void recordPoolInitialization(CausticaNrd* c, VkCommandBuffer cmd) {
+    if (!c->poolsNeedInit) return;
+
+    // Permanent history needs a defined zero value. Transition through TRANSFER for the clear,
+    // then make the result visible to every NRD compute pass.
+    for (GpuTex& tex : c->permanent) {
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = tex.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
+        VkClearColorValue clear{};
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd, tex.image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
+
+    // Transient resources are not cleared, but must leave UNDEFINED before descriptors bind them
+    // as GENERAL. The first NRD writer establishes their contents.
+    for (GpuTex& tex : c->transient) {
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = tex.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
+    c->poolsNeedInit = false;
+}
+
 static GpuTex* resolveTex(CausticaNrd* c, const nrd::ResourceDesc& r) {
     if (r.type == nrd::ResourceType::TRANSIENT_POOL) {
         if (r.indexInPool >= c->transient.size()) return nullptr;
@@ -403,7 +423,8 @@ static GpuTex* resolveTex(CausticaNrd* c, const nrd::ResourceDesc& r) {
     return &c->user[i];
 }
 
-static void dispatchOne(CausticaNrd* c, VkCommandBuffer cmd, const nrd::DispatchDesc& dDesc) {
+static bool dispatchOne(CausticaNrd* c, VkCommandBuffer cmd, VkDescriptorPool fallbackPool,
+                        const nrd::DispatchDesc& dDesc) {
     const nrd::LibraryDesc* lDesc = nrd::GetLibraryDesc();
     const nrd::InstanceDesc* iDesc = nrd::GetInstanceDesc(*c->instance);
     const nrd::PipelineDesc& pDesc = iDesc->pipelines[dDesc.pipelineIndex];
@@ -462,17 +483,76 @@ static void dispatchOne(CausticaNrd* c, VkCommandBuffer cmd, const nrd::Dispatch
     if (c->cmdPushDescriptorSetKHR && nUp > 0) {
         c->cmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.layout,
                                    iDesc->resourcesSpaceIndex, nUp, writes.data());
+    } else if (nUp > 0) {
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = fallbackPool;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &pipe.resourceLayout;
+        if (vkAllocateDescriptorSets(c->device, &dai, &set) != VK_SUCCESS) return false;
+        for (uint32_t i = 0; i < nUp; ++i) writes[i].dstSet = set;
+        vkUpdateDescriptorSets(c->device, nUp, writes.data(), 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.layout,
+                                iDesc->resourcesSpaceIndex, 1, &set, 0, nullptr);
     }
     vkCmdDispatch(cmd, dDesc.gridWidth, dDesc.gridHeight, 1);
+    return true;
 }
 
 extern "C" int caustica_nrd_probe(void) {
-    return NRD_VERSION_MAJOR * 10000 + NRD_VERSION_MINOR * 100 + NRD_VERSION_BUILD;
+    const nrd::LibraryDesc* desc = nrd::GetLibraryDesc();
+    return desc ? desc->versionMajor * 10000 + desc->versionMinor * 100 + desc->versionBuild : 0;
+}
+
+extern "C" int caustica_nrd_abi_version(void) { return CAUSTICA_NRD_ABI_VERSION; }
+extern "C" int caustica_nrd_normal_encoding(void) {
+    const nrd::LibraryDesc* desc = nrd::GetLibraryDesc();
+    return desc ? int(desc->normalEncoding) : -1;
+}
+extern "C" int caustica_nrd_roughness_encoding(void) {
+    const nrd::LibraryDesc* desc = nrd::GetLibraryDesc();
+    return desc ? int(desc->roughnessEncoding) : -1;
+}
+
+static bool queueFamilySupportsCompute(VkPhysicalDevice physical, uint32_t family) {
+    uint32_t count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, nullptr);
+    if (family >= count) return false;
+    std::vector<VkQueueFamilyProperties> properties(count);
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, properties.data());
+    return (properties[family].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+}
+
+static bool supportsNrdFormats(CausticaNrd* c) {
+    const nrd::InstanceDesc* desc = nrd::GetInstanceDesc(*c->instance);
+    auto supports = [c](const nrd::TextureDesc& texture) {
+        VkFormat format = nrdToVkFormat(texture.format);
+        if (format == VK_FORMAT_UNDEFINED) return false;
+        VkFormatProperties props{};
+        vkGetPhysicalDeviceFormatProperties(c->physical, format, &props);
+        const VkFormatFeatureFlags required =
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+        return (props.optimalTilingFeatures & required) == required;
+    };
+    for (uint32_t i = 0; i < desc->permanentPoolSize; ++i)
+        if (!supports(desc->permanentPool[i])) return false;
+    for (uint32_t i = 0; i < desc->transientPoolSize; ++i)
+        if (!supports(desc->transientPool[i])) return false;
+    return true;
 }
 
 extern "C" int caustica_nrd_create(
     uint64_t vk_device, uint64_t vk_physical, uint64_t get_device_proc_addr,
     uint32_t width, uint32_t height, void** out_ctx)
+{
+    return caustica_nrd_create_v2(vk_device, vk_physical, get_device_proc_addr, width, height,
+                                  0, UINT32_MAX, out_ctx);
+}
+
+extern "C" int caustica_nrd_create_v2(
+    uint64_t vk_device, uint64_t vk_physical, uint64_t get_device_proc_addr,
+    uint32_t width, uint32_t height, uint32_t graphics_queue_family,
+    uint32_t compute_queue_family, void** out_ctx)
 {
     if (!out_ctx || !vk_device || !vk_physical || !get_device_proc_addr || !width || !height) return -1;
     auto* c = new (std::nothrow) CausticaNrd();
@@ -482,9 +562,24 @@ extern "C" int caustica_nrd_create(
     c->getDeviceProcAddr = (PFN_vkGetDeviceProcAddr)get_device_proc_addr;
     c->cmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)
         c->getDeviceProcAddr(c->device, "vkCmdPushDescriptorSetKHR");
-    if (!c->cmdPushDescriptorSetKHR) {
+    if (!queueFamilySupportsCompute(c->physical, graphics_queue_family) ||
+        (compute_queue_family != UINT32_MAX &&
+         !queueFamilySupportsCompute(c->physical, compute_queue_family))) {
         delete c;
-        return -3; // need push descriptors
+        return -3;
+    }
+    c->queueFamilies[0] = graphics_queue_family;
+    c->queueFamilyCount = 1;
+    if (compute_queue_family != UINT32_MAX && compute_queue_family != graphics_queue_family) {
+        c->queueFamilies[1] = compute_queue_family;
+        c->queueFamilyCount = 2;
+    }
+
+    VkPhysicalDeviceFeatures features{};
+    vkGetPhysicalDeviceFeatures(c->physical, &features);
+    if (!features.shaderStorageImageExtendedFormats) {
+        delete c;
+        return -7;
     }
 
     nrd::DenoiserDesc denoisers[] = {
@@ -495,6 +590,11 @@ extern "C" int caustica_nrd_create(
     if (nrd::CreateInstance(idesc, c->instance) != nrd::Result::SUCCESS) {
         delete c;
         return -4;
+    }
+    if (!supportsNrdFormats(c)) {
+        destroyAll(c);
+        delete c;
+        return -8;
     }
 
     // Conservative one-path-per-pixel baseline. Valid guides, confidence and disocclusion
@@ -599,6 +699,7 @@ extern "C" int caustica_nrd_dispatch_v2(
     if (!ctx || !vk_command_buffer) return -1;
     auto* c = static_cast<CausticaNrd*>(ctx);
     VkCommandBuffer cmd = (VkCommandBuffer)vk_command_buffer;
+    recordPoolInitialization(c, cmd);
 
     setUserTex(c, nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, (VkImage)in_diff_image, (VkImageView)in_diff_view);
     setUserTex(c, nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST, (VkImage)in_spec_image, (VkImageView)in_spec_view);
@@ -671,8 +772,13 @@ extern "C" int caustica_nrd_dispatch_v2(
     uint32_t nDisp = 0;
     if (nrd::GetComputeDispatches(*c->instance, ids, 2, dispatches, nDisp) != nrd::Result::SUCCESS)
         return -3;
+    VkDescriptorPool fallbackPool = VK_NULL_HANDLE;
+    if (!c->cmdPushDescriptorSetKHR) {
+        fallbackPool = c->resourcePools[c->descriptorFrame++ % FALLBACK_FRAME_SLOTS];
+        if (vkResetDescriptorPool(c->device, fallbackPool, 0) != VK_SUCCESS) return -4;
+    }
     for (uint32_t i = 0; i < nDisp; ++i) {
-        dispatchOne(c, cmd, dispatches[i]);
+        if (!dispatchOne(c, cmd, fallbackPool, dispatches[i])) return -5;
     }
     return 0;
 }

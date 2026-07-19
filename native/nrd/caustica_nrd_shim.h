@@ -1,12 +1,23 @@
 /* Caustica C ABI for NVIDIA NRD REBLUR (Vulkan). */
 #pragma once
 #include <stdint.h>
+#if defined(_WIN32)
+#define CAUSTICA_NRD_API __declspec(dllexport)
+#else
+#define CAUSTICA_NRD_API __attribute__((visibility("default")))
+#endif
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/** Packed version major*10000+minor*100+build, or 0 if unavailable. */
-int caustica_nrd_probe(void);
+/** Java/native ABI implemented by this shim. */
+#define CAUSTICA_NRD_ABI_VERSION 2
+
+/** Packed NRD version major*10000+minor*100+build, or 0 if unavailable. */
+CAUSTICA_NRD_API int caustica_nrd_probe(void);
+CAUSTICA_NRD_API int caustica_nrd_abi_version(void);
+CAUSTICA_NRD_API int caustica_nrd_normal_encoding(void);
+CAUSTICA_NRD_API int caustica_nrd_roughness_encoding(void);
 
 /**
  * Create a REBLUR_DIFFUSE_SPECULAR + SIGMA_SHADOW context.
@@ -17,7 +28,7 @@ int caustica_nrd_probe(void);
  * @param out_ctx opaque handle
  * @return 0 on success
  */
-int caustica_nrd_create(
+CAUSTICA_NRD_API int caustica_nrd_create(
     uint64_t vk_device,
     uint64_t vk_physical,
     uint64_t get_device_proc_addr,
@@ -25,9 +36,20 @@ int caustica_nrd_create(
     uint32_t height,
     void** out_ctx);
 
-int caustica_nrd_destroy(void* ctx);
+/** ABI v2: initializes on the first application command buffer and supports two queue families. */
+CAUSTICA_NRD_API int caustica_nrd_create_v2(
+    uint64_t vk_device,
+    uint64_t vk_physical,
+    uint64_t get_device_proc_addr,
+    uint32_t width,
+    uint32_t height,
+    uint32_t graphics_queue_family,
+    uint32_t compute_queue_family,
+    void** out_ctx);
 
-int caustica_nrd_resize(void* ctx, uint32_t width, uint32_t height);
+CAUSTICA_NRD_API int caustica_nrd_destroy(void* ctx);
+
+CAUSTICA_NRD_API int caustica_nrd_resize(void* ctx, uint32_t width, uint32_t height);
 
 /**
  * Dispatch one REBLUR_DIFFUSE_SPECULAR + SIGMA_SHADOW frame.
@@ -37,7 +59,7 @@ int caustica_nrd_resize(void* ctx, uint32_t width, uint32_t height);
  * Motion vectors: pixel-space (prev-cur); scale applied inside as 1/w,1/h.
  * @return 0 on success
  */
-int caustica_nrd_dispatch_v2(
+CAUSTICA_NRD_API int caustica_nrd_dispatch_v2(
     void* ctx,
     uint64_t vk_command_buffer,
     uint64_t in_diff_image, uint64_t in_diff_view,
