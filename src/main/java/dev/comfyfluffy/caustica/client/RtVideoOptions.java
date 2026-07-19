@@ -176,10 +176,9 @@ public final class RtVideoOptions {
 
     private static OptionInstance<String> upscalerMode() {
         EnumSetting<CausticaConfig.UpscalerMode> setting = CausticaConfig.Rt.Upscaler.MODE;
-        // TAAU is the primary option (pure compute, cross-vendor, Linux-friendly).
-        // FSR2 added for quality comparison (v0.6.19).
-        // Legacy DLSS-RR / XeSS / NIS keys are still accepted in caustica.toml
-        // (mapped to AUTO) but no longer shown in the dropdown.
+        // TAAU: pure compute fallback. FSR2: classic FidelityFX Super Resolution partner for
+        // the AMD FidelityFX denoise preset. Legacy DLSS-RR / XeSS / NIS keys still parse from
+        // caustica.toml but are not shown in the dropdown.
         List<String> values = List.of("auto", "taau", "fsr2", "off");
         return new OptionInstance<>(
             "caustica.options.rt.upscalerMode",
@@ -197,7 +196,9 @@ public final class RtVideoOptions {
 
     private static OptionInstance<String> denoiseMode() {
         EnumSetting<CausticaConfig.DenoiserKind> setting = CausticaConfig.Rt.Denoise.MODE;
-        List<String> values = List.of("auto", "ffx", "nrd", "svgf", "off");
+        // amd-fidelityfx = FFX-only (no NRD), intended to pair with FSR2 upscaling.
+        // NRD / hybrid / auto paths remain for quality comparisons and NVIDIA/Intel.
+        List<String> values = List.of("auto", "amd-fidelityfx", "ffx", "nrd", "hybrid", "off");
         return new OptionInstance<>(
             "caustica.options.rt.denoiseMode",
             OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.denoiseMode.tooltip")),
@@ -205,8 +206,17 @@ public final class RtVideoOptions {
             new OptionInstance.Enum<>(values, Codec.STRING),
             setting.value().key(),
             value -> {
-                setting.set(CausticaConfig.DenoiserKind.fromKey(value));
+                CausticaConfig.DenoiserKind kind = CausticaConfig.DenoiserKind.fromKey(value);
+                setting.set(kind);
                 dev.comfyfluffy.caustica.rt.RtComposite.INSTANCE.invalidateDenoiseSelection();
+                // FidelityFX preset forces FSR2 as the partner upscaler (unless user set OFF).
+                if (kind == CausticaConfig.DenoiserKind.AMD_FIDELITYFX) {
+                    if (CausticaConfig.Rt.Upscaler.MODE.value() != CausticaConfig.UpscalerMode.OFF
+                            && CausticaConfig.Rt.Upscaler.MODE.value() != CausticaConfig.UpscalerMode.FSR2) {
+                        CausticaConfig.Rt.Upscaler.MODE.set(CausticaConfig.UpscalerMode.FSR2);
+                    }
+                    dev.comfyfluffy.caustica.rt.RtComposite.INSTANCE.invalidateUpscalerSelection();
+                }
             });
     }
 

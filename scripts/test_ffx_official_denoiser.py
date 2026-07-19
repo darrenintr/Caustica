@@ -54,18 +54,18 @@ def test_rgen_writes_split_lighting_buffers() -> None:
 
 
 def test_material_sky_bindings_after_split_buffers() -> None:
-    """GUIDE_COUNT=9 uses bindings 3..11 for guides+split; materials/sky must not collide."""
+    """GUIDE_COUNT=23 uses bindings 3..25; material/sky samplers must follow without collision."""
     rchit = (ROOT / "shaders/world/world.rchit").read_text(encoding="utf-8")
     rmiss = (ROOT / "shaders/world/world.rmiss").read_text(encoding="utf-8")
     rgen = (ROOT / "shaders/world/world.rgen").read_text(encoding="utf-8")
     assert "binding = 9" in rgen and "gShadowHit" in rgen
-    assert "binding = 12" in rchit and "blockSpecAtlas" in rchit
-    assert "binding = 13" in rchit and "blockNormalAtlas" in rchit
-    assert "binding = 14" in rmiss and "celestialsAtlas" in rmiss
+    assert "binding = 26" in rchit and "blockSpecAtlas" in rchit
+    assert "binding = 27" in rchit and "blockNormalAtlas" in rchit
+    assert "binding = 28" in rmiss and "celestialsAtlas" in rmiss
     composite = (ROOT / "src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java").read_text(
         encoding="utf-8"
     )
-    assert "GUIDE_COUNT = 9" in composite
+    assert "GUIDE_COUNT = 23" in composite
 
 
 def test_shadow_denoise_composite_shaders_exist() -> None:

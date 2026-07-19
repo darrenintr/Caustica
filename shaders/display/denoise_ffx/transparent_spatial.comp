@@ -4,11 +4,11 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(binding = 0, rgba16f) readonly uniform image2D gInColor;
+layout(binding = 0, r11f_g11f_b10f) readonly uniform image2D gInColor;
 layout(binding = 1, rgba16f) readonly uniform image2D gInNormal;
 layout(binding = 2, r32f) readonly uniform image2D gInDepth;
 layout(binding = 3, r8) readonly uniform image2D gTransparencyMask;
-layout(binding = 4, rgba16f) writeonly uniform image2D gOutColor;
+layout(binding = 4, r11f_g11f_b10f) writeonly uniform image2D gOutColor;
 
 layout(push_constant) uniform Push {
     float depthSigma;   // 0.15 (relaxed for water waves)

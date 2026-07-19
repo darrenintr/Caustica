@@ -133,6 +133,7 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
                 historyRadiance[i].destroy();
                 historyRadiance[i] = null;
             }
+            // History packs device depth into .a for the next-frame disocclusion test — must stay RGBA16F.
             historyRadiance[i] = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                     "ffx history " + i);
         }
@@ -145,9 +146,10 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
         if (resolveDenoisedBuf != null) {
             resolveDenoisedBuf.destroy();
         }
+        // reprojectColorBuf packs depth into .a (rgba16f). resolveDenoisedBuf is pure RGB beauty.
         reprojectColorBuf = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx reproject color");
         reprojectVarianceBuf = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R32_SFLOAT, "ffx reproject variance");
-        resolveDenoisedBuf = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx resolve denoised");
+        resolveDenoisedBuf = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "ffx resolve denoised");
         this.width = width;
         this.height = height;
         frameCounter = 0;

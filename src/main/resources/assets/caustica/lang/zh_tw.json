@@ -65,9 +65,11 @@
 	"caustica.options.rt.debugOverlay.tooltip": "在畫面左上角顯示即時光追管線狀態（升頻器、降噪模式、畫面計數、上次 DLSS-RR 傳回碼、各階段耗時）。畫面異常時方便診斷。",
 
 	"caustica.options.rt.upscalerMode": "升頻器",
-	"caustica.options.rt.upscalerMode.tooltip": "選擇升頻器。自動會依 GPU 挑選最合適的；其他選項強制使用指定後端。變更立即生效。",
+	"caustica.options.rt.upscalerMode.tooltip": "選擇升頻器。自動使用 TAAU。選 FSR2 使用經典 FidelityFX Super Resolution（搭配 AMD FidelityFX 降噪預設）。變更立即生效。",
 	"caustica.options.rt.upscalerMode.auto": "自動",
 	"caustica.options.rt.upscalerMode.off": "關閉 (1:1)",
+	"caustica.options.rt.upscalerMode.taau": "TAAU（純計算著色器）",
+	"caustica.options.rt.upscalerMode.fsr2": "FSR 2（FidelityFX）",
 	"caustica.options.rt.upscalerMode.dlss-rr": "DLSS 光線重建 (NVIDIA)",
 	"caustica.options.rt.upscalerMode.fsr-3": "FSR 3",
 	"caustica.options.rt.upscalerMode.fsr-4": "FSR 4.1 INT8 (RDNA 3/4)",
@@ -75,11 +77,11 @@
 	"caustica.options.rt.upscalerMode.nis": "NIS (NVIDIA 影像縮放)",
 
 	"caustica.options.rt.denoiseMode": "降噪",
-	"caustica.options.rt.denoiseMode.tooltip": "內建降噪。自動/混合：FFX 陰影+反射再接 NRD REBLUR。NRD：僅 REBLUR（無 FFX）。FFX：僅陰影+反射。關閉：原始路徑追蹤顆粒。",
-	"caustica.options.rt.denoiseMode.auto": "自動 (FFX→NRD)",
+	"caustica.options.rt.denoiseMode.tooltip": "內建降噪。AMD FidelityFX：FFX 陰影/反射+殘差，並強制 FSR2 升頻（不用 NRD）。自動：依顯示卡（AMD→NRD）。NRD：僅 REBLUR。FFX：同 FFX 路徑但不強制 FSR2。混合：目前等同 NRD（FFX 預處理已關閉）。關閉：原始顆粒。",
+	"caustica.options.rt.denoiseMode.auto": "自動 (AMD→NRD)",
+	"caustica.options.rt.denoiseMode.amd-fidelityfx": "AMD FidelityFX（FFX+FSR2）",
 	"caustica.options.rt.denoiseMode.ffx": "僅 FFX",
 	"caustica.options.rt.denoiseMode.nrd": "僅 NRD",
-	"caustica.options.rt.denoiseMode.hybrid": "混合 FFX→NRD",
-	"caustica.options.rt.denoiseMode.svgl": "SVGF (舊版 → FFX)",
+	"caustica.options.rt.denoiseMode.hybrid": "混合（目前=NRD）",
 	"caustica.options.rt.denoiseMode.off": "關閉"
 }

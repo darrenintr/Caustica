@@ -15,12 +15,13 @@
 //
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba16f) readonly uniform image2D inColor;
+// inColor / outDenoised are pure RGB beauty. outReprojected is rgba16f (rgb + depth-in-a).
+layout(set = 0, binding = 0, r11f_g11f_b10f) readonly uniform image2D inColor;
 layout(set = 0, binding = 1, rgba16f) readonly uniform image2D inNormal;
 layout(set = 0, binding = 2, rgba16f) readonly uniform image2D outReprojected;
 layout(set = 0, binding = 3, r32f)    readonly uniform image2D outVariance;
 layout(set = 0, binding = 4, rgba16f) readonly uniform image2D gSpecAlbedo; // unused, host-side compat
-layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D outDenoised;
+layout(set = 0, binding = 5, r11f_g11f_b10f) writeonly uniform image2D outDenoised;
 
 layout(push_constant) uniform FfxResolveParams {
     float temporalWeightMax;

@@ -65,9 +65,11 @@
 	"caustica.options.rt.debugOverlay.tooltip": "Show live ray-tracing pipeline state in the top-left of the screen (active upscaler, denoise mode, frame counter, last DLSS-RR return code, per-stage timings). Useful when an image looks wrong.",
 
 	"caustica.options.rt.upscalerMode": "Upscaler",
-	"caustica.options.rt.upscalerMode.tooltip": "Which upscaler to use. Auto picks the best one for the GPU; the rest force a specific backend. Changes take effect immediately.",
+	"caustica.options.rt.upscalerMode.tooltip": "Which upscaler to use. Auto uses TAAU. Pick FSR2 for classic FidelityFX Super Resolution (pairs with the AMD FidelityFX denoise preset). Changes take effect immediately.",
 	"caustica.options.rt.upscalerMode.auto": "Auto",
 	"caustica.options.rt.upscalerMode.off": "Off (1:1)",
+	"caustica.options.rt.upscalerMode.taau": "TAAU (pure compute)",
+	"caustica.options.rt.upscalerMode.fsr2": "FSR 2 (FidelityFX)",
 	"caustica.options.rt.upscalerMode.dlss-rr": "DLSS Ray Reconstruction (NVIDIA)",
 	"caustica.options.rt.upscalerMode.fsr-3": "FSR 3",
 	"caustica.options.rt.upscalerMode.fsr-4": "FSR 4.1 INT8 (RDNA 3/4)",
@@ -75,11 +77,11 @@
 	"caustica.options.rt.upscalerMode.nis": "NIS (NVIDIA Image Scaling)",
 
 	"caustica.options.rt.denoiseMode": "Denoise",
-	"caustica.options.rt.denoiseMode.tooltip": "Internal denoise. Auto/Hybrid: FFX shadow+refl then NRD REBLUR. NRD: REBLUR only (no FFX). FFX: shadow+refl only. SVGF: spatiotemporal variance-guided filtering (pure shader). Off: raw path-traced grain.",
-	"caustica.options.rt.denoiseMode.auto": "Auto (FFX→NRD)",
+	"caustica.options.rt.denoiseMode.tooltip": "Internal denoise. AMD FidelityFX: FFX shadow/refl + residual GI, forces FSR2 (no NRD). Auto: vendor pick (AMD→NRD). NRD: REBLUR only. FFX: same FFX stack without forcing FSR2. Hybrid: currently NRD-only (FFX prepass disabled). Off: raw grain.",
+	"caustica.options.rt.denoiseMode.auto": "Auto (AMD→NRD)",
+	"caustica.options.rt.denoiseMode.amd-fidelityfx": "AMD FidelityFX (FFX+FSR2)",
 	"caustica.options.rt.denoiseMode.ffx": "FFX only",
 	"caustica.options.rt.denoiseMode.nrd": "NRD only",
-	"caustica.options.rt.denoiseMode.hybrid": "Hybrid FFX→NRD",
-	"caustica.options.rt.denoiseMode.svgf": "SVGF",
+	"caustica.options.rt.denoiseMode.hybrid": "Hybrid (NRD; FFX prepass off)",
 	"caustica.options.rt.denoiseMode.off": "Off"
 }

@@ -33,6 +33,7 @@ public final class UpscalerSelector {
         AUTO("auto"),
         TAAU("taau"),
         XESS("xess"),
+        /** Classic FSR2.2 (and modular FSR3 when available) quality path. */
         FSR_3("fsr-3"),
         // Legacy aliases kept so old caustica.toml values parse without error.
         @Deprecated DLSS_RR("dlss-rr"),
@@ -47,6 +48,11 @@ public final class UpscalerSelector {
         public static Mode fromKey(String key) {
             if (key == null) {
                 return AUTO;
+            }
+            // fsr2 / fsr / fsr-2 all resolve to the classic FSR2 quality path.
+            if (key.equalsIgnoreCase("fsr2") || key.equalsIgnoreCase("fsr")
+                    || key.equalsIgnoreCase("fsr-2")) {
+                return FSR_3;
             }
             for (Mode m : values()) {
                 if (m.key.equalsIgnoreCase(key) || m.name().equalsIgnoreCase(key)) {
@@ -91,6 +97,16 @@ public final class UpscalerSelector {
 
     private static Upscaler resolve0(GpuVendor gpu) {
         Mode requested = CausticaConfig.Rt.Upscaler.MODE.valueEnum();
+        // AMD FidelityFX denoise preset = FFX + FSR2 stack. Force FSR2 unless the user
+        // explicitly chose OFF (debug 1:1). AUTO/TAAU/legacy modes all snap to FSR2.
+        if (CausticaConfig.Rt.Denoise.MODE.value() == CausticaConfig.DenoiserKind.AMD_FIDELITYFX
+                && requested != Mode.OFF) {
+            if (requested != Mode.FSR_3 && requested != Mode.FSR_4) {
+                LOGGER.info("AMD FidelityFX denoise preset active → forcing upscaler partner to FSR2 (was {})",
+                        requested.key);
+            }
+            requested = Mode.FSR_3;
+        }
         Upscaler candidate = null;
         String requestedReason = requested.key;
         switch (requested) {
@@ -99,11 +115,31 @@ public final class UpscalerSelector {
                 return setActive(NoopUpscaler.INSTANCE);
             }
             case TAAU -> candidate = TaaUpscaler.tryCreate();
+            case FSR_3, FSR_4 -> {
+                candidate = dev.comfyfluffy.caustica.fsr.Fsr2ClassicUpscaler.tryCreate(gpu);
+                if (candidate != null) {
+                    requestedReason = requested.key + " → classic FSR2";
+                } else {
+                    LOGGER.warn("Classic FSR2 unavailable; falling back to TAAU");
+                    candidate = TaaUpscaler.tryCreate();
+                    if (candidate != null) {
+                        requestedReason = requested.key + " → TAAU fallback (no FSR2 native)";
+                    }
+                }
+            }
             case AUTO -> {
-                // AUTO: Use TAAU (always available)
+                // Default AUTO stays on TAAU (always available). The AMD FidelityFX denoise
+                // preset rewrites requested → FSR_3 above; explicit mode=fsr2 also selects FSR2.
                 candidate = TaaUpscaler.tryCreate();
                 if (candidate != null) {
                     requestedReason = "auto: → TAAU (pure compute)";
+                }
+            }
+            default -> {
+                // XESS / DLSS_RR etc. currently fall through to TAAU until their shims land.
+                candidate = TaaUpscaler.tryCreate();
+                if (candidate != null) {
+                    requestedReason = requested.key + " → TAAU (requested backend not wired)";
                 }
             }
         }

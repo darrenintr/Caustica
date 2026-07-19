@@ -1,0 +1,89 @@
+#version 460
+//
+// AMD FidelityFX CAS-style sharpen (lightweight).
+// Contrast Adaptive Sharpening approximation for HDR display-res plates.
+// Runs after FSR2 / TAAU upscale. Pure compute, no native SDK.
+//
+// Push constants:
+//   sharpness  in [0,1]  — 0 = identity, 1 = strong
+//   width/height of the image
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Match RtContext.HDR_RADIANCE_FORMAT (B10G11R11) used by rrOutput / beauty plates.
+layout(set = 0, binding = 0, r11f_g11f_b10f) readonly  uniform image2D inColor;
+layout(set = 0, binding = 1, r11f_g11f_b10f) writeonly uniform image2D outColor;
+
+layout(push_constant) uniform CasParams {
+    int   width;
+    int   height;
+    float sharpness; // 0..1
+    float _pad;
+} pc;
+
+// Peak HDR soft clamp so sharpen does not explode fireflies.
+const float HDR_SOFT_CAP = 64.0;
+
+vec3 load(ivec2 p) {
+    p = clamp(p, ivec2(0), ivec2(pc.width - 1, pc.height - 1));
+    return imageLoad(inColor, p).rgb;
+}
+
+float luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.width || p.y >= pc.height) {
+        return;
+    }
+
+    float sharp = clamp(pc.sharpness, 0.0, 1.0);
+    vec3 c = load(p);
+    if (sharp <= 1e-4) {
+        imageStore(outColor, p, vec4(c, 1.0));
+        return;
+    }
+
+    // 3x3 cross + corners for contrast adaptive amount (CAS-like).
+    vec3 n  = load(p + ivec2( 0, -1));
+    vec3 s  = load(p + ivec2( 0,  1));
+    vec3 e  = load(p + ivec2( 1,  0));
+    vec3 w  = load(p + ivec2(-1,  0));
+    vec3 ne = load(p + ivec2( 1, -1));
+    vec3 nw = load(p + ivec2(-1, -1));
+    vec3 se = load(p + ivec2( 1,  1));
+    vec3 sw = load(p + ivec2(-1,  1));
+
+    vec3 mn = min(c, min(min(n, s), min(e, w)));
+    mn = min(mn, min(min(ne, nw), min(se, sw)));
+    vec3 mx = max(c, max(max(n, s), max(e, w)));
+    mx = max(mx, max(max(ne, nw), max(se, sw)));
+
+    // Adaptive weight: less sharpen on high-contrast edges, more on flat regions.
+    vec3 amp = clamp(min(mn, vec3(2.0) - mx) / max(mx, vec3(1e-4)), 0.0, 1.0);
+    // Shape: peak around mid-contrast, fall off at extremes.
+    amp = inversesqrt(amp);
+    amp = clamp(amp * (1.0 / 8.0), 0.0, 1.0);
+
+    // CAS peak weight scale; sharpness remaps 0..1 → 0..-0.2-ish filter lobe.
+    float peak = -0.125 - 0.075 * sharp; // classic CAS range roughly [-0.125, -0.2]
+    vec3 wgt = amp * peak;
+
+    // 5-tap cross filter (center + 4-neigh).
+    // out = (n+s+e+w)*w + c*(1+4*(-w wait)) with w negative peak.
+    // Using CAS form: (w*(n+e+s+w) + c) / (1 + 4*w) with w in (peak..0).
+    vec3 num = (n + e + s + w) * wgt + c;
+    vec3 den = vec3(1.0) + 4.0 * wgt;
+    vec3 sharpened = num / max(den, vec3(1e-4));
+
+    // Soft HDR clamp
+    float L = luma(sharpened);
+    if (L > HDR_SOFT_CAP) {
+        sharpened *= HDR_SOFT_CAP / L;
+    }
+    sharpened = max(sharpened, vec3(0.0));
+
+    imageStore(outColor, p, vec4(sharpened, 1.0));
+}

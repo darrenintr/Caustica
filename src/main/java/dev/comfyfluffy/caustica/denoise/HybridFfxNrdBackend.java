@@ -327,8 +327,10 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
             return;
         }
         destroyImages();
-        beautyRawCopy = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid beauty raw");
-        ffxPlate = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid ffx plate");
+        // Beauty plates match the RT output format (B10G11R11). NRD intermediate packs stay RGBA16F
+        // (YCoCg + normHitDist / signed normal).
+        beautyRawCopy = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "hybrid beauty raw");
+        ffxPlate = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "hybrid ffx plate");
         nrdDiffuse = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid nrd diffuse");
         nrdSpecular = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid nrd specular");
         viewZ = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R32_SFLOAT, "hybrid nrd viewZ");
@@ -344,7 +346,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         dummyShadowClean = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16_SFLOAT,
                 "nrd dummy shadow clean");
         transparencyMask = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R8_UNORM, "transparency mask");
-        transparentResult = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "transparent denoised");
+        transparentResult = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "transparent denoised");
         this.width = width;
         this.height = height;
         nrdHardReset = true;

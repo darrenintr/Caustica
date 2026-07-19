@@ -251,6 +251,14 @@ public final class RtContext {
         }
     }
 
+    /**
+     * Packed 32-bit unsigned HDR for pure RGB radiance plates (beauty / firefly / denoise out /
+     * temporal accum visible). Half the bandwidth of RGBA16F on the RX 7600's narrow bus; no alpha
+     * channel, so anything that stores signed data or hitDist/depth in .a must stay RGBA16F.
+     * GLSL layout qualifier: {@code r11f_g11f_b10f}.
+     */
+    public static final int HDR_RADIANCE_FORMAT = VK10.VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+
     /** Create an R8G8B8A8_UNORM storage image (STORAGE + TRANSFER_SRC/DST) already transitioned to GENERAL. */
     public RtImage createStorageImage(int width, int height) {
         return createStorageImage(width, height, VK10.VK_FORMAT_R8G8B8A8_UNORM);
@@ -258,9 +266,9 @@ public final class RtContext {
 
     /**
      * Create a storage image of the given format (STORAGE + TRANSFER_SRC/DST), transitioned to GENERAL.
-     * The RT trace target uses an HDR float format (R16G16B16A16_SFLOAT) so radiance values above 1 are
-     * preserved for the tonemap seam; the world-target copy stays R8G8B8A8 to match vanilla's LDR target
-     * for the vkCmdCopyImage round-trip (copy requires texel-size-compatible formats).
+     * Pure radiance plates use {@link #HDR_RADIANCE_FORMAT} (B10G11R11_UFLOAT, 32bpp); signed guides
+     * (normal/motion) and multi-channel packs stay R16G16B16A16_SFLOAT. The world-target copy stays
+     * R8G8B8A8 to match vanilla's LDR target for the vkCmdCopyImage round-trip.
      */
     public RtImage createStorageImage(int width, int height, int format) {
         return createStorageImage(width, height, format, "storage image " + width + "x" + height);

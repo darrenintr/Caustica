@@ -580,6 +580,8 @@ public final class CausticaConfig {
                     case OFF -> UpscalerSelector.Mode.OFF;
                     case AUTO -> UpscalerSelector.Mode.AUTO;
                     case TAAU -> UpscalerSelector.Mode.TAAU;
+                    // Classic FSR2 reports as FSR_3 in the selector (same quality path key in overlay).
+                    case FSR2 -> UpscalerSelector.Mode.FSR_3;
                 };
             }
             return UpscalerSelector.Mode.AUTO;
@@ -865,11 +867,12 @@ public final class CausticaConfig {
          *   <li>{@code AUTO}/{@code HYBRID} — FFX shadow+reflection prepass, then NRD REBLUR</li>
          *   <li>{@code NRD} — NRD REBLUR only (raw layers, no FFX; Radiance-style)</li>
          *   <li>{@code FFX} — Official FFX shadow+reflection only</li>
+         *   <li>{@code AMD_FIDELITYFX} — FidelityFX preset: FFX only (no NRD); pair with FSR2</li>
          *   <li>{@code OFF} — raw path-traced color</li>
          * </ul>
          *
-         * <p>Legacy aliases: {@code "svgf"} and {@code "on"} map to {@code FFX}; the
-         * legacy sigma/temporal config keys are dropped (each backend owns its tuning).
+         * <p>Aliases: {@code "on"}/{@code "ffx-official"} → FFX;
+         * {@code "amd-fidelityfx"}/{@code "fidelityfx"}/{@code "ffx-fsr"} → AMD_FIDELITYFX.
          */
         public static final class Denoise {
             public static final EnumSetting<DenoiserKind> MODE = enumSetting(
@@ -1140,11 +1143,17 @@ public final class CausticaConfig {
     }
 
     /** Upscaler mode (config). The {@code UpscalerSelector.Mode} enum is the resolved mode; this one is the
-     *  user-requested mode. Only TAAU is available — pure compute, no SDK, works on every Vulkan GPU. */
+     *  user-requested mode. */
     public enum UpscalerMode {
         OFF("off"),
         AUTO("auto"),
-        TAAU("taau");
+        /** Pure-compute TAAU — always available, no native SDK. */
+        TAAU("taau"),
+        /**
+         * Classic FSR 2.2 Vulkan ({@code libffx_fsr2_caustica.so}). Preferred partner for the
+         * {@link DenoiserKind#AMD_FIDELITYFX} preset.
+         */
+        FSR2("fsr2");
 
         final String key;
         UpscalerMode(String key) { this.key = key; }
@@ -1155,9 +1164,15 @@ public final class CausticaConfig {
             for (UpscalerMode m : values()) {
                 if (m.key.equalsIgnoreCase(s) || m.name().equalsIgnoreCase(s)) return m;
             }
-            // Tolerate legacy keys so old caustica.toml doesn't crash on load.
-            if (s.equalsIgnoreCase("dlss-rr") || s.equalsIgnoreCase("fsr-3") || s.equalsIgnoreCase("fsr-4")
-                    || s.equalsIgnoreCase("xess") || s.equalsIgnoreCase("nis")) return AUTO;
+            // Tolerate legacy / alias keys so old caustica.toml doesn't crash on load.
+            if (s.equalsIgnoreCase("fsr-3") || s.equalsIgnoreCase("fsr3")
+                    || s.equalsIgnoreCase("fsr-2") || s.equalsIgnoreCase("fsr")) {
+                return FSR2;
+            }
+            if (s.equalsIgnoreCase("dlss-rr") || s.equalsIgnoreCase("fsr-4")
+                    || s.equalsIgnoreCase("xess") || s.equalsIgnoreCase("nis")) {
+                return AUTO;
+            }
             return AUTO;
         }
     }
@@ -1170,12 +1185,15 @@ public final class CausticaConfig {
         AUTO("auto"),
         /** Official FFX shadow+reflection composite only. */
         FFX("ffx"),
+        /**
+         * AMD FidelityFX preset: official FFX shadow+reflection only (no NRD). Intended to pair with
+         * FSR2 upscaling for a lighter AMD-friendly stack.
+         */
+        AMD_FIDELITYFX("amd-fidelityfx"),
         /** NRD REBLUR only — no FFX prepass (Radiance-style). */
         NRD("nrd"),
         /** Explicit hybrid cascade (same as AUTO). */
-        HYBRID("hybrid"),
-        /** SVGF (Spatiotemporal Variance-Guided Filtering) — pure shader denoiser. */
-        SVGF("svgf");
+        HYBRID("hybrid");
 
         final String key;
         DenoiserKind(String key) { this.key = key; }
@@ -1187,7 +1205,11 @@ public final class CausticaConfig {
             for (DenoiserKind k : values()) {
                 if (k.key.equals(t) || k.name().equalsIgnoreCase(s)) return k;
             }
-            if (t.equals("on") || t.equals("ffx-official")) return FFX;
+            if (t.equals("on") || t.equals("ffx-official") || t.equals("svgf")) return FFX;
+            if (t.equals("amd_fidelityfx") || t.equals("fidelityfx") || t.equals("ffx-fsr")
+                    || t.equals("amd-ffx")) {
+                return AMD_FIDELITYFX;
+            }
             if (t.equals("ffx-nrd") || t.equals("hybrid-ffx-nrd")) return HYBRID;
             return AUTO;
         }

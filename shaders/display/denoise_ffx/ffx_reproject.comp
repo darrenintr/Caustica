@@ -9,7 +9,10 @@
 //
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba16f) readonly uniform image2D inColor;
+// inColor is pure RGB beauty (B10G11R11). outReprojected stays rgba16f so .a can
+// carry current device depth for the resolve pass's disocclusion test; history
+// sampled via samplerPrev also packs depth into .a.
+layout(set = 0, binding = 0, r11f_g11f_b10f) readonly uniform image2D inColor;
 layout(set = 0, binding = 1, rgba16f) readonly uniform image2D inNormal;
 layout(set = 0, binding = 2, r32f)    readonly uniform image2D inDepth;
 layout(set = 0, binding = 3, rgba16f) readonly uniform image2D inMotion;

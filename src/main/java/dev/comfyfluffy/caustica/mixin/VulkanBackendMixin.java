@@ -49,6 +49,12 @@ public abstract class VulkanBackendMixin {
 			new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderStorageImageWriteWithoutFormat",
 					VkPhysicalDeviceFeatures.SHADERSTORAGEIMAGEWRITEWITHOUTFORMAT);
 	private static final List<VulkanFeature> SDK_SHADER_FEATURES = List.of(
+			// The packed B10G11R11 HDR beauty chain is declared as r11f_g11f_b10f storage
+			// images in GLSL. Format support alone is insufficient: Vulkan also requires this
+			// core feature to be enabled at vkCreateDevice time. RADV correctly treats use
+			// without it as invalid and the affected RT plate commonly reads back as black.
+			new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderStorageImageExtendedFormats",
+					VkPhysicalDeviceFeatures.SHADERSTORAGEIMAGEEXTENDEDFORMATS),
 			STORAGE_IMAGE_WRITE_WITHOUT_FORMAT,
 			new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderInt16", VkPhysicalDeviceFeatures.SHADERINT16),
 			new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "shaderFloat16", VkPhysicalDeviceVulkan12Features.SHADERFLOAT16));

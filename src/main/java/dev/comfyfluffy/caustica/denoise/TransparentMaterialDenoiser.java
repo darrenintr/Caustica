@@ -85,8 +85,9 @@ public final class TransparentMaterialDenoiser {
         }
 
         destroyImages();
-        spatialTemp = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "transparent spatial temp");
-        historyColor = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "transparent history color");
+        // Pure RGB plates — match the beauty chain (B10G11R11). Depth stays a separate R32F image.
+        spatialTemp = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "transparent spatial temp");
+        historyColor = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "transparent history color");
         historyDepth = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R32_SFLOAT, "transparent history depth");
 
         this.width = width;

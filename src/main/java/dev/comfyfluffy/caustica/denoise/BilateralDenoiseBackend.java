@@ -28,6 +28,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
+import java.util.Arrays;
 
 import static dev.comfyfluffy.caustica.rt.RtContext.check;
 
@@ -54,7 +55,8 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
 
     private long dsl;
     private long pool;
-    private long set;
+    private long[] sets = new long[0];
+    private long[][] boundViews = new long[0][];
     private long layout;
     private long pipeline;
     private RtImage temp;
@@ -109,7 +111,7 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
             temp.destroy();
             temp = null;
         }
-        temp = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "bilateral temp");
+        temp = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "bilateral temp");
         this.width = width;
         this.height = height;
     }
@@ -138,7 +140,8 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
                 src = outColor;
                 dst = temp;
             }
-            bind(ctx, src, inNormal, inDepth, dst);
+            long set = sets[pass];
+            bind(ctx, pass, set, src, inNormal, inDepth, dst);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, label + " p" + pass)) {
                 VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
                 VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, stack.longs(set), null);
@@ -185,7 +188,8 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
         layout = 0L;
         pool = 0L;
         dsl = 0L;
-        set = 0L;
+        sets = new long[0];
+        boundViews = new long[0][];
     }
 
     @Override
@@ -222,16 +226,22 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
             dsl = p.get(0);
 
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(1, stack);
-            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(4);
-            VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(1).pPoolSizes(poolSizes);
+            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(4 * passes);
+            VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default()
+                    .maxSets(passes).pPoolSizes(poolSizes);
             check(VK10.vkCreateDescriptorPool(ctx.vk(), dpci, null, p), "vkCreateDescriptorPool(bilateral)");
             pool = p.get(0);
 
-            VkDescriptorSetAllocateInfo dsai = VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
-                    .descriptorPool(pool).pSetLayouts(stack.longs(dsl));
-            LongBuffer pSet = stack.mallocLong(1);
-            check(VK10.vkAllocateDescriptorSets(ctx.vk(), dsai, pSet), "vkAllocateDescriptorSets(bilateral)");
-            set = pSet.get(0);
+            sets = new long[passes];
+            boundViews = new long[passes][];
+            for (int i = 0; i < passes; i++) {
+                VkDescriptorSetAllocateInfo dsai = VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
+                        .descriptorPool(pool).pSetLayouts(stack.longs(dsl));
+                LongBuffer pSet = stack.mallocLong(1);
+                check(VK10.vkAllocateDescriptorSets(ctx.vk(), dsai, pSet),
+                        "vkAllocateDescriptorSets(bilateral p" + i + ")");
+                sets[i] = pSet.get(0);
+            }
 
             VkPushConstantRange.Buffer pcr = VkPushConstantRange.calloc(1, stack)
                     .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(16);
@@ -251,7 +261,12 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
         }
     }
 
-    private void bind(RtContext ctx, RtImage inColor, RtImage inNormal, RtImage inDepth, RtImage outColor) {
+    private void bind(RtContext ctx, int pass, long set,
+                      RtImage inColor, RtImage inNormal, RtImage inDepth, RtImage outColor) {
+        long[] views = {inColor.view, inNormal.view, inDepth.view, outColor.view};
+        if (Arrays.equals(boundViews[pass], views)) {
+            return;
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             RtImage[] images = {inColor, inNormal, inDepth, outColor};
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(4, stack);
@@ -263,6 +278,7 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
             }
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
         }
+        boundViews[pass] = views;
     }
 
     private static long loadModule(VkDevice vk, MemoryStack stack, String name) {

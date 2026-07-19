@@ -1,0 +1,58 @@
+// Fail-open guard after classic FSR2.
+// FSR can return FFX_OK while writing a pure-black plate (bad exposure flags /
+// format mismatch on RADV). If the FSR output has no energy but the packed
+// input beauty still has signal, replace the display plate with a nearest
+// upsample of the input so the user never sees a permanent black screen.
+//
+// This is deliberately per-pixel. The old implementation repeated the same 4x4
+// global probe in every invocation (32 extra image loads per display pixel), which
+// was both expensive on RDNA3 and could miss signal between sparse probe points.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f)          readonly  uniform image2D gFsrRgba; // display-res FSR output
+layout(binding = 1, rgba16f)          readonly  uniform image2D gInRgba;  // render-res packed beauty
+layout(binding = 2, r11f_g11f_b10f) writeonly uniform image2D gOut;      // display-res B10 plate
+
+layout(push_constant) uniform Push {
+    int displayW;
+    int displayH;
+    int renderW;
+    int renderH;
+} pc;
+
+float luma(vec3 c) {
+    float l = dot(max(c, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+    // NaN/Inf must count as 0 so a pure-NaN FSR plate still trips blackout.
+    return (isnan(l) || isinf(l)) ? 0.0 : l;
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= pc.displayW || pix.y >= pc.displayH) {
+        return;
+    }
+
+    vec2 uv = (vec2(pix) + 0.5) / vec2(float(max(pc.displayW, 1)), float(max(pc.displayH, 1)));
+    ivec2 src = ivec2(clamp(
+            floor(uv * vec2(float(pc.renderW), float(pc.renderH))),
+            vec2(0.0),
+            vec2(float(max(pc.renderW - 1, 0)), float(max(pc.renderH - 1, 0)))));
+    vec3 fsrRgb = max(imageLoad(gFsrRgba, pix).rgb, vec3(0.0));
+    vec3 inputRgb = max(imageLoad(gInRgba, src).rgb, vec3(0.0));
+
+    // Prefer the nearest input only where FSR produced no usable energy despite a
+    // visible source sample. This catches whole-frame black output and isolated NaNs
+    // with two reads per pixel while preserving genuinely black source regions.
+    bool blackout = luma(fsrRgb) < 1.0e-4 && luma(inputRgb) > 1.0e-3;
+    vec3 rgb = blackout ? inputRgb : fsrRgb;
+    if (any(isnan(rgb)) || any(isinf(rgb))) {
+        // Last resort: use the already loaded input for this pixel.
+        rgb = inputRgb;
+        if (any(isnan(rgb)) || any(isinf(rgb))) {
+            rgb = vec3(0.0);
+        }
+    }
+    imageStore(gOut, pix, vec4(rgb, 1.0));
+}

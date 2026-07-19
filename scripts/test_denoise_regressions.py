@@ -41,14 +41,115 @@ def test_denoise_mode_enum_exposes_auto_ffx_nrd_off() -> None:
     src = read("src/main/java/dev/comfyfluffy/caustica/CausticaConfig.java")
     assert "enum DenoiserKind" in src, "CausticaConfig must declare a DenoiserKind enum"
     body = method_body(src, "public enum DenoiserKind")
-    for name in ("AUTO", "FFX", "NRD", "OFF"):
+    for name in ("AUTO", "FFX", "NRD", "OFF", "AMD_FIDELITYFX"):
         assert name in body, f"DenoiserKind must contain {name}"
+    assert '"amd-fidelityfx"' in body, (
+        "AMD_FIDELITYFX must publish the config key 'amd-fidelityfx'"
+    )
     assert 'EnumSetting<DenoiserKind> MODE = enumSetting(' in src, (
         "Rt.Denoise.MODE must be an EnumSetting<DenoiserKind> (not the legacy StringSetting)"
     )
     assert '"caustica.rt.denoise.mode"' in src, (
         "denoise mode must keep the legacy config key caustica.rt.denoise.mode"
     )
+
+
+def test_ffx_p0_official_alignment_assets() -> None:
+    """P0: shadow prepare/hitmask, variance-aware reproject/spatial, depth hierarchy."""
+    for name in (
+        "shadow_prepare.comp",
+        "shadow_reproject.comp",
+        "shadow_spatial.comp",
+        "depth_pyramid.comp",
+        "reflection_reproject.comp",
+        "denoise_composite.comp",
+    ):
+        p = ROOT / "shaders/display/denoise_ffx" / name
+        assert p.is_file(), f"missing P0 FFX shader {name}"
+    prep = (ROOT / "shaders/display/denoise_ffx/shadow_prepare.comp").read_text(encoding="utf-8")
+    assert "8x4" in prep or "8 x 4" in prep or "lid.y * 8" in prep
+    assert "r32ui" in prep and "gHitMask" in prep
+    repro = (ROOT / "shaders/display/denoise_ffx/shadow_reproject.comp").read_text(encoding="utf-8")
+    assert "variance" in repro and "gHitMask" in repro
+    # Anti-ghost: moving contact shadows must not leave dark trails.
+    assert "motionReject" in repro, "shadow reproject must reject history under large motion"
+    assert "curShadow - 0.08" in repro, (
+        "shadow reproject must clamp against darkening trails on lit samples"
+    )
+    assert "(curShadow - histShadow) > 0.25" in repro, (
+        "shadow reproject must hard-reject darker history (entity contact ghost)"
+    )
+    spat = (ROOT / "shaders/display/denoise_ffx/shadow_spatial.comp").read_text(encoding="utf-8")
+    assert "cVar" in spat or "variance" in spat
+    comp = (ROOT / "shaders/display/denoise_ffx/denoise_composite.comp").read_text(encoding="utf-8")
+    assert "rawS - 0.06" in comp or "rawS - 0.10" in comp or "rawS - 0.1" in comp, (
+        "denoise composite must not allow large darkening deltas (player shadow ghosts)"
+    )
+    pyr = (ROOT / "shaders/display/denoise_ffx/depth_pyramid.comp").read_text(encoding="utf-8")
+    assert "gSrc" in pyr and "gDst" in pyr
+    rf = (ROOT / "shaders/display/denoise_ffx/reflection_reproject.comp").read_text(encoding="utf-8")
+    assert "gDepthMip1" in rf and "sampleDepthHierarchy" in rf
+    backend = read("src/main/java/dev/comfyfluffy/caustica/denoise/OfficialFfxDenoiseBackend.java")
+    assert "shadow_prepare.comp.spv" in backend
+    assert "depth_pyramid.comp.spv" in backend
+    assert "return ready;" in backend  # isReady must not be hard-false
+    assert "return false;" not in method_body(backend, "public boolean isReady()")
+
+
+def test_amd_fidelityfx_preset_skips_nrd_and_pairs_fsr() -> None:
+    """AMD FidelityFX Phase A = FFX + residual (no NRD) + FSR2 + CAS; no beauty TAA stack."""
+    selector = read("src/main/java/dev/comfyfluffy/caustica/denoise/DenoiseBackendSelector.java")
+    assert "AMD_FIDELITYFX" in selector and "AmdFidelityFxDenoiseBackend" in selector, (
+        "DenoiseBackendSelector must route AMD_FIDELITYFX to AmdFidelityFxDenoiseBackend"
+    )
+    # FFX-only now also uses residual polish (SPP-1 GI grain without NRD is unusable).
+    ffx_body = method_body(selector, "private static CausticaDenoiseBackend pick")
+    assert "DenoiserKind.FFX" in ffx_body and "AmdFidelityFxDenoiseBackend" in ffx_body, (
+        "DenoiseBackendSelector must route FFX mode to AmdFidelityFxDenoiseBackend (residual GI polish)"
+    )
+    assert "HybridFfxNrdBackend" in selector  # NRD path still exists for other modes
+    backend = read("src/main/java/dev/comfyfluffy/caustica/denoise/AmdFidelityFxDenoiseBackend.java")
+    assert "OfficialFfxDenoiseBackend" in backend and "BilateralDenoiseBackend" in backend, (
+        "AmdFidelityFxDenoiseBackend must compose Official FFX + residual polish"
+    )
+    assert "NrdRuntime" not in backend and "HybridFfxNrdBackend" not in backend, (
+        "AMD FidelityFX preset must not pull NRD"
+    )
+    upsel = read("src/main/java/dev/comfyfluffy/caustica/upscale/UpscalerSelector.java")
+    assert "AMD_FIDELITYFX" in upsel and "Fsr2ClassicUpscaler" in upsel, (
+        "UpscalerSelector must force/prefer FSR2 when denoise preset is AMD_FIDELITYFX"
+    )
+    assert "forcing upscaler partner to FSR2" in upsel, (
+        "AMD FidelityFX must force FSR2 partner (not only when AUTO)"
+    )
+    fsr = read("src/main/java/dev/comfyfluffy/caustica/fsr/Fsr2ClassicUpscaler.java")
+    assert "fsr_blackout_guard" in fsr or "GUARD_SPV" in fsr, (
+        "FSR2 must ship a blackout fail-open guard"
+    )
+    assert (ROOT / "shaders/display/fsr_blackout_guard.comp").is_file(), (
+        "missing shaders/display/fsr_blackout_guard.comp"
+    )
+    assert "consumeBlackoutFailOpen" in read(
+        "src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java"
+    ), "RtComposite must fail-open blit when FSR2 blackout is latched"
+    cfg = read("src/main/java/dev/comfyfluffy/caustica/CausticaConfig.java")
+    assert 'FSR2("fsr2")' in cfg or 'FSR2("fsr2")' in method_body(cfg, "public enum UpscalerMode"), (
+        "UpscalerMode must expose FSR2 so the preset can request classic FSR"
+    )
+    composite = read("src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java")
+    body = method_body(composite, "private static boolean caustica$denoiseEnabled()")
+    assert "AMD_FIDELITYFX" in body, (
+        "caustica$denoiseEnabled must treat AMD_FIDELITYFX as an active forced denoise mode"
+    )
+    taa_body = method_body(composite, "private static boolean temporalAccumEnabled")
+    assert "AMD_FIDELITYFX" in taa_body and "return false" in taa_body, (
+        "temporalAccumEnabled must hard-disable beauty TAA for the AMD FidelityFX preset"
+    )
+    assert "CasSharpenPass" in composite and "casSharpen" in composite, (
+        "RtComposite must run CAS after upscale for the FidelityFX stack"
+    )
+    assert (ROOT / "shaders/display/cas.comp").is_file(), "CAS compute shader must exist"
+    assert (ROOT / "src/main/java/dev/comfyfluffy/caustica/display/CasSharpenPass.java").is_file()
 
 
 def test_denoise_mode_legacy_svgf_alias_maps_to_ffx() -> None:
@@ -60,7 +161,7 @@ def test_denoise_mode_legacy_svgf_alias_maps_to_ffx() -> None:
 
 def test_denoise_backends_export_interface() -> None:
     iface = read("src/main/java/dev/comfyfluffy/caustica/denoise/CausticaDenoiseBackend.java")
-    for sig in ("String name()", "void dispatch(", "void ensureSized(", "void destroy()", "boolean isReady()"):
+    for sig in ("String name()", "boolean dispatch(", "void ensureSized(", "void destroy()", "boolean isReady()"):
         assert sig in iface, f"CausticaDenoiseBackend must declare {sig}"
     for name in ("FfxDenoiseBackend.java", "NrdReBlurBackend.java", "NoopDenoiseBackend.java"):
         body = read(f"src/main/java/dev/comfyfluffy/caustica/denoise/{name}")
@@ -86,12 +187,11 @@ def test_denoise_rt_composite_owns_dispatch_via_selector() -> None:
     # accumulation ran) or `output` (raw noisy trace when it didn't). The variable name
     # denoiseInput is the contract — the assignment chain must mention both accumulatedColor
     # and output so a reader can see the temporal-precedence rule in one place.
-    assert "backend.dispatch(stack, cmd, denoiseInput, gNormal, gDepth, gMotion," in src, (
-        "RtComposite must invoke the resolved backend's dispatch(... denoiseInput, inNormal, inDepth, inMotion, mvScaleX, mvScaleY, outColor)"
+    assert "backend.dispatch(stack, cmd, output, gNormal, gDepth, gMotion," in src, (
+        "RtComposite must invoke the resolved backend with raw RT output and guide buffers"
     )
-    assert "RtImage denoiseInput = temporalAccumRan ? accumulatedColor : output" in src, (
-        "the denoiseInput assignment must show the temporal-precedence rule "
-        "(temporal-accum output supersedes raw noisy trace)"
+    assert "RtImage denoiseInput = temporalAccumRan ? accumulatedColor : output" not in src, (
+        "RtComposite must not stack beauty TAA ahead of a temporal denoiser"
     )
     assert "RtDenoisePass" not in src, "RtDenoisePass is deleted; the legacy class must not be referenced"
     assert "historyColor(" not in src and "historyDepth(" not in src and "historyNormal(" not in src, (
@@ -643,7 +743,7 @@ def test_ffx_default_is_spatial_only_no_temporal_ghosts() -> None:
         f"Got {p.group(1)}."
     )
     assert "vkCmdCopyImage" in ffx, (
-        "passthrough must use vkCmdCopyImage (not blit) for rgba16f reliability"
+        "passthrough must use vkCmdCopyImage (not blit) for HDR beauty reliability"
     )
 
 
@@ -726,9 +826,69 @@ def test_debug_overlay_uses_canonical_stage_names() -> None:
     )
 
 
+
+
+def test_fsr2_declares_required_storage_format_feature_and_valid_depth_range() -> None:
+    """Packed HDR storage and reverse-infinite depth must satisfy their Vulkan/FSR contracts."""
+    pack = ROOT / "shaders/display/fsr_color_pack.comp"
+    unpack = ROOT / "shaders/display/fsr_color_unpack.comp"
+    assert pack.is_file() and unpack.is_file(), "FSR2 pack/unpack convert shaders must exist"
+    pack_src = pack.read_text(encoding="utf-8")
+    unpack_src = unpack.read_text(encoding="utf-8")
+    assert "r11f_g11f_b10f" in pack_src and "rgba16f" in pack_src
+    assert "vec4(rgb, 1.0)" in pack_src, "pack must initialize the RGBA16F staging alpha"
+    assert "rgba16f" in unpack_src and "r11f_g11f_b10f" in unpack_src
+    up = read("src/main/java/dev/comfyfluffy/caustica/fsr/Fsr2ClassicUpscaler.java")
+    assert "fsr_color_pack.comp.spv" in up and "fsr_color_unpack.comp.spv" in up
+    assert "vkCmdBlitImage" not in up, "FSR2 must not raw-blit incompatible B10G11R11/RGBA16F formats"
+    assert "1_000_000.0f" in up, (
+        "reverse-infinite FSR2 dispatch must pass a non-zero far sentinel; far=0 collapses depth reconstruction"
+    )
+    device = read("src/main/java/dev/comfyfluffy/caustica/mixin/VulkanBackendMixin.java")
+    assert "shaderStorageImageExtendedFormats" in device, (
+        "r11f_g11f_b10f storage images require shaderStorageImageExtendedFormats at vkCreateDevice"
+    )
+    guard = read("shaders/display/fsr_blackout_guard.comp")
+    assert "for (int gy" not in guard and "for (int gx" not in guard, (
+        "blackout guard must not repeat a global sparse probe for every display pixel"
+    )
+    composite = read("shaders/display/denoise_ffx/denoise_composite.comp")
+    assert "rawS + 0.12" in composite or "cleanS = min(cleanS, rawS" in composite, (
+        "shadow composite must clamp brightening so contact shadows are not washed out"
+    )
+
+
+def test_multi_dispatch_passes_do_not_mutate_one_descriptor_set() -> None:
+    """Each distinct binding tuple recorded in one command buffer needs its own descriptor set."""
+    official = read("src/main/java/dev/comfyfluffy/caustica/denoise/OfficialFfxDenoiseBackend.java")
+    for sets in ("shSpatSets", "depthPyrSets", "rfSpatSets", "compSets"):
+        assert f"long[] {sets}" in official, (
+            f"Official FFX must allocate multiple descriptor sets for {sets}"
+        )
+    assert "descriptorBindings" in official, (
+        "Official FFX must avoid updating stable sets that may still be in flight"
+    )
+    bilateral = read("src/main/java/dev/comfyfluffy/caustica/denoise/BilateralDenoiseBackend.java")
+    assert "long[] sets" in bilateral and "sets[pass]" in bilateral, (
+        "bilateral ping-pong passes must not rewrite a single descriptor set"
+    )
+    amd = read("src/main/java/dev/comfyfluffy/caustica/denoise/AmdFidelityFxDenoiseBackend.java")
+    assert amd.count("residual.dispatch(") == 1, (
+        "AMD residual must not invoke and rebind the same backend twice in one command buffer"
+    )
+    fsr = read("src/main/java/dev/comfyfluffy/caustica/fsr/Fsr2ClassicUpscaler.java")
+    assert "long[] convSets" in fsr and "convSets[setIndex]" in fsr, (
+        "FSR pack and unpack must use distinct descriptor sets"
+    )
+
+
 if __name__ == "__main__":
     tests = [
         test_denoise_mode_enum_exposes_auto_ffx_nrd_off,
+        test_ffx_p0_official_alignment_assets,
+        test_amd_fidelityfx_preset_skips_nrd_and_pairs_fsr,
+        test_fsr2_declares_required_storage_format_feature_and_valid_depth_range,
+        test_multi_dispatch_passes_do_not_mutate_one_descriptor_set,
         test_denoise_mode_legacy_svgf_alias_maps_to_ffx,
         test_denoise_backends_export_interface,
         test_denoise_selector_resolves_via_vendor_for_auto,

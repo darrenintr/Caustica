@@ -190,6 +190,10 @@ public final class RtComposite {
         if (debugView() != 0) {
             return false;
         }
+        // AMD FidelityFX preset owns temporal via FFX history + FSR2; never stack beauty TAA.
+        if (CausticaConfig.Rt.Denoise.MODE.value() == CausticaConfig.DenoiserKind.AMD_FIDELITYFX) {
+            return false;
+        }
         if (!CausticaConfig.Rt.Composite.TEMPORAL_ACCUM.value()) {
             return false;
         }
@@ -286,6 +290,9 @@ public final class RtComposite {
     private RtBuffer[] pushRing;
     private int pushSlot;
     private RtDisplayPipeline displayPipeline;
+    /** FidelityFX CAS-style sharpen after upscale (display-res). */
+    private final dev.comfyfluffy.caustica.display.CasSharpenPass casSharpen =
+            new dev.comfyfluffy.caustica.display.CasSharpenPass();
     private RtImage output;
     // Denoised path-traced color (input to the upscaler / display pipeline). The path tracer writes the
     // raw noisy color into {@code output}; the active denoise backend reads {@code output} + the guide
@@ -912,7 +919,7 @@ public final class RtComposite {
         // lazily as terrain extraction encounters sprites and refresh via flush(). Fall back to the block
         // atlas view if an atlas didn't initialize so material bindings always hold a valid descriptor —
         // the shader only samples them when a prim is flagged (mat.z/mat.w), so the fallback is never read.
-        // materialBase = firstExtra(3)+GUIDE_COUNT(13)=16 → _s@16, _n@17, sky@18.
+        // materialBase = firstExtra(3)+GUIDE_COUNT(23)=26 → _s@26, _n@27, sky@28.
         if (worldPipeline.hasBlockMaterialAtlases()) {
             RtBlockMaterials.INSTANCE.reset();
             // Build the full _s/_n atlases now (parallel decode + blit), before terrain tessellates, so
@@ -971,6 +978,7 @@ public final class RtComposite {
         }
         if (mode != dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.AUTO) {
             return mode == dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.FFX
+                    || mode == dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.AMD_FIDELITYFX
                     || mode == dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.NRD
                     || mode == dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.HYBRID;
         }
@@ -1690,8 +1698,19 @@ public final class RtComposite {
                     try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "denoise:" + backend.name());
                          RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.denoise")) {
                         if (gShadowHit != null && gDiffuse != null && gReflection != null) {
-                            if (backend instanceof dev.comfyfluffy.caustica.denoise.OfficialFfxDenoiseBackend official) {
+                            if (backend instanceof dev.comfyfluffy.caustica.denoise.AmdFidelityFxDenoiseBackend amd) {
+                                amd.setSplitBuffers(gShadowHit, gDiffuse, gReflection);
+                                if (gUnshadowedDirect != null) {
+                                    amd.setUnshadowedDirect(gUnshadowedDirect);
+                                }
+                                if (gSpecMotion != null) {
+                                    amd.setSpecMotion(gSpecMotion);
+                                }
+                            } else if (backend instanceof dev.comfyfluffy.caustica.denoise.OfficialFfxDenoiseBackend official) {
                                 official.setSplitBuffers(gShadowHit, gDiffuse, gReflection);
+                                if (gUnshadowedDirect != null) {
+                                    official.setUnshadowedDirect(gUnshadowedDirect);
+                                }
                                 if (gSpecMotion != null) {
                                     official.setSpecMotion(gSpecMotion);
                                 }
@@ -1750,6 +1769,8 @@ public final class RtComposite {
                             lastNrdDispatchOk = hybrid.lastDispatchOk();
                             lastNrdComposeOk = hybrid.lastComposeOk();
                             lastDenoisePath = hybrid.lastPathLabel();
+                        } else if (backend instanceof dev.comfyfluffy.caustica.denoise.AmdFidelityFxDenoiseBackend amd) {
+                            lastDenoisePath = amd.lastPathLabel();
                         } else if (backend instanceof dev.comfyfluffy.caustica.denoise.OfficialFfxDenoiseBackend) {
                             lastDenoisePath = "ffx";
                         }
@@ -1837,6 +1858,14 @@ public final class RtComposite {
                             rrOutput, renderW, renderH, displayW, displayH,
                             fsrJx, fsrJy, frameViewRotation, frameProjection);
                 }
+                // Fail-open: FSR2 can return true/rc=0 while writing a pure-black plate
+                // (e.g. bad exposure flags / format mismatch). Detect and force blit fallback.
+                if (rrDone && activeUpscaler instanceof dev.comfyfluffy.caustica.fsr.Fsr2ClassicUpscaler fsr
+                        && fsr.consumeBlackoutFailOpen()) {
+                    rrDone = false;
+                    CausticaMod.LOGGER.warn(
+                            "FSR2 blackout detected — falling back to 1:1 blit this frame (and subsequent until healthy)");
+                }
             }
             lastUpscalerPath = (vendorTemporal || spatialUpscale) && rrDone;
             if (isDlssRr(activeUpscaler)) {
@@ -1858,6 +1887,23 @@ public final class RtComposite {
                 }
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // rrOutput visible to exposure histogram
+
+            // Optional CAS polish after upscale. FSR2 already runs RCAS — keep this mild and fail-open.
+            // Skip when upscaler didn't produce a plate (avoid sharpening garbage).
+            if (playablePath && debugView == 0
+                    && CausticaConfig.Rt.Upscaler.SHARPEN.value()
+                    && rrOutput != null
+                    && lastUpscalerPath) {
+                try {
+                    casSharpen.ensureSized(displayW, displayH);
+                    float sharpness = Math.min(0.45f, CausticaConfig.Rt.Upscaler.SHARPNESS.value() * 0.5f);
+                    if (casSharpen.dispatchInPlace(stack, cmd, rrOutput, sharpness)) {
+                        VulkanCommandEncoder.memoryBarrier(cmd, stack);
+                    }
+                } catch (Throwable t) {
+                    CausticaMod.LOGGER.warn("CAS sharpen threw; continuing without sharpen", t);
+                }
+            }
 
             // Auto-exposure meters rrOutput (the post-RR, denoised/converged image), not the raw
             // pre-RR trace: RR has no notion of exposure (DLSS-RR Integration Guide §3.7 — ignore
@@ -2170,6 +2216,7 @@ public final class RtComposite {
         DenoiseBackendSelector.invalidate();
         destroyGuideImages();
         exposure.destroy();
+        casSharpen.destroy();
         if (displayPipeline != null) {
             displayPipeline.destroy();
             displayPipeline = null;

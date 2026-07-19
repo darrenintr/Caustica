@@ -3,7 +3,7 @@
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(binding = 0, set = 0, rgba8) uniform writeonly image2D outputImage; // LDR world target image
-layout(binding = 1, set = 0, rgba16f) uniform readonly image2D rtImage; // HDR RT radiance
+layout(binding = 1, set = 0, r11f_g11f_b10f) uniform readonly image2D rtImage; // HDR RT radiance (B10G11R11)
 layout(binding = 2, set = 0, r32f) uniform readonly image2D exposureImage; // 1x1 linear exposure scale
 layout(binding = 3, set = 0, rgba16f) uniform writeonly image2D hdrImage; // PQ-encoded ([0,1], ST.2084) HDR display
 

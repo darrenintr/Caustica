@@ -37,7 +37,9 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba16f) readonly  uniform image2D inColorLow;
+// inColorLow is the beauty plate (B10G11R11). historyOut stays rgba16f so .a can
+// carry device depth for the next-frame disocclusion test (same contract as temporal_accumulate).
+layout(set = 0, binding = 0, r11f_g11f_b10f) readonly  uniform image2D inColorLow;
 layout(set = 0, binding = 1, r32f)    readonly  uniform image2D inDepthLow;
 layout(set = 0, binding = 2, rgba16f) readonly  uniform image2D inMotionLow;
 layout(set = 0, binding = 3, rgba16f) readonly  uniform image2D inNormalLow;
@@ -45,7 +47,7 @@ layout(set = 0, binding = 4, rgba16f) readonly  uniform image2D inAlbedoLow;
 
 layout(set = 0, binding = 5) uniform sampler2D historySampler;
 
-layout(set = 0, binding = 6, rgba16f) writeonly uniform image2D outColor;
+layout(set = 0, binding = 6, r11f_g11f_b10f) writeonly uniform image2D outColor;
 layout(set = 0, binding = 7, rgba16f) writeonly uniform image2D historyOut;
 
 layout(push_constant) uniform TaauParams {

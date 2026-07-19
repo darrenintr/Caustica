@@ -67,10 +67,6 @@ public final class DenoiseBackendSelector {
         if (mode == CausticaConfig.DenoiserKind.OFF) {
             return NoopDenoiseBackend.INSTANCE;
         }
-        // SVGF: pure shader denoiser (cross-vendor, no SDK dependency)
-        if (mode == CausticaConfig.DenoiserKind.SVGF) {
-            return tryCreate(new SvgfDenoiseBackend(), gpu, false);
-        }
         // AUTO: cross-vendor optimized selection based on GPU vendor
         if (mode == CausticaConfig.DenoiserKind.AUTO) {
             return autoPick(gpu);
@@ -83,8 +79,19 @@ public final class DenoiseBackendSelector {
         if (mode == CausticaConfig.DenoiserKind.NRD) {
             return tryCreate(new HybridFfxNrdBackend(true), gpu, false);
         }
+        // FFX-only: shadow+reflection + mild residual GI polish (no NRD).
+        // Pure OfficialFfx leaves secondary/GI grain and can wash contact shadows;
+        // AmdFidelityFx wraps the same FFX path with a residual bilateral for leftover noise.
         if (mode == CausticaConfig.DenoiserKind.FFX) {
-            return tryCreate(new OfficialFfxDenoiseBackend(), gpu, false);
+            CausticaMod.LOGGER.info("  → FFX shadow+reflection + residual GI polish (no NRD)");
+            return tryCreate(new AmdFidelityFxDenoiseBackend(), gpu, true);
+        }
+        // AMD FidelityFX preset: FFX shadow+reflection + residual GI polish. No NRD.
+        // UpscalerSelector forces FSR2 as the partner (unless user set upscaler OFF).
+        if (mode == CausticaConfig.DenoiserKind.AMD_FIDELITYFX) {
+            CausticaMod.LOGGER.info(
+                    "  → AMD FidelityFX stack (FFX shadow/refl + residual GI; forces FSR2 upscaler; no NRD)");
+            return tryCreate(new AmdFidelityFxDenoiseBackend(), gpu, true);
         }
         CausticaMod.LOGGER.warn("Denoise mode={} unavailable; using Noop (raw RT)", mode.key());
         return NoopDenoiseBackend.INSTANCE;

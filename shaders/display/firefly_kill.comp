@@ -17,12 +17,12 @@
 // with probability ~100%.
 //
 // 8x8 workgroups; one invocation per output pixel. Reads from binding 0,
-// writes to binding 1. Both are rgba16f at render resolution.
+// writes to binding 1. Both are r11f_g11f_b10f (32bpp pure RGB) at render resolution.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba16f) readonly  uniform image2D inRadiance;
-layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D outRadiance;
+layout(set = 0, binding = 0, r11f_g11f_b10f) readonly  uniform image2D inRadiance;
+layout(set = 0, binding = 1, r11f_g11f_b10f) writeonly uniform image2D outRadiance;
 
 void main() {
     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
