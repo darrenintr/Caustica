@@ -141,22 +141,23 @@ void main() {
     float sg = pc.surfaceGain > 0.0 ? pc.surfaceGain : 1.0;
     vec3 c;
 
-    // Transparent materials (glass/water/ice): use specialized denoiser result
+    // Particles still use the specialized transparent bilateral path.
+    // Water/glass dielectric interfaces are remodulated from NRD REBLUR like other surfaces
+    // so reflections stay temporally stable instead of being replaced by raw beauty.
     if (transMask > 0.5) {
         c = max(imageLoad(gTransparentDenoised, pix).rgb, vec3(0.0)) * sg;
         if (any(isnan(c)) || any(isinf(c))) {
             c = clear; // fallback to raw on failure
         }
-    } else if (rough <= kWater) {
-        // Water (legacy path, should be caught by transMask but kept for safety)
-        c = clear * sg;
-        if (any(isnan(c)) || any(isinf(c))) {
-            c = vec3(0.0);
-        }
     } else {
-        // All other surfaces: remodulate denoised irradiance with albedo
+        // Remodulate denoised irradiance with albedo (opaque + water/glass dielectric).
         vec3 diffAlb = max(imageLoad(gDiffAlbedo, pix).rgb, kMinDiffAlb);
         vec3 specAlb = max(imageLoad(gSpecAlbedo, pix).rgb, kMinSpecAlb);
+        // Soft floor for dielectric body fill so dark water columns don't zero out.
+        if (rough <= kSmooth) {
+            diffAlb = max(diffAlb, vec3(0.12));
+            specAlb = max(specAlb, vec3(0.04));
+        }
         vec2 demodulated = imageLoad(gDemodulationMask, pix).rg;
         vec3 diff = yCoCgToLinear(imageLoad(gDiff, pix).xyz);
         if (demodulated.r > 0.5) diff *= diffAlb;

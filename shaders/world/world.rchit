@@ -123,6 +123,8 @@ const uint MATERIAL_OPAQUE = 0u;
 const uint MATERIAL_WATER = 1u;
 const uint MATERIAL_PARTICLE = 2u;
 const uint MATERIAL_GLASS = 3u;
+// flags bits 0..1 material; bit 2 celestial (miss only); bit 3 water-entering (hit only).
+const uint PAYLOAD_WATER_ENTERING = 8u;
 
 void payloadSetPacked(uint material, float roughness, float metalness, float emission, float sss) {
     payload.flags = material;
@@ -415,6 +417,12 @@ void main() {
     vec3 n = normalize(pr.normal.xyz);
     vec3 tint = pr.tint.rgb;
 
+    // Water prims are single-sided, wound outward from the fluid volume (RtFluidMesher). Capture the
+    // UNFLIPPED geometric "entering water?" signal before the toward-viewer flip below so raygen can
+    // set inWater from hit orientation instead of toggling parity per crossing.
+    bool waterEntering = pr.tint.w > 0.5 && pr.tint.w < 1.5
+            && dot(gl_WorldRayDirectionEXT, n) < 0.0;
+
     // Lever B: per-triangle corner UVs in primitive order. uvs.uv[3*pid + k] is a contiguous,
     // directly-addressed load (no index buffer, no scattered vertex-UV gather), so it issues as soon as
     // pid is known and its latency overlaps the prim fetch instead of serialising behind an index load.
@@ -499,4 +507,7 @@ void main() {
     }
     payload.f0 = f0;
     payloadSetPacked(material, rough, metal, emission, sss);
+    if (waterEntering) {
+        payload.flags |= PAYLOAD_WATER_ENTERING;
+    }
 }

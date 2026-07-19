@@ -192,8 +192,12 @@ const uint MATERIAL_PARTICLE = 2u;
 const uint MATERIAL_GLASS = 3u;
 const uint PAYLOAD_MATERIAL_MASK = 3u;
 const uint PAYLOAD_SHOW_CELESTIAL = 4u;
+// Set by world.rchit only on a MATERIAL_WATER hit — whether the ray was travelling into the water
+// volume (vs. out of it) at this hit's face. Distinct from PAYLOAD_SHOW_CELESTIAL (miss only).
+const uint PAYLOAD_WATER_ENTERING = 8u;
 
 uint payloadMaterial() { return payload.flags & PAYLOAD_MATERIAL_MASK; }
+bool payloadWaterEntering() { return (payload.flags & PAYLOAD_WATER_ENTERING) != 0u; }
 float payloadRoughness() { return unpackHalf2x16(payload.roughMetal).x; }
 float payloadMetalness() { return unpackHalf2x16(payload.roughMetal).y; }
 float payloadEmission() { return unpackHalf2x16(payload.emissionSss).x; }
@@ -1927,8 +1931,9 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
 
         // Water: smooth dielectric interface. Secondary hits still choose reflect/refract by F
         // (unbiased). Primary hits always evaluate BOTH lobes — SPP-1 looking down has F≈0.02 so
-        // pure stochastic sampling almost never shows sky reflections → black lakes. Medium
-        // tracking decides air↔water from path state, not hit geometry; `n` faces the ray.
+        // pure stochastic sampling almost never shows sky reflections → black lakes. On
+        // transmission, the new medium is read from this hit's face orientation (payloadWaterEntering),
+        // not toggled — a stray/missing face no longer desyncs the rest of the path.
         if (material == MATERIAL_WATER) {
             // Ripple the (near-flat) surface normal before any Fresnel/guide use → glints, broken
             // reflections, wobbling refraction. This water body's biome tint (carried in payload.albedo
@@ -1993,7 +1998,7 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
                 if (dot(tdir, tdir) > 0.0) {
                     rd = normalize(tdir);
                     ro = hitPos - n * SURF_BIAS;
-                    inWater = !inWater;
+                    inWater = payloadWaterEntering();
                     throughput *= (1.0 - F);
                     showCelestial = true;
                     pathIsSpecular = true;
@@ -2012,7 +2017,7 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
             } else {
                 rd = refract(rd, n, etaI / etaT);
                 ro = hitPos - n * SURF_BIAS;
-                inWater = !inWater;
+                inWater = payloadWaterEntering();
                 pathIsTransmission = true;
             }
             showCelestial = true;
@@ -2503,9 +2508,18 @@ void main() {
     // NRD confidence describes temporal stability, not sample count: static lighting keeps full
     // history while motion smoothly accelerates convergence before the hard disocclusion test.
     float sampleConfidence = exp(-length(motion) * 0.15);
-    float diffuseConfidence = length(frameDiffuse) > 0.0 ? sampleConfidence : 1.0;
-    float specularConfidence = length(frameSpecular) > 0.0 ? sampleConfidence : 1.0;
-    float disocclusionMix = (materialFlags & (2u | 4u | 8u)) != 0u ? 1.0 : 0.0;
+    // Water/glass: slightly more aggressive history decay under motion (waves + camera slide)
+    // but keep specular confidence high enough for REBLUR to reconstruct reflections.
+    bool dielectric = (materialFlags & (2u | 4u)) != 0u;
+    float confScale = dielectric ? 0.85 : 1.0;
+    float diffuseConfidence = length(frameDiffuse) > 0.0 ? sampleConfidence * confScale : 1.0;
+    float specularConfidence = length(frameSpecular) > 0.0
+            ? (dielectric ? max(sampleConfidence, 0.55) : sampleConfidence)
+            : 1.0;
+    // Particles still hard-disocclude; water/glass use mild mix so REBLUR can temporal-filter.
+    float disocclusionMix = (materialFlags & 8u) != 0u ? 1.0
+            : dielectric ? 0.35
+            : 0.0;
     imageStore(gClearEmission, pix,
             vec4(max(frameClearRadiance + frameEmission, vec3(0.0)), gv_emission));
     imageStore(gTransmission, pix, vec4(max(frameTransmission, vec3(0.0)), 1.0));

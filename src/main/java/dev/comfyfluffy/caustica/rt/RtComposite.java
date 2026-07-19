@@ -1415,7 +1415,10 @@ public final class RtComposite {
             var level = Minecraft.getInstance().level;
             if (level != null) {
                 cameraBlockPos.set(Mth.floor(camX), Mth.floor(camY), Mth.floor(camZ));
-                if (level.getFluidState(cameraBlockPos).is(FluidTags.WATER)) {
+                // Height-aware, mirroring vanilla Camera.getFluidInCamera(): a plain block-granular
+                // test wrongly flags the eye submerged anywhere in a water column's top block.
+                net.minecraft.world.level.material.FluidState fs = level.getFluidState(cameraBlockPos);
+                if (fs.is(FluidTags.WATER) && camY < cameraBlockPos.getY() + fs.getHeight(level, cameraBlockPos)) {
                     flags |= 0b01;
                 }
             }

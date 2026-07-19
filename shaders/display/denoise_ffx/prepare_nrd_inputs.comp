@@ -136,12 +136,16 @@ void main() {
     bool sky = nLen < 0.5;
     uint materialFlags = imageLoad(gMaterialFlags, pix).r;
 
-    // Multi-tier material classification based on roughness
+    // Multi-tier material classification based on roughness + explicit material flags.
+    // Water/glass are dielectric interfaces: reflections go through REBLUR specular,
+    // transmission/body fill through REBLUR diffuse. They no longer bypass NRD into a
+    // separate transparent bilateral path (that path smeared reflections).
     bool isMirror = !sky && rough <= kMirror;
     bool isWater = (materialFlags & 2u) != 0u;
     bool isGlass = (materialFlags & 4u) != 0u;
     bool isParticle = (materialFlags & 8u) != 0u;
-    bool isSmooth = !sky && !isWater && (isGlass || (rough > kWater && rough <= kSmooth));
+    bool isDielectricInterface = !sky && (isWater || isGlass);
+    bool isSmooth = !sky && !isDielectricInterface && (rough > kWater && rough <= kSmooth);
     bool isSemiRough = !sky && rough > kSmooth && rough <= kSemiRough;
     bool isRough = !sky && rough > kSemiRough;
 
@@ -153,22 +157,28 @@ void main() {
     bool diffuseDemodulated = false;
     bool specularDemodulated = false;
 
-    // Tiered denoising strategy based on material roughness:
-    // - Water (≤0.08): pre-modulated beauty path (avoid SPP-1 firefly outliers)
-    //   + Enhanced temporal/spatial thresholds for water surface curvature
-    // - Mirror/Smooth (≤0.15): minimal demodulation, preserve sharp reflections
-    // - SemiRough/Rough (>0.15): full demodulation for stable denoising
-    if (isWater) {
-        // Water: feed full beauty as pre-modulated diffuse + apply relaxed filtering
-        // to accommodate wave-induced normal/depth variation (water surface is not planar)
-        // Reduce specular contribution to avoid mirror-like appearance
-        Dnrd = max(Dnrd + Spnrd * 0.6, vec3(0.0));  // 40% specular reduction
-        Spnrd = vec3(0.0);
-
-        // Water-specific hint: scale hit distance to account for wave motion
-        // (larger normalized hit dist → NRD uses wider spatial filter)
-        // This prevents over-rejection at wave crests/troughs
-        // Note: actual NRD parameter adjustment happens in native dispatch
+    // Tiered denoising strategy:
+    // - Water/glass dielectric: keep specular lobe for REBLUR reflection denoise;
+    //   demode diffuse body/transmission with a soft floor so biome tint survives.
+    // - Mirror/Smooth: light demode, preserve sharp reflections
+    // - SemiRough/Rough: full demodulation for stable denoising
+    if (isDielectricInterface) {
+        // Diffuse: body fill / refracted content — demode with a soft floor so REBLUR
+        // treats it as irradiance without collapsing dark water columns to zero.
+        Dnrd = safeDiv(Dnrd, max(diffAlb, vec3(0.12)));
+        diffuseDemodulated = true;
+        // Specular: Fresnel reflection — demode by F0-ish albedo when present so REBLUR
+        // gets material-independent irradiance; keep raw on near-zero F0 to avoid blow-up.
+        if (max(specAlbIn.r, max(specAlbIn.g, specAlbIn.b)) > 0.02) {
+            Spnrd = safeDiv(Spnrd, max(specAlb, vec3(0.04)));
+            specularDemodulated = true;
+        }
+        // Mild firefly suppression tailored to SPP-1 dielectric glints (kept below the
+        // global clamp so REBLUR still sees enough energy to reconstruct reflections).
+        float sPeak = max(Spnrd.r, max(Spnrd.g, Spnrd.b));
+        if (sPeak > 3.0) {
+            Spnrd *= (3.0 + 0.2 * (sPeak - 3.0)) / sPeak;
+        }
     } else if (isMirror || isSmooth) {
         // Mirror/Smooth: light demode to preserve sharp reflections
         Dnrd = safeDiv(Dnrd, diffAlb);
@@ -226,8 +236,11 @@ void main() {
     // Alpha already contains the first real secondary-ray segment length for each lobe.
     // Normalize only with NRD's documented hit-distance function; never invent distance from
     // primary range, darkness, roughness tiers, confidence, or material guesses.
-    float nHitDiff = sky ? 0.0 : normHitDist(diffuseHit, viewZ, 1.0);
-    float nHitSpec = sky ? 0.0 : normHitDist(specularHit, viewZ, rough);
+    // Dielectric interfaces: floor specular roughness for hit-distance normalization so REBLUR
+    // uses a slightly wider spatial kernel under water waves / thin glass glints.
+    float hitRough = isDielectricInterface ? max(rough, 0.08) : rough;
+    float nHitDiff = sky ? 0.0 : normHitDist(diffuseHit, viewZ, isDielectricInterface ? 0.5 : 1.0);
+    float nHitSpec = sky ? 0.0 : normHitDist(specularHit, viewZ, hitRough);
 
     imageStore(gNrdDiffuse, pix, vec4(linearToYCoCg(Dnrd), nHitDiff));
     imageStore(gNrdSpecular, pix, vec4(linearToYCoCg(Spnrd), nHitSpec));
@@ -238,9 +251,9 @@ void main() {
         imageStore(gNrdNormalRough, pix, packNormalRoughness(nr.xyz, rough));
     }
 
-    // Transparency mask: glass/water/ice get special bilateral treatment.
-    // Threshold at 0.15 catches water(0.08), glass(0.10), ice(0.10).
-    float transparencyMask = (isWater || isGlass || isParticle) ? 1.0 : 0.0;
+    // Transparency mask: only particles still take the specialized bilateral path.
+    // Water/glass reflections+transmission are owned by NRD REBLUR (see isDielectricInterface).
+    float transparencyMask = isParticle ? 1.0 : 0.0;
     imageStore(gTransparencyMask, pix, vec4(transparencyMask, 0.0, 0.0, 0.0));
 
     // SIGMA hard-shadow baseline: open rays use FP16_MAX, blocked/NoL<=0 rays use zero.
