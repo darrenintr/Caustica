@@ -254,6 +254,13 @@ public final class RtComposite {
         return frameCounter;
     }
 
+    /** Forward vanilla block edits to the bounded light-cache updater. */
+    public void markBlockLightsDirty(int minX, int minY, int minZ, int maxX, int maxY, int maxZ) {
+        if (unifiedLightManager != null) {
+            unifiedLightManager.markBlocksDirty(minX, minY, minZ, maxX, maxY, maxZ);
+        }
+    }
+
     private RtPipeline worldPipeline;
     // Set at the HEAD of Minecraft.reloadResourcePacks() (mixin): a resource reload recreates the block
     // atlas + entity textures. We tear down the world pipeline there (drops all descriptor references) and
@@ -1467,9 +1474,12 @@ public final class RtComposite {
             int restirOffset = BREAKING_OFFSET + MAX_BREAKING * 16;
             if (ENABLE_RESTIR_DI && unifiedLightManager != null && blockLightBuffer != null) {
                 unifiedLightManager.updateFrame(level, camX, camY, camZ, frameCounter);
-                blockLightBuffer.upload(ctx, unifiedLightManager.getAllLights(
-                        (float) terrain.blockX, (float) terrain.blockY, (float) terrain.blockZ));
-                if (worldPipeline != null && blockLightBuffer.buffer() != 0L && blockLightBuffer.count() > 0) {
+                var lights = unifiedLightManager.getAllLights(
+                        (float) terrain.blockX, (float) terrain.blockY, (float) terrain.blockZ);
+                boolean lightUploadChanged = blockLightBuffer.upload(
+                        ctx, lights, unifiedLightManager.revision());
+                if (lightUploadChanged && worldPipeline != null
+                        && blockLightBuffer.buffer() != 0L && blockLightBuffer.count() > 0) {
                     worldPipeline.setExtraStorageBuffer(9, blockLightBuffer.buffer(),
                             Math.max(16L, (long) blockLightBuffer.count() * 16L));
                 }
@@ -1664,10 +1674,6 @@ public final class RtComposite {
                     }
                     try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "denoise:" + backend.name());
                          RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.denoise")) {
-                        VulkanCommandEncoder.memoryBarrier(cmd, stack);
-                        // Fail-open seed so a partial filter never shows garbage.
-                        copyImage(cmd, output.image, denoisedColor.image, renderW, renderH, false);
-                        VulkanCommandEncoder.memoryBarrier(cmd, stack);
                         if (gShadowHit != null && gDiffuse != null && gReflection != null) {
                             if (backend instanceof dev.comfyfluffy.caustica.denoise.OfficialFfxDenoiseBackend official) {
                                 official.setSplitBuffers(gShadowHit, gDiffuse, gReflection);

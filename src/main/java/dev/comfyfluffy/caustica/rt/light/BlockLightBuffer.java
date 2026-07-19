@@ -17,12 +17,17 @@ public final class BlockLightBuffer {
 
     private RtBuffer buffer;
     private int count;
+    private long uploadedRevision = Long.MIN_VALUE;
 
-    public void upload(RtContext ctx, List<BlockLight> lights) {
+    public boolean upload(RtContext ctx, List<BlockLight> lights, long revision) {
+        if (uploadedRevision == revision) {
+            return false;
+        }
         count = Math.min(lights.size(), MAX_LIGHTS);
+        uploadedRevision = revision;
         if (count == 0) {
             // Keep any existing buffer; shader gates on blockLightCount == 0.
-            return;
+            return true;
         }
 
         long requiredSize = (long) count * 16; // vec4 = 16 bytes
@@ -32,8 +37,9 @@ public final class BlockLightBuffer {
             if (buffer != null) {
                 buffer.destroy();
             }
-            // Create host-visible buffer (persistently mapped). Round up a bit for growth.
-            long allocSize = Math.max(requiredSize, 64L * 16L);
+            // The full 64 KiB capacity is tiny and avoids buffer replacement + descriptor churn as
+            // the player enters a light-dense area.
+            long allocSize = (long) MAX_LIGHTS * 16L;
             buffer = ctx.createBuffer(allocSize,
                 org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 true, // hostVisible
@@ -43,13 +49,17 @@ public final class BlockLightBuffer {
         // Write directly to mapped memory
         if (buffer.mapped != 0L) {
             FloatBuffer fb = MemoryUtil.memFloatBuffer(buffer.mapped, count * 4);
-            float[] vec4 = new float[4];
             for (int i = 0; i < count; i++) {
-                lights.get(i).writeToBuffer(vec4, 0);
-                fb.put(vec4);
+                BlockLight light = lights.get(i);
+                fb.put(light.position().x());
+                fb.put(light.position().y());
+                fb.put(light.position().z());
+                fb.put(Float.intBitsToFloat(BlockLight.packMetadata(
+                        light.intensity(), light.colorPacked(), light.dynamic())));
             }
             fb.flip();
         }
+        return true;
     }
 
     public void destroy(RtContext ctx) {
@@ -58,6 +68,7 @@ public final class BlockLightBuffer {
             buffer = null;
         }
         count = 0;
+        uploadedRevision = Long.MIN_VALUE;
     }
 
     public long buffer() {

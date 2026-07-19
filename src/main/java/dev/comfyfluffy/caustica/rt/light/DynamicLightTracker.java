@@ -1,8 +1,5 @@
 package dev.comfyfluffy.caustica.rt.light;
 
-import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
-import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
-import net.minecraft.client.Minecraft;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.ItemEntity;
@@ -26,11 +23,10 @@ import java.util.List;
  */
 public final class DynamicLightTracker {
 
-    // Current frame's dynamic lights, rebuilt each frame
-    private final List<DynamicLight> lights = new ArrayList<>();
-
-    // Previous frame's lights by entity ID, for smooth updates
-    private final Int2ObjectMap<DynamicLight> prevLights = new Int2ObjectOpenHashMap<>();
+    // Double-buffer the CPU list so an unchanged scan does not invalidate the merged GPU-light cache.
+    private List<DynamicLight> lights = new ArrayList<>();
+    private List<DynamicLight> scratch = new ArrayList<>();
+    private long revision;
 
     public DynamicLightTracker() {
     }
@@ -39,11 +35,11 @@ public final class DynamicLightTracker {
      * Update dynamic lights for this frame based on current entities.
      * Call once per frame before GPU upload.
      */
-    public void updateFrame(Iterable<Entity> entities) {
-        lights.clear();
+    public boolean updateFrame(Iterable<Entity> entities) {
+        scratch.clear();
 
         if (!dev.comfyfluffy.caustica.CausticaConfig.Rt.DynamicLights.ENABLED.value()) {
-            return;
+            return commitScratch();
         }
 
         float intensityScale = dev.comfyfluffy.caustica.CausticaConfig.Rt.DynamicLights.INTENSITY_SCALE.value();
@@ -68,7 +64,7 @@ public final class DynamicLightTracker {
                 int heldLight = getHeldLightLevel(entity);
                 if (heldLight > 0) {
                     int scaledLight = Math.min(15, (int) (heldLight * intensityScale));
-                    lights.add(DynamicLight.fromLightLevel(
+                    scratch.add(DynamicLight.fromLightLevel(
                         entityId,
                         pos,
                         scaledLight,
@@ -84,7 +80,7 @@ public final class DynamicLightTracker {
                 int itemLight = getItemLightLevel(stack);
                 if (itemLight > 0) {
                     int scaledLight = Math.min(15, (int) (itemLight * intensityScale));
-                    lights.add(DynamicLight.fromLightLevel(
+                    scratch.add(DynamicLight.fromLightLevel(
                         entityId,
                         pos,
                         scaledLight,
@@ -98,7 +94,7 @@ public final class DynamicLightTracker {
             if (entityLights && entity instanceof Projectile) {
                 if (entity.isOnFire()) {
                     int scaledLight = Math.min(15, (int) (10 * intensityScale));
-                    lights.add(DynamicLight.fromLightLevel(
+                    scratch.add(DynamicLight.fromLightLevel(
                         entityId,
                         pos,
                         scaledLight,
@@ -112,7 +108,7 @@ public final class DynamicLightTracker {
                 int entityLight = getEntityLightLevel(entity);
                 if (entityLight > 0) {
                     int scaledLight = Math.min(15, (int) (entityLight * intensityScale));
-                    lights.add(DynamicLight.fromLightLevel(
+                    scratch.add(DynamicLight.fromLightLevel(
                         entityId,
                         pos,
                         scaledLight,
@@ -122,11 +118,37 @@ public final class DynamicLightTracker {
             }
         }
 
-        // Update previous frame tracking
-        prevLights.clear();
-        for (DynamicLight light : lights) {
-            prevLights.put(light.sourceId(), light);
+        return commitScratch();
+    }
+
+    private boolean commitScratch() {
+        if (sameLights(lights, scratch)) {
+            return false;
         }
+        List<DynamicLight> previous = lights;
+        lights = scratch;
+        scratch = previous;
+        revision++;
+        return true;
+    }
+
+    private static boolean sameLights(List<DynamicLight> a, List<DynamicLight> b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        for (int i = 0; i < a.size(); i++) {
+            DynamicLight x = a.get(i);
+            DynamicLight y = b.get(i);
+            if (x.sourceId() != y.sourceId()
+                    || Float.floatToIntBits(x.position().x()) != Float.floatToIntBits(y.position().x())
+                    || Float.floatToIntBits(x.position().y()) != Float.floatToIntBits(y.position().y())
+                    || Float.floatToIntBits(x.position().z()) != Float.floatToIntBits(y.position().z())
+                    || Float.floatToIntBits(x.intensity()) != Float.floatToIntBits(y.intensity())
+                    || x.colorPacked() != y.colorPacked()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -287,11 +309,19 @@ public final class DynamicLightTracker {
         return lights.size();
     }
 
+    public long revision() {
+        return revision;
+    }
+
     /**
      * Clear all tracked lights (for cleanup).
      */
     public void clear() {
+        if (lights.isEmpty() && scratch.isEmpty()) {
+            return;
+        }
         lights.clear();
-        prevLights.clear();
+        scratch.clear();
+        revision++;
     }
 }

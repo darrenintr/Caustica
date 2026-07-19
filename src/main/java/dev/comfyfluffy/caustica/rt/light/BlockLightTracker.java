@@ -29,6 +29,7 @@ public final class BlockLightTracker {
     private final List<BlockLight> allLights = new ArrayList<>();
     private final LongSet occupiedBlocks = new LongOpenHashSet();
     private boolean dirty;
+    private long revision;
 
     private int lastScanX = Integer.MIN_VALUE;
     private int lastScanY = Integer.MIN_VALUE;
@@ -52,6 +53,7 @@ public final class BlockLightTracker {
         lightsByChunk.computeIfAbsent(cellKey, k -> new ArrayList<>()).add(light);
         occupiedBlocks.add(blockKey);
         dirty = true;
+        revision++;
     }
 
     public void removeLight(BlockPos pos) {
@@ -72,6 +74,18 @@ public final class BlockLightTracker {
         }
         occupiedBlocks.remove(pos.asLong());
         dirty = true;
+        revision++;
+    }
+
+    /** Refresh one edited block without rescanning the surrounding chunk volume. */
+    public void refreshLight(Level level, BlockPos pos) {
+        BlockState state = level.getBlockState(pos);
+        int lightLevel = state.getLightEmission();
+        if (lightLevel > 0) {
+            addLight(pos, lightLevel, getLightColor(state));
+        } else {
+            removeLight(pos);
+        }
     }
 
     /**
@@ -134,8 +148,7 @@ public final class BlockLightTracker {
         if (!force
                 && Math.abs(centerX - lastScanX) < moveThreshold
                 && Math.abs(centerY - lastScanY) < moveThreshold
-                && Math.abs(centerZ - lastScanZ) < moveThreshold
-                && !allLights.isEmpty()) {
+                && Math.abs(centerZ - lastScanZ) < moveThreshold) {
             return false;
         }
 
@@ -143,6 +156,7 @@ public final class BlockLightTracker {
         allLights.clear();
         occupiedBlocks.clear();
         dirty = true;
+        revision++;
 
         int chunkR = Math.max(1, (radiusBlocks + 15) >> 4);
         int minCx = (centerX >> 4) - chunkR;
@@ -295,5 +309,9 @@ public final class BlockLightTracker {
 
     public boolean isDirty() {
         return dirty;
+    }
+
+    public long revision() {
+        return revision;
     }
 }
