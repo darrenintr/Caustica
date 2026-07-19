@@ -27,7 +27,9 @@ import dev.comfyfluffy.caustica.rt.RtDebugLabels;
 
 import java.util.List;
 
+import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_ACCESS_2_MICROMAP_READ_BIT_EXT;
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT;
+import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT_EXT;
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_BUFFER_USAGE_MICROMAP_STORAGE_BIT_EXT;
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_BUILD_MICROMAP_MODE_BUILD_EXT;
@@ -58,7 +60,6 @@ import static org.lwjgl.vulkan.KHRAccelerationStructure.vkCreateAccelerationStru
 import static org.lwjgl.vulkan.KHRAccelerationStructure.vkDestroyAccelerationStructureKHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.vkGetAccelerationStructureBuildSizesKHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.vkGetAccelerationStructureDeviceAddressKHR;
-import static org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
 import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
 import static org.lwjgl.vulkan.KHRSynchronization2.vkCmdPipelineBarrier2KHR;
 
@@ -67,7 +68,33 @@ import static org.lwjgl.vulkan.KHRSynchronization2.vkCmdPipelineBarrier2KHR;
  * factories; free with {@link #destroy()}. One BLAS per section; one TLAS rebuilt per frame.
  */
 public final class RtAccel {
+    private static final long TLAS_INSTANCE_ADDRESS_ALIGNMENT = 16L;
+    // vkCmdBuildMicromapsEXT requires both data.deviceAddress and triangleArray.deviceAddress to be
+    // multiples of 256 (VUID-vkCmdBuildMicromapsEXT-pInfos-07515).
     private static final long MICROMAP_INPUT_ADDRESS_ALIGNMENT = 256L;
+
+    /**
+     * Size an allocation that will expose {@code requiredSize} bytes after its device address is aligned
+     * for an acceleration-structure or micromap scratch address.
+     */
+    public static long scratchBufferSize(RtContext ctx, long requiredSize) {
+        return Math.addExact(requiredSize, Math.max(1, ctx.accelerationStructureScratchAlignment()) - 1L);
+    }
+
+    private static RtBuffer createScratchBuffer(RtContext ctx, long requiredSize, String label) {
+        long alignment = Math.max(1, ctx.accelerationStructureScratchAlignment());
+        return ctx.createAlignedBuffer(Math.max(requiredSize, alignment), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                false, label, alignment);
+    }
+
+    private static long scratchAddress(RtContext ctx, RtBuffer scratch) {
+        long alignment = Math.max(1, ctx.accelerationStructureScratchAlignment());
+        if ((scratch.deviceAddress & (alignment - 1L)) != 0L) {
+            // Fall back to over-allocated/manual alignment path if the allocator returned an unaligned address.
+            return alignUp(scratch.deviceAddress, alignment);
+        }
+        return scratch.deviceAddress;
+    }
 
     public final long handle;
     public final long deviceAddress;
@@ -149,6 +176,7 @@ public final class RtAccel {
         RtBuffer data;
         RtBuffer triangles;
         RtBuffer scratch;
+        final long scratchAddress;
         final long dataAddress;
         final long triangleArrayAddress;
         final int triangleCount;
@@ -157,7 +185,7 @@ public final class RtAccel {
         boolean destroyed;
 
         OpacityMicromap(VkDevice vk, long handle, RtBuffer backing, RtBuffer data, RtBuffer triangles,
-                        RtBuffer scratch, long dataAddress, long triangleArrayAddress, int triangleCount,
+                        RtBuffer scratch, long scratchAddress, long dataAddress, long triangleArrayAddress, int triangleCount,
                         int subdivisionLevel, int bytesPerTriangle) {
             this.vk = vk;
             this.handle = handle;
@@ -165,6 +193,7 @@ public final class RtAccel {
             this.data = data;
             this.triangles = triangles;
             this.scratch = scratch;
+            this.scratchAddress = scratchAddress;
             this.dataAddress = dataAddress;
             this.triangleArrayAddress = triangleArrayAddress;
             this.triangleCount = triangleCount;
@@ -310,8 +339,7 @@ public final class RtAccel {
             VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque, false);
             RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
                     debugLabel + " backing");
-            RtBuffer scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
-                    debugLabel + " build scratch");
+            RtBuffer scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), debugLabel + " build scratch");
             RtAccel accel = createBlasOn(ctx, stack, backing, sizes.accelerationStructureSize(), true, debugLabel);
             return new PreparedBlas(accel, scratch, null, positions.deviceAddress, indices.deviceAddress, vertexCount - 1,
                     indexCount / 3, opaque, debugLabel, false, false);
@@ -335,8 +363,7 @@ public final class RtAccel {
                     vertexCount, bucketTris, opacityMicromap);
             RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
                     debugLabel + " backing");
-            RtBuffer scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
-                    debugLabel + " build scratch");
+            RtBuffer scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), debugLabel + " build scratch");
             RtAccel accel = createBlasOn(ctx, stack, backing, sizes.accelerationStructureSize(), true, debugLabel, opacityMicromap);
             return PreparedBlas.terrain(accel, scratch, null, positions.deviceAddress, indices.deviceAddress, vertexCount - 1,
                     bucketTris, opacityMicromap, debugLabel);
@@ -351,17 +378,17 @@ public final class RtAccel {
         VkDevice vk = ctx.vk();
         String label = blasLabel + " opacity micromap";
         int inputUsage = VK_BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT_EXT;
-        RtBuffer data = ctx.createBuffer(input.data().length + MICROMAP_INPUT_ADDRESS_ALIGNMENT - 1,
-                inputUsage, true, label + " data");
-        long dataOffset = alignUp(data.deviceAddress, MICROMAP_INPUT_ADDRESS_ALIGNMENT) - data.deviceAddress;
-        long dataAddress = data.deviceAddress + dataOffset;
-        MemoryUtil.memByteBuffer(data.mapped + dataOffset, input.data().length).put(input.data());
+        RtBuffer data = ctx.createAlignedBuffer(input.data().length, inputUsage, true, label + " data",
+                MICROMAP_INPUT_ADDRESS_ALIGNMENT);
+        long dataAddress = data.deviceAddress;
+        MemoryUtil.memByteBuffer(data.mapped, input.data().length).put(input.data());
+        data.flush();
         long triangleBytes = input.triangles().length;
-        RtBuffer triangles = ctx.createBuffer(triangleBytes + MICROMAP_INPUT_ADDRESS_ALIGNMENT - 1, inputUsage, true,
-                label + " triangles");
-        long triangleOffset = alignUp(triangles.deviceAddress, MICROMAP_INPUT_ADDRESS_ALIGNMENT) - triangles.deviceAddress;
-        long triangleArrayAddress = triangles.deviceAddress + triangleOffset;
-        MemoryUtil.memByteBuffer(triangles.mapped + triangleOffset, input.triangles().length).put(input.triangles());
+        RtBuffer triangles = ctx.createAlignedBuffer(triangleBytes, inputUsage, true, label + " triangles",
+                MICROMAP_INPUT_ADDRESS_ALIGNMENT);
+        long triangleArrayAddress = triangles.deviceAddress;
+        MemoryUtil.memByteBuffer(triangles.mapped, input.triangles().length).put(input.triangles());
+        triangles.flush();
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkMicromapUsageEXT.Buffer usage = micromapUsage(stack, input.triangleCount(), input.subdivisionLevel());
@@ -378,9 +405,9 @@ public final class RtAccel {
             long handle = pMicromap.get(0);
             RtDebugLabels.nameMicromap(ctx, handle, label);
 
-            RtBuffer scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
-                    label + " build scratch");
-            return new OpacityMicromap(vk, handle, backing, data, triangles, scratch,
+            RtBuffer scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), label + " build scratch");
+            long scratchAddress = scratchAddress(ctx, scratch);
+            return new OpacityMicromap(vk, handle, backing, data, triangles, scratch, scratchAddress,
                     dataAddress, triangleArrayAddress, input.triangleCount(), input.subdivisionLevel(), input.bytesPerTriangle());
         }
     }
@@ -399,8 +426,7 @@ public final class RtAccel {
             VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque, false);
             RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
                     debugLabel + " backing");
-            RtBuffer scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
-                    debugLabel + " build scratch");
+            RtBuffer scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), debugLabel + " build scratch");
             RtAccel accel = createBlasOn(ctx, stack, backing, sizes.accelerationStructureSize(), false, debugLabel);
             return new PreparedBlas(accel, scratch, backing, positions.deviceAddress, indices.deviceAddress, vertexCount - 1,
                     indexCount / 3, opaque, debugLabel, false, false);
@@ -423,8 +449,7 @@ public final class RtAccel {
             long updateScratch = sizes.updateScratchSize();
             RtBuffer backing = ctx.createBuffer(accelSize, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
                     debugLabel + " backing");
-            RtBuffer scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
-                    debugLabel + " build scratch");
+            RtBuffer scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), debugLabel + " build scratch");
             RtAccel accel = createBlasOn(ctx, stack, backing, accelSize, false, debugLabel);
             PreparedBlas op = new PreparedBlas(accel, scratch, backing, positions.deviceAddress, indices.deviceAddress,
                     vertexCount - 1, indexCount / 3, opaque, debugLabel, true, false);
@@ -699,25 +724,33 @@ public final class RtAccel {
         }
         ring.cursor = (ring.cursor + 1) % TlasRing.RING;
 
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            // Reuse a single record + transform buffer across all instances: allocating per-instance
-            // on the MemoryStack (64 KB/thread) overflows it once there are hundreds of sections.
-            VkAccelerationStructureInstanceKHR rec = VkAccelerationStructureInstanceKHR.calloc(stack);
-            java.nio.FloatBuffer xform = stack.mallocFloat(12);
-            for (int i = 0; i < count; i++) {
-                Instance inst = instances.get(i);
-                xform.clear();
-                xform.put(inst.transform3x4()).flip();
-                rec.transform().matrix(xform);
-                rec.instanceCustomIndex(inst.customIndex()).mask(inst.mask()).instanceShaderBindingTableRecordOffset(inst.sbtRecordOffset())
-                        .flags(0x00000001) // VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR
-                        .accelerationStructureReference(inst.blasDeviceAddress());
-                MemoryUtil.memCopy(rec.address(), slot.instanceBuffer.mapped + (long) i * VkAccelerationStructureInstanceKHR.SIZEOF,
-                        VkAccelerationStructureInstanceKHR.SIZEOF);
-            }
+        // Pack via LWJGL struct accessors so native ABI/bitfields stay correct, without per-instance
+        // MemoryStack pressure that overflows once section counts climb into the hundreds.
+        writeTlasInstances(instances, slot.instanceBuffer.mapped, 0);
+        if (count > 0) {
+            slot.instanceBuffer.flush(0L, (long) count * VkAccelerationStructureInstanceKHR.SIZEOF);
         }
         return new PreparedTlas(slot.accel, slot.instanceBuffer, slot.scratch, count,
                 "frame TLAS " + count + " instances");
+    }
+
+    // Wrap the mapped Vulkan array in LWJGL structs so its generated accessors own the native ABI/bitfields.
+    private static void writeTlasInstances(List<Instance> instances, long mapped, int firstInstance) {
+        if (instances.isEmpty()) {
+            return;
+        }
+        VkAccelerationStructureInstanceKHR.Buffer records = VkAccelerationStructureInstanceKHR.create(
+                mapped + (long) firstInstance * VkAccelerationStructureInstanceKHR.SIZEOF, instances.size());
+        for (int i = 0, count = instances.size(); i < count; i++) {
+            Instance instance = instances.get(i);
+            VkAccelerationStructureInstanceKHR record = records.get(i);
+            record.transform().matrix().put(instance.transform3x4());
+            record.instanceCustomIndex(instance.customIndex())
+                    .mask(instance.mask())
+                    .instanceShaderBindingTableRecordOffset(instance.sbtRecordOffset())
+                    .flags(VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR)
+                    .accelerationStructureReference(instance.blasDeviceAddress());
+        }
     }
 
     /** Create one ring slot sized for {@code capacity} instances (instance buffer + AS + backing + scratch). */
@@ -726,9 +759,9 @@ public final class RtAccel {
         String label = "TLAS ring slot (" + capacity + " instance capacity)";
         TlasRing.Slot slot = new TlasRing.Slot();
         slot.capacity = capacity;
-        slot.instanceBuffer = ctx.createBuffer((long) VkAccelerationStructureInstanceKHR.SIZEOF * capacity,
+        slot.instanceBuffer = ctx.createAlignedBuffer((long) VkAccelerationStructureInstanceKHR.SIZEOF * capacity,
                 org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true,
-                label + " instance buffer");
+                label + " instance buffer", TLAS_INSTANCE_ADDRESS_ALIGNMENT);
         try (MemoryStack stack = MemoryStack.stackPush()) {
             // Size the AS + scratch for the slot CAPACITY: build sizes are monotonic in instance count, so
             // every per-frame build with count ≤ capacity fits the same backing/scratch.
@@ -745,8 +778,7 @@ public final class RtAccel {
             RtContext.check(vkCreateAccelerationStructureKHR(vk, ci, null, pAs), "vkCreateAccelerationStructureKHR");
             long handle = pAs.get(0);
             RtDebugLabels.nameAccelerationStructure(ctx, handle, label);
-            slot.scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
-                    label + " build scratch");
+            slot.scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), label + " build scratch");
             VkAccelerationStructureDeviceAddressInfoKHR addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
                     .sType$Default().accelerationStructure(handle);
             long deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vk, addrInfo);
@@ -767,10 +799,10 @@ public final class RtAccel {
         return build;
     }
 
-    private static void recordBlasBuilds(VkCommandBuffer cmd, List<PreparedBlas> blas) {
+    private static void recordBlasBuildsRaw(RtContext ctx, VkCommandBuffer cmd, List<PreparedBlas> blas) {
         for (PreparedBlas b : blas) {
             try (MemoryStack stack = MemoryStack.stackPush()) { // per-iteration: avoid 64 KB stack overflow
-                recordBlasBuild(cmd, stack, b);
+                recordBlasBuild(ctx, cmd, stack, b);
             }
         }
     }
@@ -780,7 +812,7 @@ public final class RtAccel {
         String label = blas.size() == 1 ? blas.get(0).label + (blas.get(0).update ? " refit" : " build")
                 : "BLAS builds " + blas.size();
         try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, label)) {
-            recordBlasBuilds(cmd, blas);
+            recordBlasBuildsRaw(ctx, cmd, blas);
         }
     }
 
@@ -791,11 +823,11 @@ public final class RtAccel {
         }
     }
 
-    private static void recordTlasBuild(VkCommandBuffer cmd, PreparedTlas tlas) {
+    private static void recordTlasBuildRaw(RtContext ctx, VkCommandBuffer cmd, PreparedTlas tlas) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, tlas.instanceBuffer.deviceAddress);
             build.get(0).dstAccelerationStructure(tlas.accel.handle);
-            build.get(0).scratchData().deviceAddress(tlas.scratch.deviceAddress);
+            build.get(0).scratchData().deviceAddress(scratchAddress(ctx, tlas.scratch));
             VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack);
             range.get(0).primitiveCount(tlas.instanceCount).primitiveOffset(0).firstVertex(0).transformOffset(0);
             PointerBuffer ppRange = stack.mallocPointer(1).put(0, range.address());
@@ -806,13 +838,13 @@ public final class RtAccel {
     /** Record a labelled TLAS build into the command buffer. */
     public static void recordTlasBuild(RtContext ctx, VkCommandBuffer cmd, PreparedTlas tlas) {
         try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, tlas.label + " build")) {
-            recordTlasBuild(cmd, tlas);
+            recordTlasBuildRaw(ctx, cmd, tlas);
         }
     }
 
-    private static void recordBlasBuild(VkCommandBuffer cmd, MemoryStack stack, PreparedBlas b) {
+    private static void recordBlasBuild(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack, PreparedBlas b) {
         if (b.terrainSplit) {
-            recordTerrainBlasBuild(cmd, stack, b);
+            recordTerrainBlasBuild(ctx, cmd, stack, b);
             return;
         }
         VkAccelerationStructureGeometryKHR.Buffer geom = triangleGeometry(stack, b.vertexAddr, b.indexAddr, b.maxVertex + 1, b.opaque);
@@ -827,7 +859,7 @@ public final class RtAccel {
             // topology (primitiveCount/maxVertex) must match its original ALLOW_UPDATE build.
             build.get(0).srcAccelerationStructure(b.accel.handle);
         }
-        build.get(0).scratchData().deviceAddress(b.scratch.deviceAddress);
+        build.get(0).scratchData().deviceAddress(scratchAddress(ctx, b.scratch));
         VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack);
         range.get(0).primitiveCount(b.triangleCount).primitiveOffset(0).firstVertex(0).transformOffset(0);
         PointerBuffer ppRange = stack.mallocPointer(1).put(0, range.address());
@@ -836,7 +868,7 @@ public final class RtAccel {
 
     /** Record a terrain section's two-geometry (opaque + alpha) BUILD. Always a fresh BUILD — terrain
      *  sections are never refit in place (re-extraction allocates a new BLAS), so no UPDATE branch. */
-    private static void recordTerrainBlasBuild(VkCommandBuffer cmd, MemoryStack stack, PreparedBlas b) {
+    private static void recordTerrainBlasBuild(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack, PreparedBlas b) {
         if (b.opacityMicromap != null) {
             recordMicromapBuild(cmd, stack, b.opacityMicromap);
             micromapBuildBarrier(cmd, stack);
@@ -849,7 +881,7 @@ public final class RtAccel {
                 .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR)
                 .geometryCount(geom.capacity()).pGeometries(geom)
                 .dstAccelerationStructure(b.accel.handle);
-        build.get(0).scratchData().deviceAddress(b.scratch.deviceAddress);
+        build.get(0).scratchData().deviceAddress(scratchAddress(ctx, b.scratch));
         VkAccelerationStructureBuildRangeInfoKHR.Buffer range = terrainBuildRanges(stack, b.terrainTris);
         PointerBuffer ppRange = stack.mallocPointer(1).put(0, range.address());
         vkCmdBuildAccelerationStructuresKHR(cmd, build, ppRange);
@@ -858,7 +890,7 @@ public final class RtAccel {
     private static void recordMicromapBuild(VkCommandBuffer cmd, MemoryStack stack, OpacityMicromap opacityMicromap) {
         VkMicromapUsageEXT.Buffer usage = micromapUsage(stack, opacityMicromap.triangleCount, opacityMicromap.subdivisionLevel);
         VkMicromapBuildInfoEXT.Buffer build = VkMicromapBuildInfoEXT.calloc(1, stack);
-        build.get(0).set(micromapBuildInfo(stack, opacityMicromap.dataAddress, opacityMicromap.scratch.deviceAddress,
+        build.get(0).set(micromapBuildInfo(stack, opacityMicromap.dataAddress, opacityMicromap.scratchAddress,
                 opacityMicromap.triangleArrayAddress, opacityMicromap.handle, usage));
         vkCmdBuildMicromapsEXT(cmd, build);
     }
@@ -869,7 +901,8 @@ public final class RtAccel {
                 .srcStageMask(VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT)
                 .srcAccessMask(VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT)
                 .dstStageMask(VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR)
-                .dstAccessMask(VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+                // BLAS build reads the micromap itself, not the AS storage of a previous AS write.
+                .dstAccessMask(VK_ACCESS_2_MICROMAP_READ_BIT_EXT);
         VkDependencyInfo dep = VkDependencyInfo.calloc(stack).sType$Default().pMemoryBarriers(barrier);
         vkCmdPipelineBarrier2KHR(cmd, dep);
     }

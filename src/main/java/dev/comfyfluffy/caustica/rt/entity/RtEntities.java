@@ -469,6 +469,9 @@ public final class RtEntities {
             // The deferred horizon guarantees these are off all queues, so destroying them now is safe.
             listsForFree.releaseDeferred();
         }));
+        if (build.count > 0 && tableRing[tableSlot] != null) {
+            tableRing[tableSlot].flush(0L, (long) build.count * TABLE_ENTRY_BYTES);
+        }
         return new FrameEntities(build.instances, build.blas, build.geomTableAddr);
     }
 
@@ -1312,7 +1315,8 @@ public final class RtEntities {
                 && slot.updatesSinceBuild < refitRebuildInterval();
         if (canUpdate) {
             RtFrameStats.FRAME.count("refits", 1);
-            RtBuffer scratch = allocBuffer(ctx, slot.updateScratchSize, storage, false, label + " refit scratch");
+            RtBuffer scratch = allocBuffer(ctx, RtAccel.scratchBufferSize(ctx, slot.updateScratchSize), storage, false,
+                    label + " refit scratch");
             build.blas.add(RtAccel.refitUpdate(slot.accel, scratch, positions.deviceAddress, indices.deviceAddress, vertCount, idxCount, false,
                     label + " BLAS refit"));
             build.refitScratch.add(scratch);

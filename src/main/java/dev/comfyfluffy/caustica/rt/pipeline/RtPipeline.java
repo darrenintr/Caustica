@@ -132,6 +132,17 @@ public final class RtPipeline {
         VkDevice vk = ctx.vk();
         boolean hasAhit = rahit != null;
         String label = "world RT pipeline";
+        if (bindlessTextures > 0) {
+            long requiredCombinedSamplers = Math.addExact(
+                    Math.multiplyExact((long) bindlessTextures, BINDLESS_BINDINGS),
+                    withAtlasSampler ? 1L : 0L);
+            long deviceLimit = ctx.updateAfterBindCombinedImageSamplerLimit();
+            if (requiredCombinedSamplers > deviceLimit) {
+                throw new UnsupportedOperationException("Configured bindless texture capacity " + bindlessTextures
+                        + " requires " + requiredCombinedSamplers + " combined image samplers, device limit is "
+                        + deviceLimit);
+            }
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             int firstExtraBinding = withAtlasSampler ? 3 : 2;
             // The LabPBR _s/_n atlases (combined image samplers) follow the guide images, starting at
@@ -347,16 +358,24 @@ public final class RtPipeline {
                 VK10.vkDestroyShaderModule(vk, mAhit, null);
             }
 
-            // SBT: one record per group, each region 64-aligned (stride over-aligned to baseAlignment).
+            // SBT: one record per group. Over-align the stride so every region start is base-aligned and
+            // every individual record satisfies shaderGroupHandleAlignment.
             int handleSize = ctx.shaderGroupHandleSize();
             ByteBuffer handles = stack.malloc(groupCount * handleSize);
             check(vkGetRayTracingShaderGroupHandlesKHR(vk, pipeline, 0, groupCount, handles), "vkGetRayTracingShaderGroupHandlesKHR");
-            long stride = align(handleSize, ctx.shaderGroupBaseAlignment());
-            RtBuffer sbt = ctx.createBuffer(stride * groupCount, VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR, true,
-                    label + " shader binding table");
+            long stride = align(handleSize,
+                    Math.max(ctx.shaderGroupBaseAlignment(), ctx.shaderGroupHandleAlignment()));
+            if (stride > Integer.toUnsignedLong(ctx.maxShaderGroupStride())) {
+                throw new UnsupportedOperationException("SBT stride " + stride + " exceeds maxShaderGroupStride "
+                        + Integer.toUnsignedLong(ctx.maxShaderGroupStride()));
+            }
+            RtBuffer sbt = ctx.createAlignedBuffer(stride * groupCount,
+                    VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR, true,
+                    label + " shader binding table", ctx.shaderGroupBaseAlignment());
             for (int g = 0; g < groupCount; g++) {
                 MemoryUtil.memCopy(MemoryUtil.memAddress(handles) + (long) g * handleSize, sbt.mapped + g * stride, handleSize);
             }
+            sbt.flush();
             return new RtPipeline(ctx, dsl, pool, sets, layout, pipeline, sbt, stride, missCount, hitGroupCount, pushConstantSize, pcStages, firstExtraBinding,
                     bindlessLayout, bindlessPool, bindlessSet, specBinding, normalBinding, skyBinding);
         }
