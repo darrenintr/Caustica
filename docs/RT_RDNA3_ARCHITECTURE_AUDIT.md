@@ -70,6 +70,16 @@ split submissions. Once pass dependencies are explicit, overlap denoise/upscale 
 graphics/streaming work using timeline semaphores. Adding a second queue before that would increase ownership
 and synchronization risk without proving overlap.
 
+### P2: enforce a portable Linux native ABI
+
+The bundled x86-64 FSR2 and denoiser ELF files export every symbol required by the Java FFM bindings and only
+depend on Vulkan plus the standard C/GCC runtimes. Their current symbol-version floor is nevertheless GLIBC
+2.38 (`__isoc23_strtoul`); FSR2 also imports APIs introduced in GLIBC 2.36 and earlier. This is suitable for
+the current NixOS/new-distro test target, but not Ubuntu 22.04 or an older Steam runtime. The denoiser native is
+only an optional probe—the SPIR-V denoiser remains active if it cannot load—but FSR2 needs its native library.
+For a generally distributable build, compile the natives in the oldest supported Linux sysroot/container and
+make CI reject ELF symbol versions newer than that declared baseline.
+
 ### P2: profile-guided RDNA 3 specialization
 
 Keep the portable no-SER path as the baseline. Profile wave32/wave64 occupancy, register pressure in the
