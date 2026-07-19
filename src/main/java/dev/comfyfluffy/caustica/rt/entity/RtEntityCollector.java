@@ -1,5 +1,6 @@
 package dev.comfyfluffy.caustica.rt.entity;
 
+import com.mojang.blaze3d.PrimitiveTopology;
 import com.mojang.blaze3d.pipeline.ColorTargetState;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
 import com.mojang.blaze3d.vertex.PoseStack;
@@ -27,6 +28,7 @@ import net.minecraft.client.renderer.feature.submit.SubmitNode;
 import net.minecraft.client.renderer.gizmos.DrawableGizmoPrimitives;
 import net.minecraft.client.renderer.item.ItemStackRenderState;
 import net.minecraft.client.renderer.rendertype.RenderType;
+import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.QuadParticleRenderState;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
@@ -35,6 +37,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.network.chat.Component;
 import net.minecraft.util.ARGB;
 import net.minecraft.util.FormattedCharSequence;
+import net.minecraft.util.Mth;
 import net.minecraft.world.item.ItemDisplayContext;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.VoxelShape;
@@ -42,6 +45,7 @@ import net.minecraft.util.RandomSource;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.joml.Quaternionf;
+import org.joml.Vector3f;
 
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
 import dev.comfyfluffy.caustica.rt.material.RtEntityMaterials;
@@ -53,15 +57,18 @@ import java.util.List;
 /**
  * A {@link SubmitNodeCollector} that intercepts entity model submissions and renders them straight into
  * an {@link RtEntityCapture}, reusing all of vanilla's posing/animation. {@code submitModel} is the
- * hook (it is where {@code LivingEntityRenderer.submit} sends the body + each feature layer). Every
- * other submit* path (name tags, leashes, shadows, flames, held items, block models, custom geometry,
- * particles, gizmos) is a no-op — body geometry is what the RT path needs.
+ * hook (it is where {@code LivingEntityRenderer.submit} sends the body + each feature layer). Models, items, blocks, text, leashes, custom quads/lines (fishing rod) are captured; screen-space
+ * effects and debug geometry remain no-ops.
  *
  * <p>Driven once per entity per frame: {@link #begin} sets the capture, then {@code
  * EntityRenderDispatcher.submit} fans out into {@code submitModel} here. Reused across entities.
  */
 public final class RtEntityCollector implements SubmitNodeCollector {
     private static final Direction[] DIRECTIONS = Direction.values();
+    // Vanilla leash constants (LeashFeatureRenderer.LEASH_RENDER_STEPS / LEASH_WIDTH).
+    private static final int LEASH_STEPS = 24;
+    private static final float LEASH_WIDTH = 0.05f;
+    private static final float[] ZERO_UV = new float[4];
 
     private RtEntityCapture capture;
     private ModelBlockRenderer blockRenderer; // lazily-built mesher for moving (falling) blocks
@@ -70,6 +77,10 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     private int pendingOrder;
     private final RtTextVertexConsumer textVertexConsumer = new RtTextVertexConsumer();
     private final TextGlyphVisitor textGlyphVisitor = new TextGlyphVisitor();
+    private final RtCustomQuadVertexConsumer customQuadVertexConsumer = new RtCustomQuadVertexConsumer();
+    private final RtLineVertexConsumer lineVertexConsumer = new RtLineVertexConsumer();
+    private final float[] meshX = new float[4], meshY = new float[4], meshZ = new float[4];
+    private final Vector3f meshPos = new Vector3f();
     // Vanilla already computes the Glowing-effect outline colour (opaque team colour, or 0 when not
     // glowing) per submitModel call — see EntityRenderer.extractCommon's outlineColor. Every submitModel
     // call for one entity carries the same value, so the last non-zero one seen this entity is enough.
@@ -102,7 +113,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (outlineColor != 0) {
             this.outlineColor = outlineColor;
         }
-        capture.currentOrder = pendingOrder; // banner/shield pattern-layer stacking rank; consumed once
+        // Banner base colour is order 0 but drawn after white cloth; shift pattern ranks so base is 1+.
+        capture.currentOrder = pendingOrder + (isBannerPattern(renderType) ? 1 : 0);
         pendingOrder = 0;
         // Resolve this submission's texture to a bindless slot; the capture stamps it on every prim.
         // Block-entity models (chests/signs/beds) texture from an atlas SPRITE: use that atlas + remap
@@ -196,17 +208,29 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (renderType == null) {
             return false;
         }
-        try {
-            // RenderSetup is final, so the accessor cast goes through Object (the interface is mixed in at
-            // runtime), mirroring RtEntityTextures#textureLocation.
-            Object setup = ((RenderTypeAccessor) renderType).caustica$state();
-            RenderPipeline pipeline = ((RenderSetupAccessor) setup).caustica$pipeline();
-            ColorTargetState cts = pipeline.getColorTargetState();
-            return cts != null && cts.blendFunction().isPresent();
-        } catch (Throwable t) {
-            return false; // unknown → treat as opaque (the safe default: no behavior change)
-        }
+        Object setup = ((RenderTypeAccessor) renderType).caustica$state();
+        RenderPipeline pipeline = ((RenderSetupAccessor) setup).caustica$pipeline();
+        ColorTargetState cts = pipeline.getColorTargetState();
+        return cts != null && cts.blendFunction().isPresent();
     }
+
+    private static PrimitiveTopology primitiveTopology(RenderType renderType) {
+        if (renderType == null) {
+            return null;
+        }
+        Object setup = ((RenderTypeAccessor) renderType).caustica$state();
+        return ((RenderSetupAccessor) setup).caustica$pipeline().getPrimitiveTopology();
+    }
+
+    private static boolean isBannerPattern(RenderType renderType) {
+        if (renderType == null) {
+            return false;
+        }
+        Object setup = ((RenderTypeAccessor) renderType).caustica$state();
+        RenderPipeline pipeline = ((RenderSetupAccessor) setup).caustica$pipeline();
+        return "minecraft:pipeline/banner_pattern".equals(pipeline.getLocation().toString());
+    }
+
 
     /** Resolve a quad's tint colour from its tint index + the submission's tint layers (white if untinted). */
     private static int tintColor(int tintIndex, int[] tintLayers) {
@@ -383,9 +407,74 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     public void submitFlame(PoseStack poseStack, EntityRenderState renderState, Quaternionf rotation) {
     }
 
+    // Leashes/leads: 24-segment curve with two crossed diagonal ribbons (vanilla LeashFeatureRenderer).
     @Override
     public void submitLeash(PoseStack poseStack, EntityRenderState.LeashState leashState) {
+        if (capture == null) {
+            return;
+        }
+        capture.clearUvRemap();
+        capture.currentOrder = 0;
+        capture.currentTexSlot = RtEntityTextures.INSTANCE.whiteSlot();
+        capture.currentHasS = false;
+        capture.currentHasN = false;
+        capture.currentBlockAtlas = false;
+        capture.currentTranslucent = false;
+        Matrix4f pose = poseStack.last().pose();
+        float dx = (float) (leashState.end.x - leashState.start.x);
+        float dy = (float) (leashState.end.y - leashState.start.y);
+        float dz = (float) (leashState.end.z - leashState.start.z);
+        float offsetFactor = Mth.invSqrt(dx * dx + dz * dz) * LEASH_WIDTH / 2.0f;
+        float dxOff = dz * offsetFactor;
+        float dzOff = dx * offsetFactor;
+        if (!Float.isFinite(dxOff) || !Float.isFinite(dzOff)) {
+            dxOff = LEASH_WIDTH / 2.0f;
+            dzOff = 0f;
+        }
+        emitLeashRibbon(pose, leashState, dx, dy, dz, dxOff, dzOff, LEASH_WIDTH, false);
+        emitLeashRibbon(pose, leashState, dx, dy, dz, dxOff, dzOff, 0f, true);
     }
+
+    private void emitLeashRibbon(Matrix4f pose, EntityRenderState.LeashState state,
+                                 float dx, float dy, float dz, float dxOff, float dzOff,
+                                 float fudge, boolean altParity) {
+        float ox = (float) state.offset.x;
+        float oy = (float) state.offset.y;
+        float oz = (float) state.offset.z;
+        float prevAx = 0f, prevAy = 0f, prevAz = 0f, prevBx = 0f, prevBy = 0f, prevBz = 0f;
+        int prevColor = 0;
+        for (int k = 0; k <= LEASH_STEPS; k++) {
+            float progress = (float) k / LEASH_STEPS;
+            float x = dx * progress;
+            float y;
+            if (state.slack) {
+                y = dy > 0.0f ? dy * progress * progress : dy - dy * (1.0f - progress) * (1.0f - progress);
+            } else {
+                y = dy * progress;
+            }
+            float z = dz * progress;
+            float m = k % 2 == (altParity ? 1 : 0) ? 0.7f : 1.0f;
+            int color = 0xFF000000
+                    | ((int) (0.5f * m * 255.0f) << 16)
+                    | ((int) (0.4f * m * 255.0f) << 8)
+                    | (int) (0.3f * m * 255.0f);
+            pose.transformPosition(ox + x - dxOff, oy + y + fudge, oz + z + dzOff, meshPos);
+            float ax = meshPos.x, ay = meshPos.y, az = meshPos.z;
+            pose.transformPosition(ox + x + dxOff, oy + y + LEASH_WIDTH - fudge, oz + z - dzOff, meshPos);
+            float bx = meshPos.x, by = meshPos.y, bz = meshPos.z;
+            if (k > 0) {
+                meshX[0] = prevAx; meshY[0] = prevAy; meshZ[0] = prevAz;
+                meshX[1] = prevBx; meshY[1] = prevBy; meshZ[1] = prevBz;
+                meshX[2] = bx; meshY[2] = by; meshZ[2] = bz;
+                meshX[3] = ax; meshY[3] = ay; meshZ[3] = az;
+                capture.addDirectQuad(meshX, meshY, meshZ, ZERO_UV, ZERO_UV, 0f, 0f, 0f, prevColor);
+            }
+            prevAx = ax; prevAy = ay; prevAz = az;
+            prevBx = bx; prevBy = by; prevBz = bz;
+            prevColor = color;
+        }
+    }
+
 
     // Falling blocks render here. Mesh the block model (vanilla's mesher, same as terrain) into the
     // capture; the -0.5,0,-0.5 centring is already baked into poseStack by FallingBlockRenderer, so the
@@ -462,7 +551,180 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     @Override
     public void submitCustomGeometry(PoseStack poseStack, RenderType renderType,
                                      SubmitNodeCollector.CustomGeometryRenderer customGeometryRenderer) {
+        if (capture == null) {
+            return;
+        }
+        PrimitiveTopology topology = primitiveTopology(renderType);
+        boolean lines = topology == PrimitiveTopology.LINES || topology == PrimitiveTopology.DEBUG_LINES
+                || renderType == RenderTypes.lines() || renderType == RenderTypes.linesTranslucent();
+        if (!lines && topology != PrimitiveTopology.QUADS) {
+            return;
+        }
+
+        capture.currentOrder = pendingOrder;
+        pendingOrder = 0;
+        capture.clearUvRemap();
+        capture.currentBlockAtlas = false;
+        capture.currentHasS = false;
+        capture.currentHasN = false;
+        capture.currentTranslucent = !lines && isTranslucent(renderType);
+        // Lines untextured: white slot so albedo = vertex colour.
+        capture.currentTexSlot = lines ? RtEntityTextures.INSTANCE.whiteSlot()
+                : RtEntityTextures.INSTANCE.slotFor(renderType);
+
+        if (lines) {
+            lineVertexConsumer.begin();
+            customGeometryRenderer.render(poseStack.last(), lineVertexConsumer);
+            lineVertexConsumer.finish();
+        } else {
+            customQuadVertexConsumer.begin();
+            customGeometryRenderer.render(poseStack.last(), customQuadVertexConsumer);
+            customQuadVertexConsumer.finish();
+            capture.requireCompleteQuads("custom geometry " + renderType);
+        }
     }
+
+    /**
+     * Converts builder-style custom quad vertices into the bulk form consumed by {@link RtEntityCapture}.
+     * A new vertex commits the previous one (vanilla has no endVertex); {@link #finish()} commits the last.
+     */
+    private final class RtCustomQuadVertexConsumer implements VertexConsumer {
+        private float x, y, z, u, v, nx, ny, nz;
+        private int color;
+        private boolean pending;
+
+        void begin() { pending = false; }
+
+        void finish() { commit(); }
+
+        private void commit() {
+            if (!pending) {
+                return;
+            }
+            capture.addVertex(x, y, z, color, u, v, 0, 0, nx, ny, nz);
+            pending = false;
+        }
+
+        @Override
+        public VertexConsumer addVertex(float x, float y, float z) {
+            commit();
+            this.x = x; this.y = y; this.z = z;
+            this.u = 0f; this.v = 0f;
+            this.nx = 0f; this.ny = 0f; this.nz = 0f;
+            this.color = -1;
+            this.pending = true;
+            return this;
+        }
+
+        @Override
+        public VertexConsumer setColor(int r, int g, int b, int a) {
+            color = ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+            return this;
+        }
+
+        @Override public VertexConsumer setColor(int color) { this.color = color; return this; }
+        @Override public VertexConsumer setUv(float u, float v) { this.u = u; this.v = v; return this; }
+        @Override public VertexConsumer setUv1(int u, int v) { return this; }
+        @Override public VertexConsumer setUv2(int u, int v) { return this; }
+        @Override public VertexConsumer setNormal(float x, float y, float z) {
+            this.nx = x; this.ny = y; this.nz = z; return this;
+        }
+        @Override public VertexConsumer setLineWidth(float width) { return this; }
+    }
+
+    /** Expands each raster line segment into two crossed, camera-independent RT ribbons (fishing rod). */
+    private final class RtLineVertexConsumer implements VertexConsumer {
+        private static final float WORLD_UNITS_PER_PIXEL = 0.0025f;
+        private final float[] ax = new float[4], ay = new float[4], az = new float[4];
+        private float x, y, z, width;
+        private int color;
+        private boolean pending;
+        private boolean haveFirst;
+        private float firstX, firstY, firstZ, firstWidth;
+        private int firstColor;
+
+        void begin() { pending = false; haveFirst = false; }
+
+        void finish() {
+            commit();
+            if (haveFirst) {
+                haveFirst = false;
+                throw new IllegalStateException("custom line geometry left an unmatched vertex");
+            }
+        }
+
+        private void commit() {
+            if (!pending) {
+                return;
+            }
+            if (!haveFirst) {
+                firstX = x; firstY = y; firstZ = z; firstWidth = width; firstColor = color;
+                haveFirst = true;
+            } else {
+                emitSegment(firstX, firstY, firstZ, x, y, z, Math.max(firstWidth, width), firstColor);
+                haveFirst = false;
+            }
+            pending = false;
+        }
+
+        private void emitSegment(float x0, float y0, float z0, float x1, float y1, float z1,
+                                 float pixelWidth, int color) {
+            float dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
+            float length = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
+            if (length <= 1.0e-6f) {
+                return;
+            }
+            dx /= length; dy /= length; dz /= length;
+            float halfWidth = Math.max(0.0015f, pixelWidth * WORLD_UNITS_PER_PIXEL * 0.5f);
+            float px, py, pz;
+            float adx = Math.abs(dx), ady = Math.abs(dy), adz = Math.abs(dz);
+            if (adx <= ady && adx <= adz) {
+                px = 0f; py = dz; pz = -dy;
+            } else if (ady <= adz) {
+                px = -dz; py = 0f; pz = dx;
+            } else {
+                px = dy; py = -dx; pz = 0f;
+            }
+            float plen = (float) Math.sqrt(px * px + py * py + pz * pz);
+            px = px / plen * halfWidth; py = py / plen * halfWidth; pz = pz / plen * halfWidth;
+            emitRibbon(x0, y0, z0, x1, y1, z1, px, py, pz, color);
+            float qx = (dy * pz - dz * py);
+            float qy = (dz * px - dx * pz);
+            float qz = (dx * py - dy * px);
+            emitRibbon(x0, y0, z0, x1, y1, z1, qx, qy, qz, color);
+        }
+
+        private void emitRibbon(float x0, float y0, float z0, float x1, float y1, float z1,
+                                float px, float py, float pz, int color) {
+            ax[0] = x0 - px; ay[0] = y0 - py; az[0] = z0 - pz;
+            ax[1] = x1 - px; ay[1] = y1 - py; az[1] = z1 - pz;
+            ax[2] = x1 + px; ay[2] = y1 + py; az[2] = z1 + pz;
+            ax[3] = x0 + px; ay[3] = y0 + py; az[3] = z0 + pz;
+            capture.addDirectQuad(ax, ay, az, ZERO_UV, ZERO_UV, 0f, 0f, 0f, color);
+        }
+
+        @Override
+        public VertexConsumer addVertex(float x, float y, float z) {
+            commit();
+            this.x = x; this.y = y; this.z = z;
+            this.width = 1f; this.color = -1; this.pending = true;
+            return this;
+        }
+
+        @Override
+        public VertexConsumer setColor(int r, int g, int b, int a) {
+            color = ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+            return this;
+        }
+
+        @Override public VertexConsumer setColor(int color) { this.color = color; return this; }
+        @Override public VertexConsumer setUv(float u, float v) { return this; }
+        @Override public VertexConsumer setUv1(int u, int v) { return this; }
+        @Override public VertexConsumer setUv2(int u, int v) { return this; }
+        @Override public VertexConsumer setNormal(float x, float y, float z) { return this; }
+        @Override public VertexConsumer setLineWidth(float width) { this.width = width; return this; }
+    }
+
 
     @Override
     public void submitQuadParticleGroup(QuadParticleRenderState particles) {

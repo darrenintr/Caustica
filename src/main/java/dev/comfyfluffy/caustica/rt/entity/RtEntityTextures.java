@@ -81,6 +81,9 @@ public final class RtEntityTextures {
     private int nextSlot = 1;
     private boolean loggedFailure;
     private boolean loggedMaterialFailure;
+    // 1x1 solid-white DynamicTexture for untextured geometry (leash/line ribbons).
+    private static final Identifier WHITE_LOCATION = Identifier.fromNamespaceAndPath("caustica", "rt_white");
+    private boolean whiteRegistered;
 
     // Entity LabPBR: per-type _n/_s textures cached by resource Identifier (null = known-missing), closed
     // on reset(). Per-slot presence (→ prim mat.w/mat.z) + a guard so a slot's _n/_s are resolved once
@@ -183,6 +186,22 @@ public final class RtEntityTextures {
      * same texture). Retried each frame until the source atlas is ready. Block-atlas geometry uses the
      * fixed terrain atlases instead, so callers route the block atlas elsewhere — never here.
      */
+
+    /**
+     * Bindless slot of a solid-white 1x1 texture for untextured geometry (leashes, custom line
+     * ribbons). Colour comes from per-prim tint. Slot 0 (block atlas) is NOT a substitute.
+     */
+    public int whiteSlot() {
+        if (!whiteRegistered) {
+            whiteRegistered = true;
+            NativeImage image = new NativeImage(1, 1, false);
+            image.setPixel(0, 0, 0xFFFFFFFF);
+            Minecraft.getInstance().getTextureManager()
+                    .register(WHITE_LOCATION, new DynamicTexture(() -> "caustica RT white", image));
+        }
+        return slotForAtlas(WHITE_LOCATION);
+    }
+
     public int slotForBlockEntityAtlas(Identifier atlasLocation) {
         int slot = slotForAtlas(atlasLocation);
         if (entityPbr() && slot > 0 && !atlasMaterialBound.contains(slot)) {
@@ -247,6 +266,7 @@ public final class RtEntityTextures {
         viewCache.clear();
         viewSlotCache.clear();
         atlasSlotCache.clear();
+        whiteRegistered = false;
         atlasSlotCache.put(TextureAtlas.LOCATION_BLOCKS, 0); // block atlas = the slot-0 fallback
         atlasMaterialBound.clear();
         RtEntityMaterials.INSTANCE.reset(); // block-entity parallel _s/_n atlases are slot-bound → rebuild in lockstep

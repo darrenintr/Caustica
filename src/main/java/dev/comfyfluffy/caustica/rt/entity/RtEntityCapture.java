@@ -167,15 +167,34 @@ public final class RtEntityCapture implements VertexConsumer {
     }
 
     private void emitQuad() {
-        // Authored model normal (pose-transformed by compile); planar quad, so vertex 0's normal is the
-        // face normal. Baked quads (items/blocks) pass no normal → fall back to a geometric one from the
-        // quad edges. The closest-hit flips it toward the viewer, as for terrain. Computed BEFORE the
-        // positions are staged so a same-order offset (below) can push along it.
-        float nx = qnx[0], ny = qny[0], nz = qnz[0];
+        appendQuad(qx, qy, qz, qu, qv, qnx[0], qny[0], qnz[0], qcol[0], false);
+    }
+
+    /**
+     * Append one already-transformed quad without routing through the VertexConsumer accumulator.
+     * Used by leash ribbons and custom line/geometry paths.
+     */
+    void addDirectQuad(float[] x, float[] y, float[] z, float[] u, float[] v,
+                       float nx, float ny, float nz, int color) {
+        appendQuad(x, y, z, u, v, nx, ny, nz, color, uvRemap);
+    }
+
+    /** Fail fast before a later submission can complete a malformed custom-geometry quad. */
+    void requireCompleteQuads(String label) {
+        if (n != 0) {
+            int incomplete = n;
+            n = 0;
+            throw new IllegalStateException(label + " left an incomplete quad (" + incomplete + " vertices)");
+        }
+    }
+
+    private void appendQuad(float[] x, float[] y, float[] z, float[] u, float[] v,
+                            float nxIn, float nyIn, float nzIn, int color, boolean remapUv) {
+        float nx = nxIn, ny = nyIn, nz = nzIn;
         float len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
         if (len <= 1.0e-6f) {
-            float ex1 = qx[1] - qx[0], ey1 = qy[1] - qy[0], ez1 = qz[1] - qz[0];
-            float ex2 = qx[2] - qx[0], ey2 = qy[2] - qy[0], ez2 = qz[2] - qz[0];
+            float ex1 = x[1] - x[0], ey1 = y[1] - y[0], ez1 = z[1] - z[0];
+            float ex2 = x[2] - x[0], ey2 = y[2] - y[0], ez2 = z[2] - z[0];
             nx = ey1 * ez2 - ez1 * ey2;
             ny = ez1 * ex2 - ex1 * ez2;
             nz = ex1 * ey2 - ey1 * ex2;
@@ -186,27 +205,26 @@ public final class RtEntityCapture implements VertexConsumer {
             ny /= len;
             nz /= len;
         }
-        // Stacked decal layers (banner/shield patterns: base cloth + per-pattern cutout layers, all the
-        // SAME coplanar mesh submitted repeatedly via SubmitNodeCollector#order) tie exactly in the BVH —
-        // push each later layer outward along the face normal by rank, same fix as terrain's coincident
-        // grass-overlay resolution (RtTerrain.QuadCapture), so any-hit cutout lets the ray fall through a
-        // discarded pattern texel to the layer behind instead of a random BVH pick.
+        float ox = 0f, oy = 0f, oz = 0f;
         if (currentOrder != 0 && len > 1.0e-6f) {
             float off = ORDER_OFFSET * currentOrder;
-            for (int i = 0; i < 4; i++) {
-                qx[i] += nx * off;
-                qy[i] += ny * off;
-                qz[i] += nz * off;
-            }
+            ox = nx * off;
+            oy = ny * off;
+            oz = nz * off;
         }
 
         int base = verts.size() / 3;
         for (int i = 0; i < 4; i++) {
-            verts.add(qx[i]);
-            verts.add(qy[i]);
-            verts.add(qz[i]);
-            uvList.add(qu[i]);
-            uvList.add(qv[i]);
+            verts.add(x[i] + ox);
+            verts.add(y[i] + oy);
+            verts.add(z[i] + oz);
+            float uu = u[i], vv = v[i];
+            if (remapUv) {
+                uu = uvU0 + uu * uvDU;
+                vv = uvV0 + vv * uvDV;
+            }
+            uvList.add(uu);
+            uvList.add(vv);
         }
         idx.add(base);
         idx.add(base + 1);
@@ -214,29 +232,23 @@ public final class RtEntityCapture implements VertexConsumer {
         idx.add(base);
         idx.add(base + 2);
         idx.add(base + 3);
-        // Vertex colour as a flat per-prim tint (ARGB → rgb). White (-1) for most models → grey when lit.
-        int c = qcol[0];
-        float tr = ((c >> 16) & 0xFF) * (1f / 255f);
-        float tg = ((c >> 8) & 0xFF) * (1f / 255f);
-        float tb = (c & 0xFF) * (1f / 255f);
-        for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
+        float tr = ((color >> 16) & 0xFF) * (1f / 255f);
+        float tg = ((color >> 8) & 0xFF) * (1f / 255f);
+        float tb = (color & 0xFF) * (1f / 255f);
+        for (int t = 0; t < 2; t++) {
             prim.add(nx);
             prim.add(ny);
             prim.add(nz);
-            // normal.w: entities don't carry block-light emission, so this lane flags an alpha-blended
-            // (translucent) surface → world.rahit does stochastic transparency instead of a binary cutout.
             prim.add(currentTranslucent ? 1f : 0f);
             prim.add(tr);
             prim.add(tg);
             prim.add(tb);
-            prim.add((float) currentTexSlot); // tint.w = bindless texture slot
-            prim.add(RtMaterials.ENTITY_ROUGH); // entities default to a matte dielectric
-            prim.add(0f);                       // metalness
-            // mat.z / mat.w: LabPBR _s / _n presence + source. 0 = none, 1 = per-type bindless entity atlas,
-            // 2 = block atlas (block-like entities; sampled from the terrain _s/_n atlases).
+            prim.add((float) currentTexSlot);
+            prim.add(RtMaterials.ENTITY_ROUGH);
+            prim.add(0f);
             float matSource = currentBlockAtlas ? 2f : 1f;
-            prim.add(currentHasS ? matSource : 0f); // mat.z
-            prim.add(currentHasN ? matSource : 0f); // mat.w
+            prim.add(currentHasS ? matSource : 0f);
+            prim.add(currentHasN ? matSource : 0f);
         }
     }
 
