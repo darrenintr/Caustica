@@ -129,6 +129,9 @@ public final class RtComposite {
     private static final boolean ENABLE_RESTIR_DI = false;
     private static final boolean ENABLE_RESTIR_GI = false;
     private static final boolean ENABLE_LIGHTFIELD_GI = false;
+    // Stable RT baseline: dynamic entity BLAS capture/refit is temporarily isolated from the
+    // terrain-only TLAS while AMD device-loss causes are being reduced to one submission path.
+    private static final boolean ENABLE_DYNAMIC_ENTITY_RT = false;
     // Stable profiling baseline: keep VRS and pseudo-async compute out of the frame until their
     // individual cost and synchronization behavior are measured in isolation.
     private static final boolean ENABLE_VRS = false;
@@ -1462,8 +1465,11 @@ public final class RtComposite {
             // only the cheap instance-level TLAS is rebuilt per frame. Retired KEEP_FRAMES later.
             // Entity BLASes are built inline below and merged into the per-frame TLAS. geomTableAddr
             // feeds the hit shader entity path (per-prim normal/tint) and motion vectors.
-            RtEntities.FrameEntities fe = RtEntities.INSTANCE.beginFrame(ctx, terrain.staticInstances(),
-                    terrain.blockX, terrain.blockY, terrain.blockZ, camX, camY, camZ, frameProjection, frameViewRotation);
+            RtEntities.FrameEntities fe = ENABLE_DYNAMIC_ENTITY_RT
+                    ? RtEntities.INSTANCE.beginFrame(ctx, terrain.staticInstances(),
+                    terrain.blockX, terrain.blockY, terrain.blockZ, camX, camY, camZ,
+                    frameProjection, frameViewRotation)
+                    : new RtEntities.FrameEntities(terrain.staticInstances(), java.util.List.of(), 0L);
             push.putLong(184, fe.geomTableAddr());
             // Block-breaking overlay: resolves each destroy-stage RenderType's texture into the
             // SAME bindless entity-texture array (destroy_stage_N.png is a standalone Sampler0 texture,
