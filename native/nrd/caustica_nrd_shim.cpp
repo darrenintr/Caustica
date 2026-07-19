@@ -496,38 +496,62 @@ extern "C" int caustica_nrd_create(
         return -4;
     }
 
-    // OPTIMIZED FOR MID-RANGE GPUs (RX7600, RTX4060): SPP=1 with strong spatial+temporal.
-    // Strategy: aggressive spatial blur on motion/disocclusion (fast coverage), then
-    // temporal accumulation refines static areas. Motion blur > motion noise.
+    // NUCLEAR DENOISING FOR SPP=1 (v0.6.2): ABSOLUTE ZERO noise tolerance.
+    // User feedback: v0.6.1 (75px prepass) still shows visible grain on stone/water.
+    // Strategy: INSANE spatial blur (120px+ prepass) + ultra-loose edge checks + ignore all
+    // geometry variance. This will blur EVERYTHING into smoothness. Edges will be soft but
+    // there will be ZERO visible grain. User explicitly wants "no noise visible to eyes".
     nrd::ReblurSettings reblur{};
-    reblur.maxAccumulatedFrameNum = 28;          // faster response for dim-lighting ghosting (was 48)
-    reblur.maxFastAccumulatedFrameNum = 4;       // FAST converge on disocclusion (was 6)
-    reblur.maxStabilizedFrameNum = 32;           // stabilize radiance for stills
-    reblur.historyFixFrameNum = 2;               // minimal checkerboard (was 3)
-    reblur.historyFixBasePixelStride = 4;        // dense fill grid (was 6)
-    reblur.historyFixAlternatePixelStride = 4;
-    reblur.diffusePrepassBlurRadius = 50.0f;     // WIDE prepass: eat SPP-1 grain fast
-    reblur.specularPrepassBlurRadius = 60.0f;
+    // Temporal: ULTRA-slow accumulation for maximum smoothness
+    reblur.maxAccumulatedFrameNum = 64;          // ultra-long history (was 48)
+    reblur.maxFastAccumulatedFrameNum = 2;       // slower fast mode (was 3)
+    reblur.maxStabilizedFrameNum = 96;           // hold statics even longer (was 64)
+    reblur.historyFixFrameNum = 4;               // 4-frame checkerboard (was 3)
+    reblur.historyFixBasePixelStride = 2;        // ultra-dense grid (was 3)
+    reblur.historyFixAlternatePixelStride = 2;
+    // Spatial: ADAPTIVE prepass blur (v0.6.11) - fix near-field raw noise.
+    // Problem: 120px prepass works at distance but FAILS at near-field (1-2 blocks).
+    // Root cause: At near-field, 120px radius samples across HUGE depth discontinuities
+    //             (edge of nearby wall) → invalid samples → NRD falls back to raw input.
+    // Solution: Use SMALLER prepass at near-field, LARGER at distance.
+    // But NRD doesn't support per-pixel radius, so we choose a MIDDLE GROUND:
+    //   - Reduce from 120/150 to 60/80 (still aggressive but won't fail near-field)
+    //   - Rely more on temporal accumulation (64 frames) than spatial
+    reblur.diffusePrepassBlurRadius = 60.0f;     // REDUCED (was 120) - near-field fix
+    reblur.specularPrepassBlurRadius = 80.0f;    // REDUCED (was 150) - near-field fix
     reblur.usePrepassOnlyForSpecularMotionEstimation = false;
-    reblur.minBlurRadius = 3.0f;                 // never below 3px (was 2.0)
-    reblur.maxBlurRadius = 48.0f;                // wider max for disocclusion (was 32)
-    reblur.fastHistoryClampingSigmaScale = 1.8f; // tighter variance rejection (was 2.2)
-    reblur.lobeAngleFraction = 0.20f;            // wider lobe = more spatial reuse (was 0.15)
-    reblur.roughnessFraction = 0.20f;            // looser roughness match (was 0.15)
-    reblur.planeDistanceSensitivity = 0.03f;     // looser plane check = more blur (was 0.02)
-    reblur.minHitDistanceWeight = 0.08f;         // less hit-dist modulation (was 0.12)
-    reblur.fireflySuppressorMinRelativeScale = 3.5f; // stronger outlier rejection (was 2.5)
+    reblur.minBlurRadius = 6.0f;                 // never below 6px (was 4.0)
+    reblur.maxBlurRadius = 96.0f;                // allow MASSIVE blur (was 64)
+    // Variance rejection: ULTRA-LOOSE - accept everything to avoid grain
+    reblur.fastHistoryClampingSigmaScale = 4.0f; // extremely loose (was 2.5)
+    // Edge-stopping: DISABLED - blur across ALL edges (zero geometry awareness)
+    reblur.lobeAngleFraction = 0.50f;            // ignore normal differences (was 0.30)
+    reblur.roughnessFraction = 0.50f;            // ignore roughness differences (was 0.30)
+    reblur.planeDistanceSensitivity = 0.10f;     // ignore depth edges (was 0.05)
+    reblur.minHitDistanceWeight = 0.02f;         // completely ignore hit-dist (was 0.05)
+    // Firefly suppression: BEYOND NUCLEAR
+    reblur.fireflySuppressorMinRelativeScale = 8.0f; // OBLITERATE outliers (was 5.0)
     reblur.enableAntiFirefly = true;
-    reblur.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_3X3;
-    // Responsive accumulation: trigger fast blur on rough surfaces (motion-blur style).
-    reblur.responsiveAccumulationSettings.roughnessThreshold = 0.12f; // wider trigger (was 0.08)
-    reblur.responsiveAccumulationSettings.minAccumulatedFrameNum = 2;
-    // Antilag: moderate — too strong kills temporal benefit, too weak leaves trails.
-    reblur.antilagSettings.luminanceSigmaScale = 1.8f;
-    reblur.antilagSettings.luminanceSensitivity = 3.0f; // aggressive ghosting/firefly rejection (was 2.2)
+    reblur.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_5X5;
+    // Responsive accumulation: HYPER-AGGRESSIVE
+    reblur.responsiveAccumulationSettings.roughnessThreshold = 0.25f; // trigger on everything (was 0.18)
+    reblur.responsiveAccumulationSettings.minAccumulatedFrameNum = 1; // instant blur (was 2)
+    // EDGE STABILIZATION (v0.6.8): DISABLE antilag to fix peripheral noise.
+    // Problem: "peripheral noise around a clear central area" - NRD works in center but fails at edges.
+    // Root cause: Antilag at 4.0/6.0 is TOO AGGRESSIVE at screen edges where:
+    //   - Motion vectors are less reliable (reprojection OOB)
+    //   - Spatial samples are asymmetric (fewer neighbors)
+    //   - History is frequently rejected → fallback to raw noisy input
+    // Solution: DISABLE antilag entirely. At 1 SPP, prefer smooth ghosting over edge noise.
+    // Trade-off: May see trailing on fast-moving objects, but eliminates peripheral noise ring.
+    reblur.antilagSettings.luminanceSigmaScale = 0.0f;     // DISABLE (was 4.0)
+    reblur.antilagSettings.luminanceSensitivity = 0.0f;    // DISABLE (was 6.0)
+    reblur.antilagSettings.hitDistanceSigmaScale = 0.0f;   // DISABLE (was 4.0)
+    reblur.antilagSettings.hitDistanceSensitivity = 0.0f;  // DISABLE (was 6.0)
+    // Convergence: ULTRA-slow - blend as many frames as possible
     reblur.convergenceSettings.s = 1.0f;
-    reblur.convergenceSettings.b = 0.2f;
-    reblur.convergenceSettings.p = 0.85f;
+    reblur.convergenceSettings.b = 0.10f;          // ultra-slow convergence (was 0.15)
+    reblur.convergenceSettings.p = 0.95f;          // maximum temporal weight (was 0.90)
     nrd::SetDenoiserSettings(*c->instance, nrd::Identifier(nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR), &reblur);
 
     if (recreatePools(c, width, height) != 0) {
@@ -617,9 +641,12 @@ extern "C" int caustica_nrd_dispatch(
     cs.motionVectorScale[1] = 1.0f / float(c->height);
     cs.motionVectorScale[2] = 0.0f;
     cs.viewZScale = 1.0f;
-    // LOOSE disocclusion for mid-range: prefer blurry history over noisy single-frame.
-    // RX7600 can't brute-force SPP → spatial blur on motion is cheaper than noise.
-    cs.disocclusionThreshold = 0.035f;
+    // ULTRA-LOOSE disocclusion (v0.6.2): NEVER reject history unless absolutely forced.
+    // User feedback: still see grain with 0.055 threshold. New strategy: accept ANY history
+    // even if geometry completely changed. Only reject on hard resets (teleport/dimension change).
+    // This will cause ghosting but user explicitly prioritizes "zero visible noise" over correctness.
+    cs.disocclusionThreshold = 0.15f;           // ULTRA loose (was 0.055) - basically disabled
+    cs.disocclusionThresholdAlternate = 0.12f;  // also ultra-loose (was 0.045)
     cs.isMotionVectorInWorldSpace = false;
     cs.enableValidation = false;
 

@@ -1,0 +1,69 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+
+// SVGF - Variance Estimation Pass
+//
+// Computes per-pixel variance from the temporal accumulation output.
+// Variance guides the spatial filter: high variance areas get more aggressive filtering.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Input: temporally accumulated color
+layout(set = 0, binding = 0) uniform sampler2D u_color_accum;
+
+// Input: accumulated moment (E[x^2])
+layout(set = 0, binding = 1) uniform sampler2D u_moment_accum;
+
+// Output: estimated variance per pixel
+layout(set = 0, binding = 2, r16f) uniform writeonly image2D o_variance;
+
+layout(push_constant, scalar) uniform PushConstants {
+    vec2 resolution;
+    vec2 inv_resolution;
+    float variance_boost; // Multiplier for variance (1.0 - 4.0)
+} pc;
+
+float luminance(vec3 rgb) {
+    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(pc.resolution)))) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) * pc.inv_resolution;
+
+    // Read accumulated color and moment
+    vec3 color = texture(u_color_accum, uv).rgb;
+    float moment = texture(u_moment_accum, uv).r;
+
+    // Compute variance: Var(X) = E[X^2] - E[X]^2
+    float mean_squared = color.r * color.r + color.g * color.g + color.b * color.b;
+    float variance = max(0.0, moment - mean_squared);
+
+    // Optional: compute local variance in 3x3 neighborhood for better estimate
+    float local_variance = 0.0;
+    float weight_sum = 0.0;
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            vec2 offset_uv = uv + vec2(dx, dy) * pc.inv_resolution;
+            vec3 neighbor_color = texture(u_color_accum, offset_uv).rgb;
+            float neighbor_lum = luminance(neighbor_color);
+            float center_lum = luminance(color);
+
+            float diff = neighbor_lum - center_lum;
+            local_variance += diff * diff;
+            weight_sum += 1.0;
+        }
+    }
+
+    local_variance /= weight_sum;
+
+    // Combine temporal and spatial variance estimates
+    float final_variance = max(variance, local_variance) * pc.variance_boost;
+
+    imageStore(o_variance, pixel, vec4(final_variance));
+}

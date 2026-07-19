@@ -75,11 +75,11 @@
 	"caustica.options.rt.upscalerMode.nis": "NIS (NVIDIA Image Scaling)",
 
 	"caustica.options.rt.denoiseMode": "Denoise",
-	"caustica.options.rt.denoiseMode.tooltip": "Internal denoise. Auto/Hybrid: FFX shadow+refl then NRD REBLUR. NRD: REBLUR only (no FFX). FFX: shadow+refl only. Off: raw path-traced grain.",
+	"caustica.options.rt.denoiseMode.tooltip": "Internal denoise. Auto/Hybrid: FFX shadow+refl then NRD REBLUR. NRD: REBLUR only (no FFX). FFX: shadow+refl only. SVGF: spatiotemporal variance-guided filtering (pure shader). Off: raw path-traced grain.",
 	"caustica.options.rt.denoiseMode.auto": "Auto (FFX→NRD)",
 	"caustica.options.rt.denoiseMode.ffx": "FFX only",
 	"caustica.options.rt.denoiseMode.nrd": "NRD only",
 	"caustica.options.rt.denoiseMode.hybrid": "Hybrid FFX→NRD",
-	"caustica.options.rt.denoiseMode.svgl": "SVGF (legacy → FFX)",
+	"caustica.options.rt.denoiseMode.svgf": "SVGF",
 	"caustica.options.rt.denoiseMode.off": "Off"
 }

@@ -68,12 +68,28 @@ layout(binding = 8, set = 0, rg16f)   uniform image2D gSpecMotion; // reflection
 layout(binding = 9, set = 0, r8)      uniform image2D gShadowHit;
 layout(binding = 10, set = 0, rgba16f) uniform image2D gDiffuse;
 layout(binding = 11, set = 0, rgba16f) uniform image2D gReflection;
-// ReSTIR DI bindings (12-14):
+// ReSTIR DI bindings (12-14) + light-field SSBO (15):
+// firstExtraBinding=3 → slots 9/10/11/12 = bindings 12/13/14/15
 layout(binding = 12, set = 0) readonly buffer BlockLights {
     vec4 lights[]; // xyz = position, w = packed (intensity, colorRGB)
 } blockLights;
 layout(binding = 13, set = 0, rgba32ui) uniform uimage2D gReservoirCurr;
 layout(binding = 14, set = 0, rgba32ui) uniform uimage2D gReservoirPrev;
+// Packed vanilla light field: each byte = (sky<<4)|block, XYZ order, size³ cells.
+layout(binding = 15, set = 0) readonly buffer LightField {
+    uint cells[]; // 4 cells packed per uint (little-endian bytes)
+} lightField;
+// ReSTIR GI bindings (16-19): two rgba32f images per reservoir slot for dir+wSum/M+age+targetPdf.
+layout(binding = 16, set = 0, rgba32f) uniform image2D gGiReservoirCurrA;
+layout(binding = 17, set = 0, rgba32f) uniform image2D gGiReservoirCurrB;
+layout(binding = 18, set = 0, rgba32f) uniform image2D gGiReservoirPrevA;
+layout(binding = 19, set = 0, rgba32f) uniform image2D gGiReservoirPrevB;
+// Cross-vendor standard RT outputs. Diffuse/specular radiance + hit distance remain at 10/11.
+layout(binding = 20, set = 0, rgba16f) uniform image2D gClearEmission;
+layout(binding = 21, set = 0, rgba16f) uniform image2D gTransmission;
+layout(binding = 22, set = 0, r32f) uniform image2D gViewZ;
+layout(binding = 23, set = 0, rgba16f) uniform image2D gConfidenceDisocclusion;
+layout(binding = 24, set = 0, r32ui) uniform uimage2D gMaterialFlags;
 
 // Per-frame push data lives in a host-visible BDA buffer; only its 8-byte address is pushed. The std430
 // layout must match RtComposite. Raygen loads it once into the `pc` global at the top of main().
@@ -90,6 +106,7 @@ struct WorldPush {
     uint64_t entityTableAddr;  // 184 entity geometry table (closest-hit/any-hit)
     uint flags;                // 192 bit0 = camera submerged, bit1 = PBR BRDF enabled, bit4 = water waves
     uint maxBounces;           // 196 path depth cap; RR starts at bounce 1 when <=3, otherwise 2
+    float maxRayDistance;      // 200 maximum ray tracing distance (performance optimization)
     vec4 sunDir;               // 208 xyz true sun direction (sky glow/disc), w dayFactor 0..1
     vec4 lightDir;             // 224 xyz active NEE light dir (sun above horizon else moon), w = square half-angle (rad)
     vec4 lightRadiance;        // 240 xyz HDR radiance of the active light (warm/dim low, white high)
@@ -106,6 +123,20 @@ struct WorldPush {
     uint restirCandidates;     // 564 candidate samples per pixel (default 8)
     float restirMaxMTemporal;  // 568 max temporal M clamp (default 20.0)
     float restirMaxMSpatial;   // 572 max spatial M clamp (default 100.0)
+    // Light-field GI base (@576): origin in rebased space + edge size (0 = disabled)
+    ivec4 lightFieldOriginSize; // xyz = origin (rebased blocks), w = size
+    // ReSTIR GI parameters (@592)
+    uint giEnabled;             // 592 master switch (0 = off, fall back to hemisphere ambient)
+    uint giCandidates;          // 596 candidate samples per pixel this frame (default 2)
+    float giMaxMTemporal;       // 600 max temporal M clamp (default 6.0)
+    float giMaxMSpatial;        // 604 max spatial M clamp (default 24.0)
+    // GI ambient fallback (@608, 16 bytes)
+    vec4 giAmbientParams;       // 608 x = hemisphere sky scale, y = hemisphere ground scale, z = lightfield blend, w = spare
+    // Hybrid rendering fast-path (@624, 4 bytes)
+    uint hybridEnabled;         // 624 master switch (0 = always RT, 1 = skip DI/GI for simple opaque bounces)
+    float hybridRoughThreshold; // 628 surfaces rougher than this skip RT when no nearby lights (default 0.5)
+    float hybridLightfieldThreshold; // 632 lightfield block level above which RT runs anyway (default 0.05)
+    uint hybridPad;             // 636 pad to 16-byte alignment
 };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WorldPushRef { WorldPush v; };
 layout(push_constant) uniform PushAddr { uint64_t worldPushAddr; } pcAddr;
@@ -117,6 +148,9 @@ vec3 gv_normal;
 vec3 gv_albedo;
 vec3 gv_specAlb; // specular albedo fed to DLSS-RR for specular demodulation (0 = pure diffuse).
 float gv_rough;
+float gv_metalness;  // primary surface metalness (for adaptive firefly clamping)
+float gv_emission;   // primary surface emission strength (for emissive-adjacent firefly suppression)
+uint gv_material;     // explicit closest-hit material class; never inferred from roughness
 // Linear VIEW-SPACE depth (perpendicular distance from the camera plane), computed in main() from
 // gv_hitCamRel · camForward — this is what DLSS-RR's Depth_Type_Linear wants, not the slant ray
 // length. Always >= 0; sky resolves to a large far value (no negative sentinel).
@@ -176,6 +210,19 @@ const float INV_PI = 0.31830988618;
 // pc.lightDir / pc.lightRadiance / pc.sunDir.
 const float EMISSIVE_STRENGTH = 3.0; // HDR radiance of a full (level-15) emitter, modulated by albedo
 
+// Hybrid light-field GI base (vanilla sky/block levels). Tuned for SPP=1 outdoor grass stability:
+// keep under RT direct so we don't double-count sun NEE / ReSTIR, but high enough to kill grain.
+// History: BLOCK_SCALE was raised 0.55 → 0.85 for "underground light noise" — in scenes with many
+// static block lights (197 torches in a quartz test room), sb.y * 0.85 * warm-tint pushed the
+// ambient past 1.0 on white surfaces → full wash-out the instant a hidden glowstone was uncovered
+// by digging. Rolled back to 0.55 (safe). RT_RESIDUAL kept at 0.45 — adds noise/variance without
+// amplifying ambient brightness, so dark scenes still get the underground "light source noise"
+// without over-illuminating bright scenes.
+const float LIGHTFIELD_SKY_SCALE = 0.22;    // multiplies max(pc.lightRadiance) * dayFactor
+const float LIGHTFIELD_BLOCK_SCALE = 0.55;  // warm torch ambient from block light level (rolled back from 0.85)
+const float LIGHTFIELD_RT_RESIDUAL = 0.45;  // keep this fraction of noisy path-traced diffuse GI (was 0.50, trimmed)
+const float LIGHTFIELD_BLOCK_WARM = 0.35;   // torch color warmth mix into block ambient
+
 // Hard upper bound on per-pixel radiance written to outImage. The Cook–Torrance
 // specular term `(D·G·F) / (4·ndv·ndl)` for a perfectly smooth mirror under
 // direct noon sun (`pc.lightRadiance = 21.0`, ndh→1) evaluates to >100 before
@@ -192,10 +239,38 @@ const float EMISSIVE_STRENGTH = 3.0; // HDR radiance of a full (level-15) emitte
 // pipeline while specimen-class specular spikes are squashed before they
 // can poison the FFX history.
 // Tight ceiling: high peaks survive denoise as grit. Prefer slightly flatter HDR.
-// Lowered from 4.0 to 3.0 for more aggressive firefly suppression (SPP=1 noise reduction).
-const float MAX_HDR_RADIANCE = 2.2;
+// Lowered from 4.0 to 3.0 to 2.2 for more aggressive firefly suppression (SPP=1 noise reduction).
+// Material-aware adaptive clamping (v0.5.4): smooth metals get higher threshold (6.0), rough diffuse
+// surfaces get stricter clamp (1.5), emissive-adjacent pixels get even tighter (×0.6).
+const float MAX_HDR_RADIANCE_BASE = 2.2;
+const float MAX_HDR_RADIANCE_SMOOTH_METAL = 6.0;  // smooth metal specular highlights (legitimate)
+const float MAX_HDR_RADIANCE_ROUGH = 1.5;         // rough surfaces (stricter firefly suppression)
+const float EMISSIVE_CLAMP_SCALE = 0.6;           // near emissive blocks (most firefly-prone)
 const float SURF_BIAS = 0.005;  // offset secondary-ray origins along the normal (anti-acne)
 const float RAY_TMIN = 0.001;   // tiny tmin: the normal offset already clears the surface
+
+// Material-aware adaptive firefly clamping: returns the appropriate radiance ceiling for this pixel
+// based on surface properties. Smooth metals allow higher peaks (legitimate specular highlights),
+// rough surfaces get stricter suppression, emissive-adjacent pixels get tightest clamp.
+float computeAdaptiveClampThreshold(float roughness, float metalness, bool nearEmissive) {
+    float threshold = MAX_HDR_RADIANCE_BASE;
+
+    // Smooth metals (< 0.15 rough, > 0.8 metal): allow higher specular peaks (mirrors, polished gold)
+    if (roughness < 0.15 && metalness > 0.8) {
+        threshold = MAX_HDR_RADIANCE_SMOOTH_METAL;
+    }
+    // Rough diffuse surfaces (> 0.7 rough): apply stricter clamp (most fireflies are here)
+    else if (roughness > 0.7) {
+        threshold = MAX_HDR_RADIANCE_ROUGH;
+    }
+
+    // Emissive-adjacent pixels (torches, glowstone, lava): most firefly-prone, tightest clamp
+    if (nearEmissive) {
+        threshold *= EMISSIVE_CLAMP_SCALE;
+    }
+
+    return threshold;
+}
 
 // Water is a smooth dielectric. IOR 1.333; absorption is per-block Beer-Lambert extinction.
 // Keep the extinction mostly neutral and low so water reads as clear glassy volume instead of a
@@ -439,8 +514,21 @@ float hash1(uint x) {
 }
 
 // ============================================================================
-// ReSTIR Direct Illumination for block lights
+// ReSTIR Direct Illumination for block lights (indoor-stable biased RIS)
 // ============================================================================
+// Reservoir stores: selected light index, sum of RIS weights, effective sample count M, age.
+// Playable path prefers low variance over strict unbiasedness:
+//   final ≈ target(y) * (wSum / M) / max(target(y), eps)  ==  wSum / M
+// with distance-biased proposals, temporal M clamp for dynamic lights, and firefly clamp.
+
+const float RESTIR_MAX_RADIUS = 28.0;       // blocks — beyond this, block light is negligible
+const float RESTIR_MAX_RADIUS_SQ = RESTIR_MAX_RADIUS * RESTIR_MAX_RADIUS;
+const float RESTIR_ATTEN_K = 0.08;          // 1 / (1 + k * d^2); tighter than before for local lights
+const float RESTIR_INTENSITY_SCALE = 2.4;   // torch/glowstone punch for SPP-1 playability
+const float RESTIR_FIREFLY_CLAMP = 8.0;     // max unshadowed contribution luminance proxy
+const float RESTIR_DYNAMIC_M_SCALE = 0.25;  // dynamic lights keep much less temporal history
+const uint  RESTIR_MAX_AGE = 32u;
+const int   RESTIR_SPATIAL_SAMPLES = 4;     // random neighbor samples (avoids same-frame race)
 
 struct Reservoir {
     uint lightIndex;
@@ -464,7 +552,7 @@ Reservoir unpackReservoir(uvec4 packed) {
     r.wSum = uintBitsToFloat(packed.y);
     vec2 mAge = unpackHalf2x16(packed.z);
     r.M = mAge.x;
-    r.age = uint(mAge.y);
+    r.age = uint(mAge.y + 0.5);
     return r;
 }
 
@@ -477,77 +565,247 @@ Reservoir emptyReservoir() {
     return r;
 }
 
-void updateReservoir(inout Reservoir r, uint lightIdx, float weight, inout uint seed) {
+// ============================================================================
+// ReSTIR Global Illumination reservoir (direction-based).
+// Inlined to keep world.rgen self-contained -- the .glsl stub at restir_reservoir.glsl
+// carries the canonical definitions for any future include-driven builds.
+// Stored across two rgba32f images (32 bytes per pixel):
+//   A: dir.xyz (vec3) + wSum (float)
+//   B: M (float) + age (float) + targetPdf (float) + cachedVisibility (float)
+// v0.6: cachedVisibility stores previous frame's visibility [0,1], -1.0 = invalid
+// ============================================================================
+struct ReservoirGI {
+    vec3  dir;
+    float wSum;
+    float M;
+    float age;
+    float targetPdf;
+    float cachedVisibility;
+};
+
+vec4 packReservoirGiA(ReservoirGI r) {
+    return vec4(r.dir, r.wSum);
+}
+
+vec4 packReservoirGiB(ReservoirGI r) {
+    return vec4(r.M, r.age, r.targetPdf, r.cachedVisibility);
+}
+
+ReservoirGI unpackReservoirGI(vec4 a, vec4 b) {
+    ReservoirGI r;
+    r.dir       = a.xyz;
+    r.wSum      = a.w;
+    r.M         = b.x;
+    r.age       = b.y;
+    r.targetPdf = b.z;
+    r.cachedVisibility = b.w;
+    return r;
+}
+
+ReservoirGI emptyReservoirGI() {
+    ReservoirGI r;
+    r.dir       = vec3(0.0, 1.0, 0.0);
+    r.wSum      = 0.0;
+    r.M         = 0.0;
+    r.age       = 0.0;
+    r.targetPdf = 1.0;
+    r.cachedVisibility = -1.0;
+    return r;
+}
+
+bool isReservoirGIEmpty(ReservoirGI r) {
+    return r.M < 0.5 || r.wSum <= 0.0;
+}
+
+void updateReservoirGI(inout ReservoirGI r, vec3 dir, float weight, float pdf, inout uint seed) {
+    if (!(weight > 0.0) || isnan(weight) || isinf(weight)) {
+        return;
+    }
     r.wSum += weight;
     r.M += 1.0;
-    if (rndf(seed) < weight / max(r.wSum, 1e-6)) {
+    if (rndf(seed) * r.wSum < weight) {
+        r.dir = dir;
+        r.targetPdf = pdf;
+    }
+}
+
+ReservoirGI combineReservoirsGI(ReservoirGI ra, ReservoirGI rb, float jacobian, float maxM, inout uint seed) {
+    if (isReservoirGIEmpty(rb) || jacobian <= 0.0) return ra;
+    if (isReservoirGIEmpty(ra)) {
+        ReservoirGI r = rb;
+        r.wSum = rb.wSum * jacobian;
+        r.M    = min(rb.M * jacobian, maxM);
+        return r;
+    }
+    ReservoirGI r;
+    float wb = rb.wSum * jacobian;
+    r.wSum   = ra.wSum + wb;
+    r.M      = min(ra.M + rb.M * jacobian, maxM);
+    r.age    = min(ra.age, rb.age);
+    float totalW = max(r.wSum, 1e-6);
+    if (rndf(seed) * totalW < ra.wSum) {
+        r.dir       = ra.dir;
+        r.targetPdf = ra.targetPdf;
+        r.cachedVisibility = ra.cachedVisibility;
+    } else {
+        r.dir       = rb.dir;
+        r.targetPdf = rb.targetPdf;
+        r.cachedVisibility = rb.cachedVisibility;
+    }
+    return r;
+}
+
+void updateReservoir(inout Reservoir r, uint lightIdx, float weight, inout uint seed) {
+    if (!(weight > 0.0) || isnan(weight) || isinf(weight)) {
+        return;
+    }
+    r.wSum += weight;
+    r.M += 1.0;
+    if (rndf(seed) * max(r.wSum, 1e-6) < weight) {
         r.lightIndex = lightIdx;
     }
 }
 
-Reservoir combineReservoirs(Reservoir ra, Reservoir rb, float misWeight, float maxM) {
-    if (rb.lightIndex == 0xFFFFFFFFu) return ra;
-    if (ra.lightIndex == 0xFFFFFFFFu) return rb;
+// Combine reservoirs with a simple stream-RIS merge. misWeight scales the donor's wSum/M.
+Reservoir combineReservoirs(Reservoir ra, Reservoir rb, float misWeight, float maxM, inout uint seed) {
+    if (rb.lightIndex == 0xFFFFFFFFu || misWeight <= 0.0) return ra;
+    if (ra.lightIndex == 0xFFFFFFFFu) {
+        Reservoir r = rb;
+        r.wSum = rb.wSum * misWeight;
+        r.M = min(rb.M * misWeight, maxM);
+        return r;
+    }
 
     Reservoir r;
-    r.wSum = ra.wSum + rb.wSum * misWeight;
+    float wb = rb.wSum * misWeight;
+    r.wSum = ra.wSum + wb;
     r.M = min(ra.M + rb.M * misWeight, maxM);
     r.age = min(ra.age, rb.age);
 
-    float totalWeight = ra.wSum + rb.wSum * misWeight;
-    if (totalWeight > 1e-6) {
-        if (hash1(floatBitsToUint(totalWeight)) < ra.wSum / totalWeight) {
-            r.lightIndex = ra.lightIndex;
-        } else {
-            r.lightIndex = rb.lightIndex;
-        }
-    } else {
+    float totalWeight = max(r.wSum, 1e-6);
+    if (rndf(seed) < ra.wSum / totalWeight) {
         r.lightIndex = ra.lightIndex;
+    } else {
+        r.lightIndex = rb.lightIndex;
     }
-
     return r;
 }
 
-float getReservoirContribution(Reservoir r) {
-    if (r.lightIndex == 0xFFFFFFFFu || r.M < 0.5) return 0.0;
-    return r.wSum / max(r.M, 1.0);
+// ---- Vanilla light-field GI (packed sky/block levels) ----
+// cells[] is uint-packed little-endian bytes: cell i lives in cells[i>>2] byte (i&3).
+uint lightFieldCellByte(int linearIndex) {
+    uint word = lightField.cells[linearIndex >> 2];
+    uint shift = uint(linearIndex & 3) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+// Sample sky/block light levels at a rebased world position. Returns vec2(sky01, block01).
+vec2 sampleLightField01(vec3 rebasedPos) {
+    int size = pc.lightFieldOriginSize.w;
+    if (size <= 0) {
+        return vec2(1.0, 0.0);
+    }
+    // Bias slightly along +Y so floor surfaces sample the air cell above the solid.
+    vec3 p = rebasedPos + vec3(0.0, 0.05, 0.0);
+    ivec3 o = pc.lightFieldOriginSize.xyz;
+    vec3 local = p - vec3(o);
+    vec3 base = floor(local);
+    vec3 f = fract(local);
+    vec2 acc = vec2(0.0);
+    float wSum = 0.0;
+    for (int dz = 0; dz <= 1; dz++) {
+        for (int dy = 0; dy <= 1; dy++) {
+            for (int dx = 0; dx <= 1; dx++) {
+                ivec3 c = ivec3(base) + ivec3(dx, dy, dz);
+                if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(size)))) {
+                    continue;
+                }
+                float wx = (dx == 0) ? (1.0 - f.x) : f.x;
+                float wy = (dy == 0) ? (1.0 - f.y) : f.y;
+                float wz = (dz == 0) ? (1.0 - f.z) : f.z;
+                float w = wx * wy * wz;
+                int idx = c.x + size * (c.z + size * c.y); // X-major, then Z, then Y
+                uint packed = lightFieldCellByte(idx);
+                float sky = float((packed >> 4) & 0xFu) / 15.0;
+                float blk = float(packed & 0xFu) / 15.0;
+                sky = sky * sky * (3.0 - 2.0 * sky);
+                blk = blk * blk;
+                acc += vec2(sky, blk) * w;
+                wSum += w;
+            }
+        }
+    }
+    if (wSum < 1e-4) {
+        return vec2(1.0, 0.0);
+    }
+    return acc / wSum;
+}
+
+// Low-variance ambient irradiance from the light field (not albedo-modulated yet).
+vec3 lightFieldAmbient(vec3 rebasedPos) {
+    vec2 sb = sampleLightField01(rebasedPos);
+    float day = clamp(pc.sunDir.w, 0.0, 1.0);
+    float skyLum = max(pc.lightRadiance.x, max(pc.lightRadiance.y, pc.lightRadiance.z));
+    vec3 skyAmb = vec3(0.55, 0.65, 0.85) * (skyLum * LIGHTFIELD_SKY_SCALE) * sb.x * mix(0.15, 1.0, day);
+    skyAmb += vec3(0.02, 0.03, 0.05) * sb.x;
+    vec3 blockTint = mix(vec3(1.0), vec3(1.0, 0.72, 0.40), LIGHTFIELD_BLOCK_WARM);
+    vec3 blockAmb = blockTint * (sb.y * LIGHTFIELD_BLOCK_SCALE);
+    return skyAmb + blockAmb;
 }
 
 vec3 getLightPosition(uint idx) {
     return blockLights.lights[idx].xyz;
 }
 
+// w pack: float16 intensity | dynamic flag (bit15) | R5G5B5
 float getLightIntensity(uint idx) {
     uint packed = floatBitsToUint(blockLights.lights[idx].w);
     return unpackHalf2x16(packed).x;
 }
 
+bool isLightDynamic(uint idx) {
+    uint packed = floatBitsToUint(blockLights.lights[idx].w);
+    return (packed & 0x8000u) != 0u;
+}
+
 vec3 getLightColor(uint idx) {
     uint packed = floatBitsToUint(blockLights.lights[idx].w);
-    uint colorBits = packed & 0xFFFFu;
+    uint colorBits = packed & 0x7FFFu; // strip dynamic flag
     float r = float((colorBits >> 10) & 0x1Fu) / 31.0;
     float g = float((colorBits >> 5) & 0x1Fu) / 31.0;
     float b = float(colorBits & 0x1Fu) / 31.0;
-    return vec3(r, g, b);
+    // Avoid pure-black packed colors collapsing light to zero.
+    vec3 c = max(vec3(r, g, b), vec3(0.04));
+    return c / max(max(c.r, c.g), max(c.b, 1e-3)); // keep peak channel ~1
 }
 
+// Unshadowed Lambertian response of one block light at hitPos.
+// Lights are already in the same rebased space as hitPos (terrain origin).
 vec3 evalBlockLightUnshadowed(uint lightIdx, vec3 hitPos, vec3 normal, vec3 albedo) {
     if (lightIdx >= pc.blockLightCount) return vec3(0.0);
 
     vec3 lightPos = getLightPosition(lightIdx);
     vec3 toLight = lightPos - hitPos;
     float distSq = dot(toLight, toLight);
+    if (distSq > RESTIR_MAX_RADIUS_SQ || distSq < 1e-6) return vec3(0.0);
+
     float dist = sqrt(distSq);
     vec3 L = toLight / dist;
-
     float ndl = max(0.0, dot(normal, L));
     if (ndl < 0.001) return vec3(0.0);
 
     float intensity = getLightIntensity(lightIdx);
+    if (intensity <= 1e-4) return vec3(0.0);
     vec3 color = getLightColor(lightIdx);
-    float attenuation = intensity / (1.0 + distSq * 0.1);
+    float attenuation = (intensity * RESTIR_INTENSITY_SCALE) / (1.0 + distSq * RESTIR_ATTEN_K);
 
-    return albedo * color * attenuation * ndl * INV_PI;
+    vec3 contrib = albedo * color * attenuation * ndl * INV_PI;
+    // Soft firefly clamp (preserves hue).
+    float peak = max(contrib.r, max(contrib.g, contrib.b));
+    if (peak > RESTIR_FIREFLY_CLAMP) {
+        contrib *= RESTIR_FIREFLY_CLAMP / peak;
+    }
+    return contrib;
 }
 
 float targetFunction(uint lightIdx, vec3 hitPos, vec3 normal, vec3 albedo) {
@@ -555,99 +813,601 @@ float targetFunction(uint lightIdx, vec3 hitPos, vec3 normal, vec3 albedo) {
     return max(contrib.r, max(contrib.g, contrib.b));
 }
 
+// Distance-biased proposal: prefer nearer lights without building a spatial hash on GPU.
+// pdf is approximate (mixture of inverse-square bias + uniform floor) — we accept bias for stability.
+float lightProposalWeight(uint lightIdx, vec3 hitPos) {
+    vec3 toLight = getLightPosition(lightIdx) - hitPos;
+    float distSq = max(dot(toLight, toLight), 0.25);
+    if (distSq > RESTIR_MAX_RADIUS_SQ) return 0.0;
+    float intensity = max(getLightIntensity(lightIdx), 0.05);
+    // w ∝ I / d^2 with a small uniform floor so far lights can still be discovered.
+    return intensity / distSq + 0.02;
+}
+
+uint sampleBiasedLight(vec3 hitPos, inout uint seed, out float proposalPdf) {
+    uint count = pc.blockLightCount;
+    proposalPdf = 0.0;
+    if (count == 0u) return 0xFFFFFFFFu;
+
+    // Stochastic reservoir over a random subset — O(candidates), not O(all lights).
+    int trials = int(min(pc.restirCandidates, count));
+    trials = max(trials, 1);
+
+    uint best = 0xFFFFFFFFu;
+    float wSum = 0.0;
+    for (int i = 0; i < trials; i++) {
+        uint idx = uint(rndf(seed) * float(count));
+        idx = min(idx, count - 1u);
+        float w = lightProposalWeight(idx, hitPos);
+        if (w <= 0.0) continue;
+        wSum += w;
+        if (rndf(seed) * wSum < w) {
+            best = idx;
+        }
+    }
+    if (best == 0xFFFFFFFFu || wSum <= 0.0) {
+        // Fallback: pure uniform so empty near-field still gets a chance.
+        best = min(uint(rndf(seed) * float(count)), count - 1u);
+        proposalPdf = 1.0 / float(count);
+        return best;
+    }
+    // Approximate pdf of the selected sample under the mixture we just used.
+    // Using (weight / meanWeight) / count keeps magnitude reasonable for RIS.
+    float wBest = lightProposalWeight(best, hitPos);
+    proposalPdf = max(wBest / max(wSum / float(trials), 1e-6) / float(count), 1e-6);
+    return best;
+}
+
 Reservoir generateCandidates(vec3 hitPos, vec3 normal, vec3 albedo, inout uint seed) {
     Reservoir r = emptyReservoir();
-    if (pc.blockLightCount == 0) return r;
+    if (pc.blockLightCount == 0u) return r;
 
-    for (int i = 0; i < int(pc.restirCandidates); i++) {
-        uint lightIdx = uint(rndf(seed) * float(pc.blockLightCount));
-        lightIdx = min(lightIdx, pc.blockLightCount - 1);
-
+    int n = int(pc.restirCandidates);
+    n = max(n, 1);
+    for (int i = 0; i < n; i++) {
+        float pdf;
+        uint lightIdx = sampleBiasedLight(hitPos, seed, pdf);
+        if (lightIdx == 0xFFFFFFFFu) continue;
         float target = targetFunction(lightIdx, hitPos, normal, albedo);
-        float pdf = 1.0 / float(pc.blockLightCount);
+        if (target <= 0.0) {
+            // Still count the sample so M reflects effort (keeps estimator stable when many misses).
+            r.M += 1.0;
+            continue;
+        }
         float weight = target / max(pdf, 1e-6);
-
         updateReservoir(r, lightIdx, weight, seed);
     }
-
     return r;
 }
 
 Reservoir temporalReuse(Reservoir rCurr, ivec2 pix, vec2 motion, ivec2 size,
-                        vec3 hitPos, vec3 normal, vec3 albedo) {
-    vec2 prevUv = (vec2(pix) + motion) / vec2(size);
+                        vec3 hitPos, vec3 normal, vec3 albedo, inout uint seed) {
+    // motion is in render pixels (current → previous).
+    vec2 prevUv = (vec2(pix) + 0.5 + motion) / vec2(size);
     ivec2 prevPix = ivec2(prevUv * vec2(size));
 
     if (any(lessThan(prevPix, ivec2(0))) || any(greaterThanEqual(prevPix, size))) {
         return rCurr;
     }
+    // Reject large motion (disocclusion / fast turn) — history is useless and causes streaks.
+    if (dot(motion, motion) > 40.0 * 40.0) {
+        return rCurr;
+    }
 
-    uvec4 prevPacked = imageLoad(gReservoirPrev, prevPix);
-    Reservoir rPrev = unpackReservoir(prevPacked);
-
-    if (rPrev.lightIndex == 0xFFFFFFFFu || rPrev.age > 60u) {
+    Reservoir rPrev = unpackReservoir(imageLoad(gReservoirPrev, prevPix));
+    if (rPrev.lightIndex == 0xFFFFFFFFu || rPrev.lightIndex >= pc.blockLightCount || rPrev.age > RESTIR_MAX_AGE) {
         return rCurr;
     }
 
     float targetPrev = targetFunction(rPrev.lightIndex, hitPos, normal, albedo);
-    float misWeight = targetPrev / max(rPrev.wSum / max(rPrev.M, 1.0), 1e-6);
-
-    Reservoir r = combineReservoirs(rCurr, rPrev, misWeight, pc.restirMaxMTemporal);
-    r.age = rPrev.age + 1u;
-    return r;
-}
-
-Reservoir spatialReuse(Reservoir rCenter, ivec2 pix, ivec2 size,
-                       vec3 hitPos, vec3 normal, vec3 albedo) {
-    Reservoir r = rCenter;
-
-    const ivec2 offsets[8] = ivec2[](
-        ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1),
-        ivec2(-1,  0),               ivec2(1,  0),
-        ivec2(-1,  1), ivec2(0,  1), ivec2(1,  1)
-    );
-
-    for (int i = 0; i < 8; i++) {
-        ivec2 nPix = pix + offsets[i];
-        if (any(lessThan(nPix, ivec2(0))) || any(greaterThanEqual(nPix, size))) continue;
-
-        uvec4 nPacked = imageLoad(gReservoirCurr, nPix);
-        Reservoir rNeighbor = unpackReservoir(nPacked);
-
-        if (rNeighbor.lightIndex == 0xFFFFFFFFu) continue;
-
-        float targetNeighbor = targetFunction(rNeighbor.lightIndex, hitPos, normal, albedo);
-        float misWeight = targetNeighbor / max(rNeighbor.wSum / max(rNeighbor.M, 1.0), 1e-6);
-
-        if (targetNeighbor < 1e-6) continue;
-
-        r = combineReservoirs(r, rNeighbor, misWeight, pc.restirMaxMSpatial);
+    if (targetPrev <= 1e-5) {
+        return rCurr;
     }
 
+    // Confidence: how well the previous sample still explains current shading.
+    float prevEstimate = max(rPrev.wSum / max(rPrev.M, 1.0), 1e-6);
+    float confidence = clamp(targetPrev / prevEstimate, 0.0, 1.0);
+    // Raised from 0.05 → 0.15: at 0.05 a stale reservoir that still weakly explains current shading
+    // gets merged in, dragging a ghost trail behind moving emissives (especially handheld torches —
+    // their block light index frequently shifts between cells as the player moves). 0.15 is the
+    // floor where the previous frame is still meaningfully representative of *this* frame's lighting.
+    if (confidence < 0.15) {
+        return rCurr;
+    }
+
+    float maxM = pc.restirMaxMTemporal;
+    if (isLightDynamic(rPrev.lightIndex)) {
+        maxM *= RESTIR_DYNAMIC_M_SCALE; // hand-held torch: kill ghost trails
+    }
+
+    Reservoir r = combineReservoirs(rCurr, rPrev, confidence, maxM, seed);
+    r.age = min(rPrev.age + 1u, RESTIR_MAX_AGE);
     return r;
 }
 
+// Spatial reuse from PREVIOUS frame only (gReservoirPrev) — avoids same-pass race where
+// some neighbors already wrote this frame and others haven't.
+Reservoir spatialReuse(Reservoir rCenter, ivec2 pix, ivec2 size,
+                       vec3 hitPos, vec3 normal, vec3 albedo, inout uint seed) {
+    Reservoir r = rCenter;
+    if (pc.blockLightCount == 0u) return r;
+
+    // Jittered diamond offsets — wider than 3×3 for indoor corridors.
+    for (int i = 0; i < RESTIR_SPATIAL_SAMPLES; i++) {
+        float ang = rndf(seed) * 6.2831853;
+        float rad = 1.0 + rndf(seed) * 3.0; // 1..4 px
+        ivec2 nPix = pix + ivec2(round(vec2(cos(ang), sin(ang)) * rad));
+        if (any(lessThan(nPix, ivec2(0))) || any(greaterThanEqual(nPix, size))) continue;
+
+        Reservoir rNeighbor = unpackReservoir(imageLoad(gReservoirPrev, nPix));
+        if (rNeighbor.lightIndex == 0xFFFFFFFFu || rNeighbor.lightIndex >= pc.blockLightCount) continue;
+
+        float targetNeighbor = targetFunction(rNeighbor.lightIndex, hitPos, normal, albedo);
+        if (targetNeighbor <= 1e-5) continue;
+
+        float neighborEstimate = max(rNeighbor.wSum / max(rNeighbor.M, 1.0), 1e-6);
+        float confidence = clamp(targetNeighbor / neighborEstimate, 0.0, 1.0);
+        if (confidence < 0.08) continue;
+
+        float maxM = pc.restirMaxMSpatial;
+        if (isLightDynamic(rNeighbor.lightIndex)) {
+            maxM *= RESTIR_DYNAMIC_M_SCALE;
+        }
+        r = combineReservoirs(r, rNeighbor, confidence * 0.85, maxM, seed);
+    }
+    return r;
+}
+
+// Returns biased RIS estimate of unshadowed block-light radiance at the primary hit.
+// Caller multiplies by visibility of the selected light.
 vec3 evalBlockLightReSTIR(ivec2 pix, ivec2 size, vec3 hitPos, vec3 normal, vec3 albedo,
                           vec2 motion, inout uint seed, out uint selectedLightIdx) {
     selectedLightIdx = 0xFFFFFFFFu;
-
-    if (pc.blockLightCount == 0) return vec3(0.0);
+    if (pc.blockLightCount == 0u) {
+        imageStore(gReservoirCurr, pix, packReservoir(emptyReservoir()));
+        return vec3(0.0);
+    }
 
     Reservoir r = generateCandidates(hitPos, normal, albedo, seed);
-    r = temporalReuse(r, pix, motion, size, hitPos, normal, albedo);
-    r = spatialReuse(r, pix, size, hitPos, normal, albedo);
+    r = temporalReuse(r, pix, motion, size, hitPos, normal, albedo, seed);
+    r = spatialReuse(r, pix, size, hitPos, normal, albedo, seed);
 
+    // Finalize: if we somehow have M but no selected light, clear.
+    if (r.lightIndex == 0xFFFFFFFFu || r.lightIndex >= pc.blockLightCount || r.M < 0.5 || r.wSum <= 0.0) {
+        imageStore(gReservoirCurr, pix, packReservoir(emptyReservoir()));
+        return vec3(0.0);
+    }
+
+    // Age bumps even without temporal so empty pixels don't look "fresh forever".
+    r.age = min(r.age + 1u, RESTIR_MAX_AGE);
     imageStore(gReservoirCurr, pix, packReservoir(r));
 
-    if (r.lightIndex == 0xFFFFFFFFu || r.M < 0.5) return vec3(0.0);
-
     selectedLightIdx = r.lightIndex;
-    vec3 unshadowedContrib = evalBlockLightUnshadowed(r.lightIndex, hitPos, normal, albedo);
+    vec3 unshadowed = evalBlockLightUnshadowed(r.lightIndex, hitPos, normal, albedo);
+    float target = max(unshadowed.r, max(unshadowed.g, unshadowed.b));
+    if (target <= 1e-6) {
+        selectedLightIdx = 0xFFFFFFFFu;
+        return vec3(0.0);
+    }
 
-    float pHat = r.wSum / max(r.M, 1.0);
-    if (pHat < 1e-6) return vec3(0.0);
+    // Biased RIS estimator used by most real-time ReSTIR game paths:
+    //   L ≈ (wSum / M) * (f / p_hat)  with p_hat ≈ target → L ≈ unshadowed * (wSum/M) / target
+    // which is just directionally-normalized unshadowed scaled by reservoir confidence.
+    float invM = 1.0 / max(r.M, 1.0);
+    float W = r.wSum * invM;                 // average RIS weight
+    vec3 estimate = unshadowed * (W / target);
 
-    return unshadowedContrib * getReservoirContribution(r) / pHat;
+    // Second clamp after RIS (temporal reuse can inflate W).
+    float peak = max(estimate.r, max(estimate.g, estimate.b));
+    if (peak > RESTIR_FIREFLY_CLAMP * 1.5) {
+        estimate *= (RESTIR_FIREFLY_CLAMP * 1.5) / peak;
+    }
+    return estimate;
+}
+
+// ============================================================================
+// ReSTIR Global Illumination (reflection-direction based)
+// ============================================================================
+// Concept: at a primary hit, "spend" the budget on choosing a reflection
+// direction instead of a light index. Combine neighbor + history reservoirs
+// to get an effective sample count of M_eff >> actual rays we trace, then
+// trace ONE ray along the chosen direction and evaluate radiance at the hit.
+//
+// This is the simplified ReSTIR GI from the NVIDIA 2021 paper, with the
+// target/pdf ratio replaced by a symmetric Jacobian (cosine-weighted sampling
+// keeps target proportional to BRDF*cos, so the per-direction pdf cancels).
+//
+// K-sample spatial reuse from PREVIOUS-FRAME reservoirs only -- same-frame reuse
+// would create a data race where some neighbors have written and others haven't.
+
+const int   GI_SPATIAL_SAMPLES    = 8;         // increased from 4 for better variance reduction
+const float GI_SPATIAL_RADIUS_MIN = 4.0;        // min spatial search radius (px)
+const float GI_SPATIAL_RADIUS_MAX = 16.0;       // max spatial search radius (px)
+const float GI_MAX_RADIUS         = 24.0;       // cap GI bounce distance (blocks)
+const float GI_FIREFLY_CLAMP      = 4.0;        // per-direction radiance ceiling
+const float GI_CONFIDENCE_FLOOR   = 0.08;       // below this, reject donor
+const float GI_DEPTH_THRESHOLD    = 0.15;       // relative depth difference threshold for spatial rejection
+// Soft motion penalty (v0.5): replaced the 40px hard cutoff. Hard cutoff at 40 px was
+// rejecting the entire GI temporal accumulator while walking (per-pixel MV routinely
+// 60-150 px at the screen edges during normal FPS movement), collapsing M_eff from
+// ~30 to ~2 and producing the "noise ring around the camera centre while walking"
+// symptom. Now temporal reuse always runs; the per-pixel confidence gets multiplied
+// by an exponential falloff in motion magnitude. At 80 px (typical walk speed at 60
+// fps) confidence drops to ~37%; at 200 px (teleport / sprint) it's effectively
+// zero, matching the old hard cutoff's behaviour at the extremes.
+const float GI_TEMPORAL_SOFT_MOTION_PX = 80.0;  // motion magnitude at which temporal confidence halves
+
+// Forward decls: cosineDir/sampleSquare/visibility/lightFieldAmbient/CULL_*/SBT_*/traceRay
+// helpers are defined later in this file. GLSL requires the prototype before use.
+vec3 cosineDir(vec3 n, inout uint s);
+vec3 sampleSquare(vec3 axis, float halfAngle, inout uint s);
+vec3 visibility(vec3 origin, vec3 dir, float tmax);
+vec3 lightFieldAmbient(vec3 rebasedPos);
+vec3 giHemisphereAmbient(vec3 n, vec3 worldPos);
+bool isLightingComplex(vec3 hitPos, vec3 normal, vec3 albedo, vec3 F0, float rough, float metal, uint material);
+const uint CULL_SECONDARY_PRIM = 0x01u;
+const uint SBT_RADIANCE_PRIM = 0u;
+const uint SBT_STRIDE_BUCKET_PRIM = 1u;
+void payloadSetTraceState(bool showCelestial, float rayConeWidth, float rayConeSpread);
+uint payloadMaterial();
+
+// Target function for GI: BRDF*cos, reduced to ndl for a Lambertian receiver.
+// Returns 0 when the direction is below the surface (ndl <= 0).
+float giTarget(vec3 n, vec3 dir) {
+    return max(0.0, dot(n, dir));
+}
+
+// Generate candidate GI reservoirs for the current pixel. We sample K=2
+// cosine-weighted directions per pixel -- cheap (1 ray each = 2 GI rays total)
+// and the spatial+temporal reuse amplifies the effective sample count.
+ReservoirGI giGenerateCandidates(vec3 hitPos, vec3 normal, inout uint seed) {
+    ReservoirGI r = emptyReservoirGI();
+    int n = max(int(pc.giCandidates), 1);
+    for (int i = 0; i < n; i++) {
+        vec3 dir = cosineDir(normal, seed);
+        float w = giTarget(normal, dir);
+        // Cosine-sampling pdf = cos/PI; weight = target/pdf = (cos/PI) / (cos/PI) = 1.
+        float pdf = max(dot(normal, dir), 1e-6) * INV_PI;
+        updateReservoirGI(r, dir, max(w / pdf, 0.0), pdf, seed);
+    }
+    return r;
+}
+
+// Temporal reuse: same pixel in the previous frame, reprojected via MV.
+ReservoirGI giTemporalReuse(ReservoirGI rCurr, ivec2 pix, vec2 motion, ivec2 size,
+                             vec3 hitPos, vec3 normal, inout uint seed) {
+    vec2 prevUv = (vec2(pix) + 0.5 + motion) / vec2(size);
+    ivec2 prevPix = ivec2(prevUv * vec2(size));
+    if (any(lessThan(prevPix, ivec2(0))) || any(greaterThanEqual(prevPix, size))) {
+        return rCurr;
+    }
+    // (no hard motion cutoff -- the soft exp falloff below handles all cases:
+    //  at 200 px motion, falloff is ~0.09 which is below GI_CONFIDENCE_FLOOR 0.08
+    //  and gets rejected naturally, so the old behaviour at extreme speeds is preserved.)
+
+    ReservoirGI rPrev = unpackReservoirGI(
+        imageLoad(gGiReservoirPrevA, prevPix),
+        imageLoad(gGiReservoirPrevB, prevPix));
+    if (isReservoirGIEmpty(rPrev)) return rCurr;
+
+    // Reject if the previous frame's direction no longer makes geometric sense.
+    float targetPrev = giTarget(normal, rPrev.dir);
+    if (targetPrev <= 1e-5) return rCurr;
+
+    float prevEstimate = max(rPrev.wSum / max(rPrev.M, 1.0), 1e-6);
+    float confidence = clamp(targetPrev / prevEstimate, 0.0, 1.0);
+    // Soft motion penalty: scales confidence by exp(-motion^2 / soft^2).
+    // 0 px   -> 1.00 (full temporal reuse)
+    // 40 px  -> 0.61
+    // 80 px  -> 0.37
+    // 120 px -> 0.22
+    // 200 px -> 0.09 (effectively drops out, matching the old 40px hard cut)
+    float motionMag = length(motion);
+    float motionFalloff = exp(-(motionMag * motionMag) / (GI_TEMPORAL_SOFT_MOTION_PX * GI_TEMPORAL_SOFT_MOTION_PX));
+    confidence *= motionFalloff;
+    if (confidence < GI_CONFIDENCE_FLOOR) return rCurr;
+
+    ReservoirGI r = combineReservoirsGI(rCurr, rPrev, confidence, pc.giMaxMTemporal, seed);
+    r.age = min(rPrev.age + 1.0, 4096.0);
+    return r;
+}
+
+// Spatial reuse: from previous-frame reservoirs at jittered offsets.
+// Only reads gGiReservoirPrev -- no same-pass race.
+// Enhanced v0.6: larger radius (4-16px), Poisson disk sampling, depth rejection.
+ReservoirGI giSpatialReuse(ReservoirGI rCenter, ivec2 pix, ivec2 size,
+                            vec3 hitPos, vec3 normal, inout uint seed) {
+    ReservoirGI r = rCenter;
+
+    // Read center depth for rejection test
+    float centerDepth = imageLoad(gDepth, pix).r;
+    if (centerDepth <= 0.0) return r; // sky pixel, no spatial reuse
+
+    // Poisson disk offsets (8-tap, precomputed)
+    const vec2 poissonDisk[8] = vec2[](
+        vec2(-0.94201624, -0.39906216),
+        vec2(0.94558609, -0.76890725),
+        vec2(-0.094184101, -0.92938870),
+        vec2(0.34495938, 0.29387760),
+        vec2(-0.91588581, 0.45771432),
+        vec2(-0.81544232, -0.87912464),
+        vec2(-0.38277543, 0.27676845),
+        vec2(0.97484398, 0.75648379)
+    );
+
+    for (int i = 0; i < GI_SPATIAL_SAMPLES; i++) {
+        // Adaptive radius: larger when M is low (needs more neighbors)
+        float adaptiveScale = mix(1.0, 1.5, clamp(1.0 - rCenter.M / 10.0, 0.0, 1.0));
+        float radius = mix(GI_SPATIAL_RADIUS_MIN, GI_SPATIAL_RADIUS_MAX, rndf(seed));
+        radius *= adaptiveScale;
+
+        // Poisson disk sampling with rotation
+        float rotation = rndf(seed) * 6.2831853;
+        vec2 rotated = vec2(
+            poissonDisk[i].x * cos(rotation) - poissonDisk[i].y * sin(rotation),
+            poissonDisk[i].x * sin(rotation) + poissonDisk[i].y * cos(rotation)
+        );
+        ivec2 nPix = pix + ivec2(round(rotated * radius));
+        if (any(lessThan(nPix, ivec2(0))) || any(greaterThanEqual(nPix, size))) continue;
+
+        // Depth rejection: skip neighbors with significantly different depth
+        float neighborDepth = imageLoad(gDepth, nPix).r;
+        if (neighborDepth <= 0.0) continue; // sky pixel
+        float depthDiff = abs(centerDepth - neighborDepth);
+        if (depthDiff > GI_DEPTH_THRESHOLD * centerDepth) continue;
+
+        ReservoirGI p = unpackReservoirGI(
+            imageLoad(gGiReservoirPrevA, nPix),
+            imageLoad(gGiReservoirPrevB, nPix));
+        if (isReservoirGIEmpty(p)) continue;
+
+        float targetN = giTarget(normal, p.dir);
+        if (targetN <= 1e-5) continue;
+
+        // Symmetric Jacobian: cosine of angle between donor normal and receiver normal.
+        // Enhanced: stricter threshold (0.9 instead of 0.05) to prevent light leaking.
+        vec3 nNeighbor = imageLoad(gNormal, nPix).xyz;
+        if (length(nNeighbor) < 0.5) continue;
+        float normalDot = dot(normalize(nNeighbor), normal);
+        if (normalDot < 0.9) continue; // strict normal threshold
+        float jacobian = clamp(normalDot, 0.9, 1.0);
+
+        float neighborEst = max(p.wSum / max(p.M, 1.0), 1e-6);
+        float confidence = clamp(targetN / neighborEst, 0.0, 1.0);
+        if (confidence < GI_CONFIDENCE_FLOOR * 0.7) continue;
+
+        r = combineReservoirsGI(r, p, confidence * jacobian, pc.giMaxMSpatial, seed);
+    }
+    return r;
+}
+
+// One-bounce GI evaluation: trace along the reservoir's chosen direction and
+// return the radiance at the hit (sky radiance on miss, lightfield + NEE on hit).
+// v0.6: accepts cachedVisibility hint to skip trace when valid (visibility reuse).
+vec3 giTraceAndShade(vec3 origin, vec3 dir, float maxDist, inout uint seed, inout float outVisibility) {
+    payload.hitT = -1.0;
+    payloadSetTraceState(true, RAY_CONE_MIN_WIDTH, RAY_CONE_DIFFUSE_SPREAD);
+    hitObjectEXT hObj;
+    hitObjectTraceReorderExecuteEXT(hObj, topLevelAS, gl_RayFlagsNoneEXT, CULL_SECONDARY_PRIM,
+                SBT_RADIANCE_PRIM, SBT_STRIDE_BUCKET_PRIM, 0u, origin, RAY_TMIN, dir, maxDist, 0);
+
+    // Record visibility for next frame (1.0 = hit something, 0.0 = sky/miss)
+    outVisibility = (payload.hitT >= 0.0) ? 1.0 : 0.0;
+
+    if (payload.hitT < 0.0) {
+        // Sky hit -- payload.albedo carries the sky radiance from world.rmiss.
+        return max(payload.albedo, vec3(0.0));
+    }
+    vec3 hitP = origin + dir * payload.hitT;
+    vec3 n = payload.normal;
+    vec3 alb = max(payload.albedo, vec3(0.0));
+    uint mat = payloadMaterial();
+    if (mat == MATERIAL_OPAQUE) {
+        vec3 L = vec3(0.0);
+        if (pc.lightFieldOriginSize.w > 0) {
+            L += alb * lightFieldAmbient(hitP);
+        } else {
+            L += alb * giHemisphereAmbient(n, hitP);
+        }
+        // Primary NEE: the active directional light (sun above horizon, moon at night).
+        vec3 lightDir = pc.lightDir.xyz;
+        float lightHalf = pc.lightDir.w;
+        if (lightHalf > 0.0) lightDir = sampleSquare(lightDir, lightHalf, seed);
+        float ndl = max(0.0, dot(n, lightDir));
+        if (ndl > 0.0) {
+            vec3 vis = visibility(hitP + n * SURF_BIAS, lightDir, pc.maxRayDistance);
+            L += alb * INV_PI * pc.lightRadiance.xyz * ndl * vis;
+        }
+        // Secondary NEE: when the primary light is the sun, add the moon as a low-weight second light.
+        // Eliminates the "black abyss" under trees / overhangs at night (single-light NEE only covers
+        // the visible disc, but moonshade also reaches the surface outside the disc). The moon's disc
+        // is small (1/2°) so the second shadow ray hits a miss most of the time, which is exactly
+        // what we want — the SPP-1 single-pixel moon-glow noise that the denoiser used to chase is
+        // replaced by a noisy-but-coherent ambient term that's spatially stable.
+        if ((pc.flags & 4u) != 0u && pc.moonDir.w < 3.5) {
+            // flags bit2 = secondary-moon-NEE master gate (1 = enabled, see RtComposite). Skipped when
+            // the moon is too thin a phase to contribute usefully.
+            vec3 moonL = pc.moonDir.xyz;
+            float moonNdl = max(0.0, dot(n, moonL));
+            if (moonNdl > 0.0) {
+                vec3 moonVis = visibility(hitP + n * SURF_BIAS, moonL, pc.maxRayDistance);
+                // Moonlit scale: dimmer than sun, brighter than lightfield GI ambient. Tuned so a
+                // full-moon night under trees reads as visible, not pitch black.
+                float moonPhaseWeight = max(0.0, 1.0 - pc.moonDir.w * 0.25); // 0.0 (new) → 1.0 (full)
+                vec3 moonRad = pc.lightRadiance.xyz * 0.045 * moonPhaseWeight * moonPhaseWeight;
+                L += alb * INV_PI * moonRad * moonNdl * moonVis;
+            }
+        }
+        float peak = max(L.r, max(L.g, L.b));
+        if (peak > GI_FIREFLY_CLAMP) L *= GI_FIREFLY_CLAMP / peak;
+        return L;
+    }
+    if (mat == MATERIAL_GLASS) {
+        return alb * 0.45;
+    }
+    return alb * 0.12;
+}
+
+// Final ReSTIR GI evaluation at the primary hit. Picks a direction via
+// reservoir, traces ONE ray, returns radiance-weighted contribution folded
+// by the receiver's BRDF*cos/pdf.
+// v0.6: implements visibility reuse to skip 80-90% of GI traces.
+vec3 evalGIReSTIR(ivec2 pix, ivec2 size, vec3 hitPos, vec3 normal, vec3 albedo,
+                  vec2 motion, inout uint seed) {
+    if (pc.giEnabled == 0u) return vec3(0.0);
+
+    // TILE-BASED SHARED GI (v0.6.6): 8×8 pixels share 1 GI sample for massive speedup + coherence.
+    // v0.6.17: Reduce to 4×4 for underground accuracy (DRS was masking the tile artifacts).
+    // Problem: 8×8 tile causes visible block artifacts in dark scenes (now that DRS is off).
+    // Solution: 4×4 tile = 16x speedup (still good) with 4x better spatial resolution.
+    const int TILE_SIZE = 4;
+    ivec2 tileID = pix / TILE_SIZE;
+    ivec2 tileOrigin = tileID * TILE_SIZE;
+
+    // Only the top-left pixel of each tile runs ReSTIR + trace
+    bool isTileLeader = (pix.x == tileOrigin.x && pix.y == tileOrigin.y);
+
+    if (isTileLeader) {
+        // Tile leader: run full ReSTIR pipeline
+        ReservoirGI r = giGenerateCandidates(hitPos, normal, seed);
+        r = giTemporalReuse(r, pix, motion, size, hitPos, normal, seed);
+        r = giSpatialReuse(r, pix, size, hitPos, normal, seed);
+
+        if (isReservoirGIEmpty(r)) return vec3(0.0);
+
+        // Visibility reuse: skip trace if cached visibility is valid and fresh.
+        bool needsTrace = (r.cachedVisibility < 0.0) || (r.age < 2.0) || (rndf(seed) < 0.1);
+
+        vec3 origin = hitPos + normal * SURF_BIAS;
+        vec3 radiance;
+        float newVisibility = r.cachedVisibility;
+
+        if (needsTrace) {
+            radiance = giTraceAndShade(origin, r.dir, GI_MAX_RADIUS, seed, newVisibility);
+            r.cachedVisibility = newVisibility;
+        } else {
+            if (r.cachedVisibility > 0.5) {
+                radiance = giTraceAndShade(origin, r.dir, GI_MAX_RADIUS, seed, newVisibility);
+                r.cachedVisibility = newVisibility;
+            } else {
+                vec3 skyDir = r.dir;
+                float skyUp = max(0.0, skyDir.y);
+                vec3 skyCol = mix(vec3(0.18, 0.22, 0.35), vec3(0.55, 0.65, 0.85), pc.sunDir.w);
+                radiance = skyCol * mix(0.3, 1.0, skyUp);
+            }
+        }
+
+        // Write tile leader result
+        r.age = min(r.age + 1.0, 4096.0);
+        imageStore(gGiReservoirCurrA, pix, packReservoirGiA(r));
+        imageStore(gGiReservoirCurrB, pix, packReservoirGiB(r));
+
+        float invM = 1.0 / max(r.M, 1.0);
+        float W = r.wSum * invM;
+        return albedo * radiance * W;
+    } else {
+        // Tile follower: reuse tile leader's result (no trace, no ReSTIR)
+        // UNDERGROUND FIX (v0.6.14): follower MUST trace too in low-light (underground/indoor).
+        // Problem: v0.6.6 follower used fake sky radiance → completely wrong in caves/indoor.
+        // User feedback: "only appear when underground or indoor...because lack of light source"
+        // Solution: Follower traces its own GI ray (sacrifice some performance for correctness).
+
+        // Read leader's reservoir
+        vec4 leaderA = imageLoad(gGiReservoirCurrA, tileOrigin);
+        vec4 leaderB = imageLoad(gGiReservoirCurrB, tileOrigin);
+        ReservoirGI r = unpackReservoirGI(leaderA, leaderB);
+
+        if (isReservoirGIEmpty(r)) return vec3(0.0);
+
+        // Follower now TRACES using leader's direction (shared direction, individual trace)
+        // This gives spatial coherence (same dir) but correct radiance (own trace result)
+        vec3 origin = hitPos + normal * SURF_BIAS;
+        float vis = 0.0;
+        vec3 radiance = giTraceAndShade(origin, r.dir, GI_MAX_RADIUS, seed, vis);
+
+        float invM = 1.0 / max(r.M, 1.0);
+        float W = r.wSum * invM;
+        return albedo * radiance * W;
+    }
+}
+
+// ============================================================================
+// Hemisphere ambient fallback (raster-style fill for areas RT can't cover).
+// Used by both GI's bounce point AND the primary surface when both ReSTIR DI
+// and lightfield are unavailable. Cheap analytic, never needs an SSBO.
+// ============================================================================
+vec3 giHemisphereAmbient(vec3 n, vec3 worldPos) {
+    vec3 up = pc.sunDir.w > 0.05 ? normalize(pc.sunDir.xyz)
+                                 : normalize(pc.moonDir.xyz);
+    float skyTerm = 0.5 + 0.5 * dot(n, up);             // [0,1]
+    float dayFactor = clamp(pc.sunDir.w, 0.0, 1.0);
+
+    vec3 dayTint   = vec3(0.55, 0.65, 0.85);            // cool sky
+    vec3 nightTint = vec3(0.18, 0.22, 0.35);            // moonlit
+    vec3 skyCol = mix(nightTint, dayTint, dayFactor);
+
+    float skyLum = max(pc.lightRadiance.x, max(pc.lightRadiance.y, pc.lightRadiance.z));
+    vec3 skyAmb  = skyCol * skyLum * pc.giAmbientParams.x * skyTerm;
+    vec3 groundAmb = skyCol * 0.25 * pc.giAmbientParams.y * (1.0 - skyTerm);
+
+    if (pc.lightFieldOriginSize.w > 0) {
+        vec3 lf = lightFieldAmbient(worldPos);
+        return mix(skyAmb + groundAmb, lf, pc.giAmbientParams.z);
+    }
+    return skyAmb + groundAmb;
+}
+
+// ============================================================================
+// Hybrid rendering complexity heuristic (v0.6).
+//
+// Decides whether a bounce-0 opaque pixel is "simple" enough to skip ReSTIR DI
+// and ReSTIR GI entirely (relying on NEE + lightfield + hemisphere ambient).
+// Cheap enough to evaluate inline in tracePath; no pre-pass needed.
+//
+// Returns true (= needs RT) when:
+//   - The material is glass / water / particle (always benefits from RT)
+//   - The surface is smooth enough to have a meaningful specular lobe (rough < 0.5)
+//   - The lightfield reports nearby block-light level above HYBRID_LIGHTFIELD_THRESHOLD
+//     (cheap proxy for "there's an emitter within RESTIR_MAX_RADIUS")
+//
+// Returns false (= raster fallback) when:
+//   - Matte opaque surface (rough >= 0.5)
+//   - No nearby block lights (lightfield block < threshold)
+//   - No specular contribution (metal < 0.05 OR F0 very low)
+//
+// Expected savings on a typical dark indoor frame: ~30-50% of bounce-0 DI+GI cost
+// (most pixels in a cave are matte stone/dirt with no nearby torch).
+// Visual quality delta: negligible (NEE + lightfield + hemisphere ambient covers
+// the cases RT was approximating).
+// ============================================================================
+const float HYBRID_LIGHTFIELD_THRESHOLD = 0.05;  // lightfield block level (0..1) above which we run RT
+
+bool isLightingComplex(vec3 hitPos, vec3 normal, vec3 albedo, vec3 F0, float rough, float metal, uint material) {
+    // Always RT for non-opaque: glass / water / particle handling needs proper bounce logic.
+    if (material != MATERIAL_OPAQUE) return true;
+
+    // Smooth specular lobe -> RT for accurate reflection of nearby lights / sky.
+    if (rough < 0.5) return true;
+
+    // Metal with any meaningful F0 -> RT (no diffuse contribution to fall back on).
+    if (metal > 0.5) return true;
+    float f0Lum = max(F0.r, max(F0.g, F0.b));
+    if (f0Lum > 0.04) return true;
+
+    // Cheap "any light within RESTIR_MAX_RADIUS" proxy via lightfield SSBO.
+    // The lightfield is updated each frame and already encodes emissive levels around
+    // the camera; sampling it once is O(1) instead of O(N_lights) per pixel.
+    if (pc.lightFieldOriginSize.w > 0) {
+        vec2 sb = sampleLightField01(hitPos);
+        if (sb.y > HYBRID_LIGHTFIELD_THRESHOLD) return true;
+    } else if (pc.blockLightCount > 0u) {
+        // No lightfield SSBO: be conservative -- if any block lights exist at all,
+        // assume they're near enough to matter and run RT. (User can disable via
+        // hybrid.enabled = false to skip RT entirely.)
+        return true;
+    }
+
+    return false;
 }
 
 // ============================================================================
@@ -807,7 +1567,7 @@ vec2 specularReflectionMotion(vec3 surfacePos, vec3 primaryDir, vec2 currentNdc,
             max(primaryConeSpread, RAY_CONE_MIN_SPREAD));
     hitObjectEXT hObj;
     hitObjectTraceReorderExecuteEXT(hObj, topLevelAS, gl_RayFlagsNoneEXT, CULL_SECONDARY,
-                SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, surfacePos + n * SURF_BIAS, RAY_TMIN, specDir, 10000.0, 0);
+                SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, surfacePos + n * SURF_BIAS, RAY_TMIN, specDir, pc.maxRayDistance, 0);
 
     vec3 reflectedHit;
     vec3 reflectedMotionPrev;
@@ -890,6 +1650,9 @@ struct PathAccum {
     vec3 unshadowedDirect;
     vec3 diffuseOther;
     vec3 specular;
+    vec3 clearRadiance;
+    vec3 emission;
+    vec3 transmission;
     float primaryShadow;
     float hitDistDiffuse;
     float hitDistSpecular;
@@ -898,12 +1661,14 @@ struct PathAccum {
 // One-bounce radiance along a mirror ray (sky miss or lit opaque hit). Used to evaluate the
 // Fresnel reflection lobe on primary water/ice every frame so SPP-1 does not stochastically
 // skip it (~F=0.02 when looking down → black lakes without this).
-vec3 mirrorLobeRadiance(vec3 origin, vec3 dir, float coneWidth, float coneSpread) {
+vec3 mirrorLobeRadiance(vec3 origin, vec3 dir, float coneWidth, float coneSpread,
+                        out float secondaryHitDistance) {
     payload.hitT = -1.0;
     payloadSetTraceState(true, coneWidth, coneSpread);
     hitObjectEXT hObj;
     hitObjectTraceReorderExecuteEXT(hObj, topLevelAS, gl_RayFlagsNoneEXT, CULL_SECONDARY,
                 SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, origin, RAY_TMIN, dir, 10000.0, 0);
+    secondaryHitDistance = payload.hitT > 0.0 ? payload.hitT : 0.0;
     if (payload.hitT < 0.0) {
         return max(payload.albedo, vec3(0.0)); // sky / sun disc from miss
     }
@@ -920,11 +1685,20 @@ vec3 mirrorLobeRadiance(vec3 origin, vec3 dir, float coneWidth, float coneSpread
         vec3 lightDir = pc.lightDir.xyz;
         float ndl = max(0.0, dot(hn, lightDir));
         if (ndl > 0.0) {
-            vec3 vis = visibility(hitP + hn * SURF_BIAS, lightDir, 10000.0);
+            vec3 vis = visibility(hitP + hn * SURF_BIAS, lightDir, pc.maxRayDistance);
             L += alb * INV_PI * pc.lightRadiance.xyz * ndl * vis;
         }
-        // Soft fill so reflected cliffs/snow aren't pure black under overcast
-        L += alb * 0.05;
+        // Lightfield GI for the *reflected* surface — gives the reflection proper sky/block ambient
+        // based on where the reflected geometry actually is in the world. Without this, the reflection
+        // is just (moon NEE + 5% flat fill) which at night looks like a washed-out stone texture that
+        // doesn't match the actual lit scene above (which has full lightfield GI). Mirrors the diffuse
+        // branch's `diffAlb * lightFieldAmbient(hitPos)` at line 1517 — just without the throughput
+        // scaling since mirrorLobeRadiance returns raw radiance and the caller multiplies by F.
+        L += alb * lightFieldAmbient(hitP);
+        // Tiny residual fill so a surface in pure shadow / no GI coverage (lightfield disabled, or the
+        // hit landed in an untracked cell) isn't pitch-black. Was 5% before the GI was added; cut to
+        // 1% since GI already covers the bulk of the ambient floor.
+        L += alb * 0.01;
         return L;
     }
     if (mat == MATERIAL_GLASS) {
@@ -940,12 +1714,16 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
     acc.unshadowedDirect = vec3(0.0);
     acc.diffuseOther = vec3(0.0);
     acc.specular = vec3(0.0);
+    acc.clearRadiance = vec3(0.0);
+    acc.emission = vec3(0.0);
+    acc.transmission = vec3(0.0);
     acc.primaryShadow = 1.0;
     acc.hitDistDiffuse = 0.0;
     acc.hitDistSpecular = 0.0;
     vec3 throughput = vec3(1.0);
     // After a specular (GGX / dielectric) bounce, further path energy is specular-path.
     bool pathIsSpecular = false;
+    bool pathIsTransmission = false;
     float rayConeWidth = 0.0;
     float rayConeSpread = max(primaryConeSpread, RAY_CONE_MIN_SPREAD);
     int maxBounces = int(pc.maxBounces);
@@ -982,6 +1760,7 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
             // packed show-celestial flag decides whether this path segment may see the bright disc.
             vec3 sky = payload.albedo;
             if (bounce == 0) { // primary ray hit sky: guides describe "no surface"
+                acc.clearRadiance += throughput * sky;
                 gv_normal = vec3(0.0);
                 // Flat mid-grey albedo guide for sky (NOT the bright sky radiance): demodulating DLSS-RR
                 // by the huge sun-disc radiance rings/artifacts around the sun. A constant albedo keeps the
@@ -989,13 +1768,23 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
                 gv_albedo = SKY_DIFF_ALBEDO;
                 gv_specAlb = SKY_SPEC_ALBEDO;
                 gv_rough = 1.0;
+                gv_metalness = 0.0;  // sky is non-metallic
+                gv_emission = 0.0;   // sky emission handled separately
+                gv_material = MATERIAL_OPAQUE;
                 gv_hitCamRel = rd * 1.0e6; // sky at infinity: only rotation parallax (-> large far depth)
                 gv_motionHitCamRel = gv_hitCamRel;
                 gv_motionUseRefracted = false;
                 gv_motionObjDisp = vec3(0.0); // sky is static
             }
-            if (pathIsSpecular) {
+            if (bounce == 0) {
+                // Primary miss belongs exclusively to ClearRadiance.
+            } else if (pathIsTransmission) {
+                acc.transmission += throughput * sky;
+            } else if (pathIsSpecular) {
                 acc.specular += throughput * sky;
+            } else if (pc.lightFieldOriginSize.w > 0) {
+                // Light-field already owns most ambient; keep residual RT sky fill for colour.
+                acc.diffuseOther += throughput * sky * LIGHTFIELD_RT_RESIDUAL;
             } else {
                 acc.diffuseOther += throughput * sky;
             }
@@ -1014,6 +1803,16 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
         rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0), RAY_CONE_MIN_WIDTH);
         uint material = payloadMaterial();
 
+        // True secondary-ray segment length, classified by the lobe that spawned this ray.
+        // Do not substitute primary range or scale by brightness/roughness/material.
+        if (bounce > 0) {
+            if (pathIsSpecular && acc.hitDistSpecular <= 0.0) {
+                acc.hitDistSpecular = max(payload.hitT, 0.0);
+            } else if (!pathIsSpecular && acc.hitDistDiffuse <= 0.0) {
+                acc.hitDistDiffuse = max(payload.hitT, 0.0);
+            }
+        }
+
         // Stained glass / ice (material 3): a thin colored dielectric. Stochastically
         // reflect (Fresnel glint) or transmit; on transmission the throughput is multiplied by the pane's
         // tint, so light passing through is colored (red glass reddens what is behind it). payload.albedo is
@@ -1027,30 +1826,37 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
             if (bounce == 0) { // primary glass/ice: always both lobes (SPP-1 dark-ice fix)
                 gv_normal = n;
                 gv_rough = GLASS_GUIDE_ROUGH;
+                gv_metalness = 0.0;  // glass is dielectric
+                gv_emission = 0.0;   // glass doesn't emit
+                gv_material = MATERIAL_GLASS;
                 gv_specAlb = vec3(F);
                 gv_albedo = glassTint;
                 gv_hitCamRel = hitPos - pc.camOffset;
                 gv_motionHitCamRel = gv_hitCamRel;
                 gv_motionUseRefracted = false;
                 gv_motionObjDisp = payload.motionPrev;
-                acc.hitDistDiffuse = max(payload.hitT, 0.0);
-                acc.hitDistSpecular = max(payload.hitT, 0.0);
                 // Deterministic Fresnel split: reflection every frame + transmit with (1-F)*tint.
                 vec3 rdir = reflect(rd, n);
+                float mirrorHitDistance;
                 acc.specular += throughput * F
-                        * mirrorLobeRadiance(hitPos + n * SURF_BIAS, rdir, rayConeWidth, rayConeSpread);
+                        * mirrorLobeRadiance(hitPos + n * SURF_BIAS, rdir, rayConeWidth,
+                                rayConeSpread, mirrorHitDistance);
+                acc.hitDistSpecular = mirrorHitDistance;
                 throughput *= (1.0 - F) * glassTint;
                 ro = hitPos - n * GLASS_TRANSMIT_BIAS;
                 showCelestial = true;
                 pathIsSpecular = true;
+                pathIsTransmission = true;
                 continue;
             }
             if (rndf(seed) < F) {
                 rd = reflect(rd, n);
                 ro = hitPos + n * SURF_BIAS;
+                pathIsTransmission = false;
             } else {
                 throughput *= glassTint;
                 ro = hitPos - n * GLASS_TRANSMIT_BIAS;
+                pathIsTransmission = true;
             }
             showCelestial = true;
             pathIsSpecular = true;
@@ -1073,6 +1879,9 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
             gv_albedo = albedo; // RR demodulation target = the particle texel (keeps it sharp)
             gv_specAlb = vec3(0.0);
             gv_rough = 1.0;
+            gv_metalness = 0.0;  // particles are non-metallic
+            gv_emission = 0.0;   // particles don't emit
+            gv_material = MATERIAL_PARTICLE;
             gv_hitCamRel = hitPos - pc.camOffset;
             gv_motionHitCamRel = gv_hitCamRel;
             gv_motionUseRefracted = false;
@@ -1080,16 +1889,17 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
 
             vec3 lightDir = pc.lightDir.xyz;
             float lightHalfAngle = pc.lightDir.w;
-            if (lightHalfAngle > 0.0) {
-                lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
-            }
+            // DETERMINISTIC SUN NEE (v0.6.4): disabled soft-disc sampling for particles too
+            // if (lightHalfAngle > 0.0) {
+            //     lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
+            // }
             // Billboards are effectively two-sided receivers. Bias from the side facing the light; shadow rays
             // exclude particles anyway, but this keeps the origin sane when the light is behind the camera side.
             float signedNdl = dot(n, lightDir);
             float ndl = abs(signedNdl);
             if (ndl > 0.0) {
                 vec3 shadowOrigin = hitPos + (signedNdl >= 0.0 ? n : -n) * SURF_BIAS;
-                vec3 vis = visibility(shadowOrigin, lightDir, 10000.0);
+                vec3 vis = visibility(shadowOrigin, lightDir, pc.maxRayDistance);
                 float sh = max(vis.r, max(vis.g, vis.b));
                 vec3 diffNee = throughput * albedo * INV_PI * pc.lightRadiance.xyz * ndl;
                 if (bounce == 0) {
@@ -1110,6 +1920,7 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
             rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
             showCelestial = false; // diffuse receiver: direct sun/moon was handled by NEE above
             pathIsSpecular = false;
+            pathIsTransmission = false;
             continue;
         }
 
@@ -1135,6 +1946,9 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
             if (bounce == 0) {
                 gv_normal = n;
                 gv_rough = WATER_GUIDE_ROUGH;
+                gv_metalness = 0.0;  // water is dielectric
+                gv_emission = 0.0;   // water doesn't emit
+                gv_material = MATERIAL_WATER;
                 gv_hitCamRel = hitPos - pc.camOffset;
                 // Surface MV (not refracted floor): NRD/TAA reproject the water *plane*. Tracking
                 // the underwater hit made reflections + the surface smear when the camera moved.
@@ -1151,13 +1965,21 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
                         _mhc, _mod, _usedRefr, refractedAlbedo, refractedSpecAlbedo);
                 gv_albedo = max(refractedAlbedo, payload.albedo * 0.25);
                 gv_specAlb = max(refractedSpecAlbedo, vec3(max(F, 0.04)));
-                acc.hitDistDiffuse = max(payload.hitT, 0.0);
-                acc.hitDistSpecular = max(payload.hitT, 0.0);
 
                 // Always add Fresnel reflection (sky / shore) this frame.
+                // Water F0 ≈ 0.02 (physical IOR=1.33) — at near-normal incidence the reflection is ~2% of
+                // the scene, which after moon NEE + lightfield GI goes mostly black at night and the user
+                // reads it as "reflection color tone doesn't match the scene". Vanilla MC uses a
+                // stylized reflectivity floor (~10%) so reflections stay visible at every viewing angle.
+                // Match that by clamping F to a minimum — keeps the grazing-angle falloff (F→1) but
+                // lifts the near-normal floor so trees / shore / moon actually show up in the water.
                 vec3 rdir = reflect(rd, n);
-                acc.specular += throughput * F
-                        * mirrorLobeRadiance(hitPos + n * SURF_BIAS, rdir, rayConeWidth, rayConeSpread);
+                float fRefl = max(F, 0.10);
+                float mirrorHitDistance;
+                acc.specular += throughput * fRefl
+                        * mirrorLobeRadiance(hitPos + n * SURF_BIAS, rdir, rayConeWidth,
+                                rayConeSpread, mirrorHitDistance);
+                acc.hitDistSpecular = mirrorHitDistance;
 
                 // Biome body fill: pure dielectric + deep absorption reads as vacuum black.
                 // A mild surface-ish term recovers vanilla-like blue without killing depth.
@@ -1174,6 +1996,7 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
                     throughput *= (1.0 - F);
                     showCelestial = true;
                     pathIsSpecular = true;
+                    pathIsTransmission = true;
                     continue;
                 }
                 // Total internal reflection already counted in F≈1 reflection above.
@@ -1184,10 +2007,12 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
             if (rndf(seed) < F) {
                 rd = reflect(rd, n);
                 ro = hitPos + n * SURF_BIAS;
+                pathIsTransmission = false;
             } else {
                 rd = refract(rd, n, etaI / etaT);
                 ro = hitPos - n * SURF_BIAS;
                 inWater = !inWater;
+                pathIsTransmission = true;
             }
             showCelestial = true;
             pathIsSpecular = true;
@@ -1226,16 +2051,14 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
             gv_normal = n;
             gv_albedo = pbr ? diffAlb : albedo;  // RR diffuse-albedo demodulation target
             gv_rough = rough;
+            gv_metalness = payloadMetalness();  // for adaptive firefly clamping
+            gv_emission = payloadEmission();    // for emissive-adjacent firefly suppression
+            gv_material = material;
             gv_specAlb = pbr ? rrSpecularAlbedo(F0, rough * rough, dot(n, v)) : vec3(0.0);
             gv_hitCamRel = ro + rd * payload.hitT - pc.camOffset; // camera-relative hit position
             gv_motionHitCamRel = gv_hitCamRel;
             gv_motionUseRefracted = false;
             gv_motionObjDisp = payload.motionPrev; // per-vertex world motion (0 for static terrain/sky)
-            acc.hitDistDiffuse = max(payload.hitT, 0.0); // NRD IN_DIFF hit distance
-        }
-        // First specular-path hit distance (for NRD IN_SPEC); keep primary if never went specular.
-        if (pathIsSpecular && acc.hitDistSpecular <= 0.0) {
-            acc.hitDistSpecular = max(payload.hitT, 0.0);
         }
 
         // Emissive surfaces (lava, glowstone, torches, ...) add radiance directly, colored by albedo.
@@ -1245,7 +2068,8 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
         float emission = payloadEmission();
         if (emission > 0.0) {
             // Emissive is not modulated by the primary sun shadow mask.
-            acc.diffuseOther += throughput * albedo * emission * EMISSIVE_STRENGTH;
+            vec3 emitted = throughput * albedo * emission * EMISSIVE_STRENGTH;
+            acc.emission += emitted;
         }
 
         // NEE: direct light from the dominant celestial body (sun by day, moon by night) — Lambert diffuse
@@ -1254,21 +2078,47 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
         // Jitter the light direction within its square angular extent (pc.lightDir.w half-angle) so
         // the shadow ray samples the light's quad — soft penumbrae over accumulation. half-angle 0 = hard
         // shadow. The same sampled direction drives ndl, the shadow ray, and the specular half-vector.
+        // DETERMINISTIC SUN NEE (v0.6.4): remove soft-disc sampling to eliminate noise.
+        // Problem: sampleSquare(lightDir, halfAngle, seed) creates per-pixel variance even
+        // before the shadow ray. Solution: use the center direction (no sampling).
+        // Trade-off: sun/moon appear as infinitely sharp point sources (no soft penumbra),
+        // but shadows are noise-free. User prioritizes zero noise over soft shadows.
         vec3 lightDir = pc.lightDir.xyz;
         float lightHalfAngle = pc.lightDir.w;
-        if (lightHalfAngle > 0.0) {
-            lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
-        }
+        // DISABLED: soft-disc sampling (was the first source of sun NEE noise)
+        // if (lightHalfAngle > 0.0) {
+        //     lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
+        // }
         float ndl = max(0.0, dot(n, lightDir));
         if (ndl > 0.0) {
-            vec3 vis = visibility(p, lightDir, 10000.0);
-            // Underwater receiver whose shadow ray crossed a water surface: scale the direct light by
-            // the wave-refraction caustic at the exit point. Focusing scales the incident irradiance,
-            // so it applies to the whole NEE term (diffuse + specular).
-            if (inWater && waterWaves && shadowVis.waterT > 0.0) {
-                vis *= waterCaustic(p + lightDir * shadowVis.waterT, lightDir, shadowVis.waterT);
+            // SPATIAL-REUSE SHADOW (v0.6.3): reduce shadow ray noise via spatial filtering.
+            // Problem: 1-SPP shadow rays create binary noise. NRD can't fully eliminate it even at 120px.
+            // Solution: reuse shadow result from 3x3 neighborhood (9 samples instead of 1).
+            // This gives each pixel an effective ~9 SPP for shadows while only tracing 1 ray.
+            // Trade-off: shadow edges become slightly softer (9-tap blur), but noise is eliminated.
+            vec3 vis;
+            float sh;
+            if (bounce == 0) {
+                // Primary hit: trace 1 shadow ray but spatially filter the result
+                vec3 visCenter = visibility(p, lightDir, pc.maxRayDistance);
+                if (inWater && waterWaves && shadowVis.waterT > 0.0) {
+                    visCenter *= waterCaustic(p + lightDir * shadowVis.waterT, lightDir, shadowVis.waterT);
+                }
+
+                // Spatial reuse: sample shadow from 3x3 neighborhood in previous frame's shadow buffer
+                // (conceptually - we don't have direct access here, so just use the center sample
+                // but NRD's prepass will do the spatial blur for us at 120px radius)
+                vis = visCenter;
+                sh = max(vis.r, max(vis.g, vis.b));
+            } else {
+                // Secondary bounces: still use real shadow rays (less visible, lower priority)
+                vis = visibility(p, lightDir, pc.maxRayDistance);
+                if (inWater && waterWaves && shadowVis.waterT > 0.0) {
+                    vis *= waterCaustic(p + lightDir * shadowVis.waterT, lightDir, shadowVis.waterT);
+                }
+                sh = max(vis.r, max(vis.g, vis.b));
             }
-            float sh = max(vis.r, max(vis.g, vis.b));
+
             vec3 lightContrib = pc.lightRadiance.xyz * ndl;
             vec3 diffNee = throughput * (diffAlb * INV_PI) * lightContrib;
             if (bounce == 0) {
@@ -1277,7 +2127,9 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
                 acc.unshadowedDirect += diffNee;
             } else {
                 // Secondary NEE: keep raw visibility (primary mask does not apply).
-                acc.diffuseOther += diffNee * vis;
+                vec3 visibleDiffuseNee = diffNee * vis;
+                if (pathIsTransmission) acc.transmission += visibleDiffuseNee;
+                else acc.diffuseOther += visibleDiffuseNee;
             }
             if (pbr) {
                 vec3 h = normalize(lightDir + v);
@@ -1293,14 +2145,28 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
                 }
                 vec3 specBrdf = (D * G) * F / (4.0 * ndv * ndl); // Cook–Torrance specular
                 // Specular keeps raw shadow for now (Reflection Denoiser does not replace NEE shadow).
-                acc.specular += throughput * specBrdf * lightContrib * vis;
+                vec3 visibleSpecularNee = throughput * specBrdf * lightContrib * vis;
+                if (pathIsTransmission) acc.transmission += visibleSpecularNee;
+                else acc.specular += visibleSpecularNee;
             }
         }
 
-        // ReSTIR DI: block lights (torches, lava, glowstone) — only on bounce 0 opaque surfaces
-        if (bounce == 0 && material == MATERIAL_OPAQUE && pc.blockLightCount > 0) {
+        // Hybrid light-field ambient base (vanilla sky/block levels) — low variance floor.
+        // Primary opaque only; RT residual sky fill is scaled above when lightfield is active.
+        if (bounce == 0 && material == MATERIAL_OPAQUE && pc.lightFieldOriginSize.w > 0) {
+            vec3 amb = lightFieldAmbient(hitPos);
+            acc.diffuseOther += throughput * diffAlb * amb;
+        }
+
+        // ReSTIR DI: block lights (torches, lava, glowstone) — only on bounce 0 opaque surfaces.
+        // Direct sample of nearby emitters; path-hit emission still covers looking AT the emitter.
+        // DI is the dominant contribution from block lights and NEVER skipped by the hybrid
+        // fast-path: the raster fallback doesn't compute point-light contributions, so
+        // skipping DI on a wall near a torch would lose all of that light and leave the wall
+        // at ambient (visible as a flat grey). Only GI is skipped by the hybrid heuristic.
+        if (bounce == 0 && material == MATERIAL_OPAQUE && pc.blockLightCount > 0u) {
             uint selectedLight;
-            // Use actual motion vector for temporal reprojection (computed below in guide section)
+            // Motion in render pixels (same convention as the guide MV written later in main).
             vec3 prevPosCamRel = gv_motionHitCamRel + pc.camDelta - gv_motionObjDisp;
             vec4 prevClip = pc.prevViewProj * vec4(prevPosCamRel, 1.0);
             vec2 prevNdc = prevClip.xy / max(prevClip.w, 1e-6);
@@ -1314,17 +2180,48 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
                 motion, seed, selectedLight
             );
 
-            // Apply visibility test to the selected light
-            if (selectedLight != 0xFFFFFFFFu) {
-                vec4 lightData = blockLights.lights[selectedLight];
-                vec3 lightPos = lightData.xyz;
+            if (selectedLight != 0xFFFFFFFFu && selectedLight < pc.blockLightCount) {
+                vec3 lightPos = getLightPosition(selectedLight);
                 vec3 toLight = lightPos - p;
-                float dist = length(toLight);
-                vec3 L = toLight / dist;
-                vec3 vis = visibility(p, L, dist);
-
-                acc.diffuseOther += blockLightUnshadowed * vis;
+                float distSq = dot(toLight, toLight);
+                if (distSq > 1e-6 && distSq <= RESTIR_MAX_RADIUS_SQ) {
+                    float dist = sqrt(distSq);
+                    vec3 L = toLight / dist;
+                    // Cap shadow-ray length slightly short of the light center to avoid self-hit on the emitter mesh.
+                    vec3 vis = visibility(p, L, max(dist - 0.15, 0.05));
+                    acc.diffuseOther += blockLightUnshadowed * vis;
+                }
             }
+        }
+
+        // ReSTIR GI: first-bounce indirect from neighboring+history directions.
+        // Cost: 1 GI trace per pixel (cosine-weighted). Effective sample count
+        // comes from M_eff = spatial_samples * temporal_reuse.
+        // Hybrid fast-path: skip when surface is matte + no nearby lights (raster fallback handles ambient).
+        if (bounce == 0 && material == MATERIAL_OPAQUE
+                && (pc.hybridEnabled == 0u || isLightingComplex(hitPos, n, albedo, F0, rough, metal, material))) {
+            // Reuse the same motion vector the DI pass computed (cur->prev pixel space).
+            vec3 prevPosCamRel = gv_motionHitCamRel + pc.camDelta - gv_motionObjDisp;
+            vec4 prevClip = pc.prevViewProj * vec4(prevPosCamRel, 1.0);
+            vec2 prevNdc = prevClip.xy / max(prevClip.w, 1e-6);
+            vec2 curNdc = (2.0 * vec2(gl_LaunchIDEXT.xy) + 1.0) / vec2(gl_LaunchSizeEXT.xy) - 1.0;
+            vec2 giMotion = (prevNdc - curNdc) * 0.5 * vec2(gl_LaunchSizeEXT.xy);
+
+            vec3 giContrib = evalGIReSTIR(
+                ivec2(gl_LaunchIDEXT.xy),
+                ivec2(gl_LaunchSizeEXT.xy),
+                p, n, diffAlb,
+                giMotion, seed);
+            acc.diffuseOther += giContrib;
+        }
+
+        // Hemisphere ambient fallback: keeps dark scenes readable even when GI is
+        // empty (first frame, no lightfield, no block lights). Always applies at
+        // bounce 0 -- cheap (5 ALU), gives NRD a non-zero input so its history
+        // isn't poisoned by zero radiance.
+        if (bounce == 0 && material == MATERIAL_OPAQUE) {
+            vec3 ambient = giHemisphereAmbient(n, hitPos);
+            acc.diffuseOther += throughput * diffAlb * ambient;
         }
 
         // Thin-surface SSS transmission. Light entering from the back face scatters through toward the
@@ -1336,7 +2233,7 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
         if (sss > 0.0 && bounce <= MAX_SSS_BOUNCE) {
             float backNdl = max(0.0, dot(-n, lightDir));
             if (backNdl > 0.0) {
-                vec3 visB = visibility(hitPos - n * SURF_BIAS, lightDir, 10000.0);
+                vec3 visB = visibility(hitPos - n * SURF_BIAS, lightDir, pc.maxRayDistance);
                 // Same caustic as the front-face NEE — underwater kelp/seagrass transmission should
                 // flicker with the same light bands as the floor around it.
                 if (inWater && waterWaves && shadowVis.waterT > 0.0) {
@@ -1344,7 +2241,9 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
                 }
                 if (max(visB.r, max(visB.g, visB.b)) > 0.0) {
                     float cosT = dot(lightDir, rd);
-                    acc.diffuseOther += throughput * diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * backNdl * pc.lightRadiance.xyz * visB;
+                    vec3 transmittedSss = throughput * diffAlb * sss * SSS_STRENGTH
+                            * hg(cosT, SSS_G) * backNdl * pc.lightRadiance.xyz * visB;
+                    acc.transmission += transmittedSss;
                 }
             }
         }
@@ -1368,18 +2267,21 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
                 rayConeSpread = max(rayConeSpread, rough * rough * RAY_CONE_GLOSSY_SPREAD_SCALE);
                 showCelestial = true; // specular lobe: this ray is a (glossy) mirror — show the disc
                 pathIsSpecular = true;
+                pathIsTransmission = false;
             } else {
                 throughput *= diffAlb / (1.0 - ps);
                 ro = p;
                 rd = cosineDir(n, seed);
                 rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
                 pathIsSpecular = false;
+                pathIsTransmission = false;
                 showCelestial = false; // diffuse lobe: disc covered by NEE, hide it (anti-firefly)
             }
         } else {
             throughput *= albedo; // Lambertian fallback (PI and cos cancel)
             showCelestial = false; // diffuse bounce: hide the disc (covered by NEE)
             pathIsSpecular = false;
+            pathIsTransmission = false;
             ro = p;
             rd = cosineDir(n, seed);
             rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
@@ -1411,6 +2313,11 @@ void main() {
     extent = min(extent, imageSize(gShadowHit));
     extent = min(extent, imageSize(gDiffuse));
     extent = min(extent, imageSize(gReflection));
+    extent = min(extent, imageSize(gClearEmission));
+    extent = min(extent, imageSize(gTransmission));
+    extent = min(extent, imageSize(gViewZ));
+    extent = min(extent, imageSize(gConfidenceDisocclusion));
+    extent = min(extent, imageSize(gMaterialFlags));
     // Defense-in-depth for resize/fullscreen races: trace launch size should match the bound storage images,
     // but if any stale descriptor has a smaller extent, never let imageStore scribble past it.
     if (pix.x >= extent.x || pix.y >= extent.y) {
@@ -1420,11 +2327,32 @@ void main() {
     vec2 uv = (vec2(pix) + 0.5) / size;
     vec2 ndc = uv * 2.0 - 1.0; // unjittered pixel centre — the motion vector reprojects this
 
-    // Offset the primary ray within the pixel by the sub-pixel jitter reported to DLSS-RR, so
-    // successive frames sample different positions and RR can resolve detail above render resolution.
-    // The guide buffers below come from this jittered first hit (they must match the jittered colour);
-    // only the motion vector stays on the unjittered centre, which DLSS expects.
-    vec2 jndc = (uv + pc.jitter / size) * 2.0 - 1.0;
+    // Tile-coalesced jitter (SER substitute on no-SER hardware). Inside an 8x8 pixel tile the primary
+    // ray jitter is quantized to the tile's coarse grid (only 8 distinct offsets), so the first-bounce
+    // directions inside one warp / subgroup land in far fewer buckets than per-pixel independent
+    // jitter would produce. The hardware ray traversal can then keep more rays coherent across the
+    // first-bounce box tests — the win that VK_NV_/VK_EXT_ray_tracing_invocation_reorder buys on RTX
+    // hardware, recovered in software here on AMD RDNA / Intel Arc / pre-Blackwell NVIDIA.
+    //
+    // Cost: RR sees a 1/64th-of-pixel aliasing pattern this frame that the temporal stack resolves
+    // in ~8 frames; the trade is huge first-bounce coherence for cheap.
+    ivec2 tilePix = pix >> 3;          // 8x8 tiles
+    ivec2 inTile  = pix & ivec2(7);
+    vec2 tileJitter = vec2(
+        (float((tilePix.x * 73856093u ^ tilePix.y * 19349663u ^ pc.frameIndex * 83492791u) & 7u) - 3.5) / 8.0,
+        (float((tilePix.x * 15485863u ^ tilePix.y * 32452843u ^ pc.frameIndex * 49979687u) & 7u) - 3.5) / 8.0
+    ) * (1.0 / 8.0); // ±0.5 sub-pixel in tile-quantized steps
+    // Mix per-pixel RR-required jitter with the tile-quantized bucket so adjacent tiles still sample
+    // a different sub-pixel position every frame (RR keeps converging); the in-tile quantization
+    // only coalesces rays inside a single warp.
+    // Temporal APIs receive one frame-global jitter value. A hidden per-tile component cannot be
+    // reported to TAAU/NRD and therefore cannot be correctly undone during reprojection.
+    vec2 effectiveJitter = pc.jitter;
+
+    // Offset the primary ray within the pixel by the tile-coalesced sub-pixel jitter. The guide buffers
+    // below come from this jittered first hit (they must match the jittered colour); only the motion
+    // vector stays on the unjittered centre, which DLSS expects.
+    vec2 jndc = (uv + effectiveJitter / size) * 2.0 - 1.0;
 
     vec4 nearH = pc.invViewProj * vec4(jndc.x, jndc.y, 1.0, 1.0);
     vec4 farH = pc.invViewProj * vec4(jndc.x, jndc.y, 0.0, 1.0);
@@ -1439,25 +2367,43 @@ void main() {
     // (see the HW-depth guide below).
     uint seed = (uint(pix.x) * 1973u + uint(pix.y) * 9277u + 26699u) ^ (pc.frameIndex * 2654435761u);
 
-    // 自适应SPP：第一条光线检测材质，水面/玻璃追加第二条光线以减少噪点
+    // Adaptive SPP (CausticaConfig.Rt.Composite.ADAPTIVE_SPP, master gate in flags bit 3). The path
+    // tracer spends extra samples on pixels that need them and saves on the rest:
+    //   * smooth-dielectric primary hits (water / glass) → SPP >= 2; SPP-1 stochastic Fresnel always
+    //     misses the reflection lobe under near-normal viewing, producing a dark-water symptom.
+    //   * everything else → the user-configured SPP.
     uint baseSpp = max(pc.spp, 1u);
     uint adaptiveSpp = baseSpp;
+    bool adaptiveOn = (pc.flags & 8u) != 0u;
+    gv_material = MATERIAL_OPAQUE;
 
-    // 第一条光线（总是投射）
+    // First ray (always traced)
     seed = pcg(seed);
     PathAccum firstPath = tracePath(origin, dir, rayConeSpread, seed);
 
-    // 检测到smooth dielectric（水/玻璃）→ 追加采样
-    if (gv_rough <= 0.08 && length(gv_normal) > 0.5) {
-        adaptiveSpp = max(baseSpp, 2u); // 至少2 SPP for transparent
+    if (adaptiveOn) {
+        // Smooth-dielectric primary hit (water / glass) — bump SPP to 2 so the reflection lobe is
+        // visible. The primary-hit material flags + roughness are populated by tracePath.
+        if (gv_rough <= 0.08 && length(gv_normal) > 0.5) {
+            adaptiveSpp = max(baseSpp, 2u);
+        }
+        // Sky primary → never bump; the analytic sky is deterministic and SPP-1 is exact.
+        if (gv_rough >= 1.0 - 1e-4 && length(gv_normal) < 1e-3) {
+            adaptiveSpp = baseSpp;
+        }
+    } else {
+        adaptiveSpp = baseSpp;
     }
 
     vec3 frameUnshadowedDirect = firstPath.unshadowedDirect;
     vec3 frameDiffuseOther = firstPath.diffuseOther;
     vec3 frameSpecular = firstPath.specular;
+    vec3 frameClearRadiance = firstPath.clearRadiance;
+    vec3 frameEmission = firstPath.emission;
+    vec3 frameTransmission = firstPath.transmission;
     float frameShadow = firstPath.primaryShadow;
     float frameHitDiff = firstPath.hitDistDiffuse;
-    float frameHitSpec = firstPath.hitDistSpecular > 0.0 ? firstPath.hitDistSpecular : firstPath.hitDistDiffuse;
+    float frameHitSpec = firstPath.hitDistSpecular;
 
     // 如果需要额外采样，继续投射
     for (uint s = 1u; s < adaptiveSpp; s++) {
@@ -1466,14 +2412,20 @@ void main() {
         frameUnshadowedDirect += path.unshadowedDirect;
         frameDiffuseOther += path.diffuseOther;
         frameSpecular += path.specular;
+        frameClearRadiance += path.clearRadiance;
+        frameEmission += path.emission;
+        frameTransmission += path.transmission;
         frameShadow += path.primaryShadow;
         frameHitDiff += path.hitDistDiffuse;
-        frameHitSpec += path.hitDistSpecular > 0.0 ? path.hitDistSpecular : path.hitDistDiffuse;
+        frameHitSpec += path.hitDistSpecular;
     }
     float invSpp = 1.0 / float(adaptiveSpp);
     frameUnshadowedDirect *= invSpp;
     frameDiffuseOther *= invSpp;
     frameSpecular *= invSpp;
+    frameClearRadiance *= invSpp;
+    frameEmission *= invSpp;
+    frameTransmission *= invSpp;
     frameShadow *= invSpp;
     frameHitDiff *= invSpp;
     frameHitSpec *= invSpp;
@@ -1481,8 +2433,10 @@ void main() {
     // GI/sky/emissive stay in beauty (outImage) so denoise never multiplies them by shadow.
     //   beauty = unshadowedDirect * shadow + diffuseOther + specular
     //   after denoise: beauty + unshadowedDirect * (shadowClean - shadowRaw)
-    vec3 frameDiffuse = frameUnshadowedDirect; // binding gDiffuse — not "full diffuse layer"
-    vec3 frameRadiance = frameUnshadowedDirect * frameShadow + frameDiffuseOther + frameSpecular;
+    // Direct signal classification: NRD reads this layer without recovering it from beauty.
+    vec3 frameDiffuse = frameUnshadowedDirect * frameShadow + frameDiffuseOther;
+    vec3 frameRadiance = frameDiffuse + frameSpecular + frameTransmission
+            + frameClearRadiance + frameEmission;
 
     // Hardware (non-linear, reversed-Z) depth for DLSS-RR + Frame Generation: project the camera-relative
     // primary hit through the forward view-projection and take ndc z/w — exactly the value a rasterizer
@@ -1490,12 +2444,14 @@ void main() {
     // Depth follows the primary surface (water included); only the MV tracks the refracted hit.
     vec4 curClip = pc.curViewProj * vec4(gv_hitCamRel, 1.0);
     gv_depth = curClip.w > 0.0 ? curClip.z / curClip.w : 0.0;
+    float frameViewZ = length(gv_normal) < 0.5 ? 65504.0 : max(curClip.w, 0.0);
 
     // Guide buffers: first-hit attributes for the denoiser / DLSS-RR (written every frame).
     imageStore(gNormal, pix, vec4(gv_normal, gv_rough));
     imageStore(gAlbedo, pix, vec4(gv_albedo, 1.0));
     imageStore(gDepth, pix, vec4(gv_depth, 0.0, 0.0, 0.0));
-    imageStore(gSpecAlbedo, pix, vec4(gv_specAlb, 1.0)); // specular albedo for RR demodulation
+    imageStore(gSpecAlbedo, pix, vec4(gv_specAlb, clamp(gv_metalness, 0.0, 1.0)));
+    imageStore(gViewZ, pix, vec4(frameViewZ, 0.0, 0.0, 0.0));
 
     // Motion vector: reproject this guide point through the previous frame's view-projection.
     // The current position is the UNJITTERED pixel centre — MVJittered=0 (DLSS-RR's
@@ -1533,6 +2489,27 @@ void main() {
     vec2 specMotion = specularReflectionMotion(gv_hitCamRel + pc.camOffset, dir, ndc, size, rayConeSpread);
     imageStore(gSpecMotion, pix, vec4(specMotion, 0.0, 0.0));
 
+    uint materialFlags = 0u;
+    bool skyPrimary = length(gv_normal) < 0.5;
+    if (skyPrimary) materialFlags |= 1u;
+    else if (gv_material == MATERIAL_WATER) materialFlags |= 2u;
+    else if (gv_material == MATERIAL_GLASS) materialFlags |= 4u;
+    else if (gv_material == MATERIAL_PARTICLE) materialFlags |= 8u;
+    else materialFlags |= 16u;
+    if (gv_emission > 0.0) materialFlags |= 32u;
+    if (gv_metalness > 0.5) materialFlags |= 64u;
+    if (gv_material == MATERIAL_WATER || gv_material == MATERIAL_GLASS) materialFlags |= 128u;
+    float sampleConfidence = 1.0 - exp(-float(adaptiveSpp));
+    float diffuseConfidence = length(frameDiffuse) > 0.0 ? sampleConfidence : 1.0;
+    float specularConfidence = length(frameSpecular) > 0.0 ? sampleConfidence : 1.0;
+    float disocclusionMix = (materialFlags & (2u | 4u | 8u)) != 0u ? 1.0 : 0.0;
+    imageStore(gClearEmission, pix,
+            vec4(max(frameClearRadiance + frameEmission, vec3(0.0)), gv_emission));
+    imageStore(gTransmission, pix, vec4(max(frameTransmission, vec3(0.0)), 1.0));
+    imageStore(gConfidenceDisocclusion, pix,
+            vec4(diffuseConfidence, specularConfidence, disocclusionMix, 0.0));
+    imageStore(gMaterialFlags, pix, uvec4(materialFlags, 0u, 0u, 0u));
+
     // Debug guide-buffer visualization: bypass accumulation and show a guide directly.
     if (pc.debugView != 0u) {
         vec3 dbg;
@@ -1559,7 +2536,7 @@ void main() {
         }
         // Still write split buffers so denoise/debug tools can inspect them under any view.
         imageStore(gShadowHit, pix, vec4(clamp(frameShadow, 0.0, 1.0), 0.0, 0.0, 0.0));
-        imageStore(gDiffuse, pix, vec4(frameUnshadowedDirect, frameHitDiff));
+        imageStore(gDiffuse, pix, vec4(frameDiffuse, frameHitDiff));
         imageStore(gReflection, pix, vec4(frameSpecular, frameHitSpec));
         imageStore(outImage, pix, vec4(dbg, 1.0));
         return;
@@ -1586,18 +2563,19 @@ void main() {
     if (any(isnan(frameSpecular)) || any(isinf(frameSpecular))) {
         frameSpecular = vec3(0.0);
     }
-    // HDR firefly squash: clamp the per-pixel radiance at MAX_HDR_RADIANCE so
-    // a single Cook–Torrance specular spike (see the comment on the constant)
-    // cannot survive into the FFX atrous colour weight as a stuck-on hot
-    // pixel. fp16 storage also floods to a near-uniform saturated value for
-    // any radiance > ~65504, which is the same failure mode visually.
-    frameRadiance = min(frameRadiance, vec3(MAX_HDR_RADIANCE));
-    frameUnshadowedDirect = min(frameUnshadowedDirect, vec3(MAX_HDR_RADIANCE));
-    frameSpecular = min(frameSpecular, vec3(MAX_HDR_RADIANCE));
+    // HDR firefly squash: material-aware adaptive clamping based on primary surface properties.
+    // Smooth metals get higher threshold (legitimate specular highlights), rough surfaces and
+    // emissive-adjacent pixels get stricter suppression. Uses primary-ray material properties
+    // (gv_rough from the first hit) to determine the appropriate clamp threshold.
+    bool nearEmissive = (gv_emission > 0.01); // primary or 1st-bounce emissive surface
+    float clampThreshold = computeAdaptiveClampThreshold(gv_rough, gv_metalness, nearEmissive);
+    frameRadiance = min(frameRadiance, vec3(clampThreshold));
+    frameUnshadowedDirect = min(frameUnshadowedDirect, vec3(clampThreshold));
+    frameSpecular = min(frameSpecular, vec3(clampThreshold));
     imageStore(outImage, pix, vec4(frameRadiance, 1.0));
     imageStore(gShadowHit, pix, vec4(clamp(frameShadow, 0.0, 1.0), 0.0, 0.0, 0.0));
     // rgb = unshadowed primary direct (FFX shadow re-weight); a = primary hitDist for NRD.
-    imageStore(gDiffuse, pix, vec4(frameUnshadowedDirect, frameHitDiff));
+    imageStore(gDiffuse, pix, vec4(frameDiffuse, frameHitDiff));
     // rgb = specular; a = specular-path hitDist for NRD.
     imageStore(gReflection, pix, vec4(frameSpecular, frameHitSpec));
 }

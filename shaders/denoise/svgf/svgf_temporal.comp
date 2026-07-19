@@ -1,0 +1,113 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+
+// SVGF (Spatiotemporal Variance-Guided Filtering) - Temporal Accumulation Pass
+// Paper: "Spatiotemporal Variance-Guided Filtering" (Schied et al. 2017)
+//
+// This pass accumulates the current frame with the reprojected previous frame,
+// computing a temporal variance estimate for adaptive spatial filtering.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Input: current frame noisy color
+layout(set = 0, binding = 0) uniform sampler2D u_color_current;
+
+// Input: current frame depth
+layout(set = 0, binding = 1) uniform sampler2D u_depth_current;
+
+// Input: current frame normal
+layout(set = 0, binding = 2) uniform sampler2D u_normal_current;
+
+// Input: motion vectors (screen-space, pixels)
+layout(set = 0, binding = 3) uniform sampler2D u_motion;
+
+// Input: previous frame accumulated color
+layout(set = 0, binding = 4) uniform sampler2D u_color_history;
+
+// Input: previous frame moment (for variance)
+layout(set = 0, binding = 5) uniform sampler2D u_moment_history;
+
+// Output: temporally accumulated color
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D o_color_accum;
+
+// Output: accumulated moment (E[x^2] for variance computation)
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D o_moment_accum;
+
+// Push constants
+layout(push_constant, scalar) uniform PushConstants {
+    vec2 resolution;      // Image resolution
+    vec2 inv_resolution;  // 1.0 / resolution
+    float alpha;          // Temporal blend factor (0.05 - 0.2)
+    float depth_threshold; // Depth similarity threshold
+    float normal_threshold; // Normal similarity threshold (cos angle)
+    int reset;            // Reset history (1 = reset, 0 = accumulate)
+} pc;
+
+// Luminance for variance computation
+float luminance(vec3 rgb) {
+    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(pc.resolution)))) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) * pc.inv_resolution;
+
+    // Read current frame data
+    vec3 color_curr = texture(u_color_current, uv).rgb;
+    float depth_curr = texture(u_depth_current, uv).r;
+    vec3 normal_curr = texture(u_normal_current, uv).xyz * 2.0 - 1.0;
+
+    // Read motion vector (in pixels)
+    vec2 motion = texture(u_motion, uv).xy;
+
+    // Compute previous frame UV
+    vec2 uv_prev = uv - motion * pc.inv_resolution;
+
+    // Default: no temporal accumulation
+    vec3 color_out = color_curr;
+    float moment_out = color_curr.r * color_curr.r + color_curr.g * color_curr.g + color_curr.b * color_curr.b;
+
+    // Check if reprojection is valid
+    bool valid = pc.reset == 0 &&
+                 all(greaterThanEqual(uv_prev, vec2(0.0))) &&
+                 all(lessThanEqual(uv_prev, vec2(1.0)));
+
+    if (valid) {
+        // Sample previous frame
+        vec3 color_prev = texture(u_color_history, uv_prev).rgb;
+        float moment_prev = texture(u_moment_history, uv_prev).r;
+
+        // Sample previous frame depth/normal for validation
+        float depth_prev = texture(u_depth_current, uv_prev).r;
+        vec3 normal_prev = texture(u_normal_current, uv_prev).xyz * 2.0 - 1.0;
+
+        // Depth similarity test
+        float depth_diff = abs(depth_curr - depth_prev) / max(depth_curr, 1e-6);
+        bool depth_ok = depth_diff < pc.depth_threshold;
+
+        // Normal similarity test
+        float normal_sim = dot(normalize(normal_curr), normalize(normal_prev));
+        bool normal_ok = normal_sim > pc.normal_threshold;
+
+        // Temporal accumulation with validation
+        if (depth_ok && normal_ok) {
+            // Exponential moving average
+            float alpha = pc.alpha;
+            color_out = mix(color_prev, color_curr, alpha);
+
+            // Accumulate moment for variance
+            float moment_curr = color_curr.r * color_curr.r +
+                               color_curr.g * color_curr.g +
+                               color_curr.b * color_curr.b;
+            moment_out = mix(moment_prev, moment_curr, alpha);
+        }
+    }
+
+    // Write outputs
+    imageStore(o_color_accum, pixel, vec4(color_out, 1.0));
+    imageStore(o_moment_accum, pixel, vec4(moment_out, 0.0, 0.0, 1.0));
+}

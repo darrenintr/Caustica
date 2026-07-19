@@ -1,18 +1,25 @@
-// ReSTIR reservoir for Direct Illumination sampling.
-// See: Bitterli et al. 2020, "Spatiotemporal reservoir resampling..."
+// ReSTIR reservoir packing helpers.
+// Production path: inlined in world.rgen (same layout).
 
 #ifndef RESTIR_RESERVOIR_GLSL
 #define RESTIR_RESERVOIR_GLSL
 
+// ============================================================================
+// Direct-illumination reservoir (light-index based). 16 bytes/pixel: rgba32ui.
+// ============================================================================
 // Reservoir state (packed into uvec4 = 128-bit per pixel)
+//   .x lightIndex
+//   .y floatBitsToUint(wSum)
+//   .z packHalf2x16(M, age)
+//   .w unused
+
 struct Reservoir {
-    uint lightIndex;    // selected light ID (0-based index into block light buffer)
-    float wSum;         // sum of weights (for unbiased estimator)
-    float M;            // effective sample count (# of samples contributing)
-    uint age;           // frames since last reset (for staleness check)
+    uint lightIndex;
+    float wSum;
+    float M;
+    uint age;
 };
 
-// Pack reservoir into uvec4 for storage
 uvec4 packReservoir(Reservoir r) {
     return uvec4(
         r.lightIndex,
@@ -22,72 +29,127 @@ uvec4 packReservoir(Reservoir r) {
     );
 }
 
-// Unpack reservoir from uvec4
 Reservoir unpackReservoir(uvec4 packed) {
     Reservoir r;
     r.lightIndex = packed.x;
     r.wSum = uintBitsToFloat(packed.y);
     vec2 mAge = unpackHalf2x16(packed.z);
     r.M = mAge.x;
-    r.age = uint(mAge.y);
+    r.age = uint(mAge.y + 0.5);
     return r;
 }
 
-// Initialize empty reservoir
 Reservoir emptyReservoir() {
     Reservoir r;
-    r.lightIndex = 0xFFFFFFFFu; // invalid
+    r.lightIndex = 0xFFFFFFFFu;
     r.wSum = 0.0;
     r.M = 0.0;
     r.age = 0u;
     return r;
 }
 
-// Update reservoir with a new sample using weighted reservoir sampling (WRS)
-// weight = contribution / pdf (target function / proposal density)
-void updateReservoir(inout Reservoir r, uint lightIdx, float weight, inout uint seed) {
-    r.wSum += weight;
-    r.M += 1.0;
-    // Weighted random selection: accept with probability weight / wSum
-    if (rndf(seed) < weight / max(r.wSum, 1e-6)) {
-        r.lightIndex = lightIdx;
-    }
+// ============================================================================
+// Global-illumination reservoir (direction-based). 32 bytes/pixel: 2x rgba32f.
+// ============================================================================
+// Stores a sampled reflection direction (NOT a light index) plus RIS weights.
+// Splits across two images so the direction stays full-precision:
+//   A: dir.xyz (vec3) + wSum (float)  -> 16 bytes
+//   B: M (float) + age (float) + targetPdf (float) + cachedVisibility (float) -> 16 bytes
+// age is stored as float rather than half because ReSTIR GI needs >1024-frame
+// reuse to converge in deep indoor scenes; half saturates at 2048 anyway but
+// rounding eats frames. Full float adds 2 bytes for a much friendlier ceiling.
+// cachedVisibility (v0.6): stores the previous frame's visibility result [0,1]
+// to avoid retracing every frame. -1.0 = invalid/needs refresh.
+
+struct ReservoirGI {
+    vec3  dir;
+    float wSum;
+    float M;
+    float age;
+    float targetPdf;
+    float cachedVisibility;
+};
+
+vec4 packReservoirGiA(ReservoirGI r) {
+    return vec4(r.dir, r.wSum);
 }
 
-// Combine two reservoirs (temporal or spatial reuse)
-// MIS weight for unbiased combination: w_q = p_q(y) / p_combined(y)
-Reservoir combineReservoirs(Reservoir ra, Reservoir rb, float misWeight, float maxM) {
-    if (rb.lightIndex == 0xFFFFFFFFu) return ra;
-    if (ra.lightIndex == 0xFFFFFFFFu) return rb;
+vec4 packReservoirGiB(ReservoirGI r) {
+    return vec4(r.M, r.age, r.targetPdf, r.cachedVisibility);
+}
 
-    Reservoir r;
-    r.wSum = ra.wSum + rb.wSum * misWeight;
-    r.M = min(ra.M + rb.M * misWeight, maxM);
-    r.age = min(ra.age, rb.age);
-
-    // Select sample from combined distribution
-    float totalWeight = ra.wSum + rb.wSum * misWeight;
-    if (totalWeight > 1e-6) {
-        // Keep ra's sample with probability ra.wSum / totalWeight
-        if (hash1(floatBitsToUint(totalWeight)) < ra.wSum / totalWeight) {
-            r.lightIndex = ra.lightIndex;
-        } else {
-            r.lightIndex = rb.lightIndex;
-        }
-    } else {
-        r.lightIndex = ra.lightIndex;
-    }
-
+ReservoirGI unpackReservoirGI(vec4 a, vec4 b) {
+    ReservoirGI r;
+    r.dir       = a.xyz;
+    r.wSum      = a.w;
+    r.M         = b.x;
+    r.age       = b.y;
+    r.targetPdf = b.z;
+    r.cachedVisibility = b.w;
     return r;
 }
 
-// Finalize reservoir: compute unbiased contribution weight
-// Returns: selected_light_contribution / p_target(selected)
-// where p_target = sum of all target functions seen
-float getReservoirContribution(Reservoir r) {
-    if (r.lightIndex == 0xFFFFFFFFu || r.M < 0.5) return 0.0;
-    // Unbiased estimator: (1/M) * wSum
-    return r.wSum / max(r.M, 1.0);
+ReservoirGI emptyReservoirGI() {
+    ReservoirGI r;
+    r.dir       = vec3(0.0, 1.0, 0.0);
+    r.wSum      = 0.0;
+    r.M         = 0.0;
+    r.age       = 0.0;
+    r.targetPdf = 1.0;
+    r.cachedVisibility = -1.0; // invalid, needs trace
+    return r;
+}
+
+bool isReservoirGIEmpty(ReservoirGI r) {
+    // M tracks effective candidate count. Below 0.5 means no valid sample was
+    // ever accepted -> treat as empty regardless of wSum.
+    return r.M < 0.5 || r.wSum <= 0.0;
+}
+
+void updateReservoirGI(inout ReservoirGI r, vec3 dir, float weight, float pdf, inout uint seed) {
+    if (!(weight > 0.0) || isnan(weight) || isinf(weight)) {
+        return;
+    }
+    r.wSum += weight;
+    r.M += 1.0;
+    if (rndf(seed) * r.wSum < weight) {
+        r.dir = dir;
+        r.targetPdf = pdf;
+    }
+}
+
+// Symmetric RIS merge for GI reservoirs. The Jacobian term handles the
+// visibility/normal mismatch between the donor pixel and the receiver -
+// typically a saturated dot(N, N_neighbor) check. This is the simplified
+// variant from the ReSTIR GI paper (Eq. 6) that omits the full target/pdf
+// ratio because cosine-weighted sampling makes both sides proportional.
+// v0.6: propagates cachedVisibility from the chosen reservoir.
+ReservoirGI combineReservoirsGI(ReservoirGI ra, ReservoirGI rb, float jacobian, float maxM, inout uint seed) {
+    if (isReservoirGIEmpty(rb) || jacobian <= 0.0) return ra;
+    if (isReservoirGIEmpty(ra)) {
+        ReservoirGI r = rb;
+        r.wSum = rb.wSum * jacobian;
+        r.M    = min(rb.M * jacobian, maxM);
+        return r;
+    }
+
+    ReservoirGI r;
+    float wb = rb.wSum * jacobian;
+    r.wSum   = ra.wSum + wb;
+    r.M      = min(ra.M + rb.M * jacobian, maxM);
+    r.age    = min(ra.age, rb.age);
+
+    float totalW = max(r.wSum, 1e-6);
+    if (rndf(seed) * totalW < ra.wSum) {
+        r.dir       = ra.dir;
+        r.targetPdf = ra.targetPdf;
+        r.cachedVisibility = ra.cachedVisibility;
+    } else {
+        r.dir       = rb.dir;
+        r.targetPdf = rb.targetPdf;
+        r.cachedVisibility = rb.cachedVisibility;
+    }
+    return r;
 }
 
 #endif // RESTIR_RESERVOIR_GLSL

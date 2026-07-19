@@ -67,6 +67,75 @@ final class RtTerrainOmm {
     /** Drop all cached triangle classifications; call on resource reload when sprite pixels may change. */
     static void clearCache() {
         CACHE.clear();
+        QUAD_CACHE.clear();
+    }
+
+    /** Position-independent per-quad result cache. Key = (sprite, integer-quantized UV bbox). The quad
+     *  emit path (RtTerrain.QuadCapture.emit) and the per-triangle OMM buildInput path share the same
+     *  result, so scanning happens at most once per (sprite, UV bbox) per resource load. */
+    private static final Map<QuadKey, Integer> QUAD_CACHE = new ConcurrentHashMap<>();
+    private record QuadKey(TextureAtlasSprite sprite, int uMin, int vMin, int uMax, int vMax) {}
+    private static int classifyQuadCached(TextureAtlasSprite sprite, float minU, float minV,
+                                          float maxU, float maxV) {
+        // Quantize the UV bbox to 1/256 of the sprite. Quad bboxes are usually a few texels wide; this
+        // collapses near-identical overlapping quads onto the same cache key without losing precision
+        // (the per-pixel scan inside spriteRegionCutoutState is still exact).
+        float spanU = sprite.getU1() - sprite.getU0();
+        float spanV = sprite.getV1() - sprite.getV0();
+        int uMin = Math.round((minU - sprite.getU0()) / Math.max(spanU, 1.0e-6f) * 256.0f);
+        int uMax = Math.round((maxU - sprite.getU0()) / Math.max(spanU, 1.0e-6f) * 256.0f);
+        int vMin = Math.round((minV - sprite.getV0()) / Math.max(spanV, 1.0e-6f) * 256.0f);
+        int vMax = Math.round((maxV - sprite.getV0()) / Math.max(spanV, 1.0e-6f) * 256.0f);
+        QuadKey key = new QuadKey(sprite, uMin, vMin, uMax, vMax);
+        Integer cached = QUAD_CACHE.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        int result = spriteRegionOmmState(sprite, minU, minV, maxU, maxV);
+        Integer prev = QUAD_CACHE.putIfAbsent(key, result);
+        return prev != null ? prev : result;
+    }
+
+    /** Cutout bucket reclassification result for one quad (two triangles, single sprite). Used by
+     *  RtTerrain's emit() to decide whether to promote a CUTOUT quad to the SOLID bucket, drop it,
+     *  or leave it in CUTOUT. This is the cross-vendor substitute for VK_EXT_opacity_micromap —
+     *  it works on every GPU because it's a CPU-side bucket reassignment driven by the same
+     *  per-region pixel scan OMM uses, with the result consumed via SOLID's VK_GEOMETRY_OPAQUE_BIT
+     *  (which makes traversal skip world.rahit on the hardware side). */
+    static final int CUTOUT_KEEP = 0;        // mixed / unsafe / unsafe-uv → stay in CUTOUT bucket
+    static final int CUTOUT_FULLY_OPAQUE = 1; // no alpha < cutoff anywhere → re-bucket into SOLID
+    static final int CUTOUT_FULLY_TRANSPARENT = 2; // no alpha >= cutoff anywhere → drop from BLAS
+
+    /** Classify a CUTOUT quad (one sprite, four corner UVs) by scanning the union of both triangles'
+     *  UV regions at alpha-cutoff 0.5. Same algorithm as the OMM triangle classification, batched
+     *  to two scans per quad instead of two scans per triangle (skips redundant overlap re-reads).
+     *  The MC isOpaque() fast path short-circuits to FULLY_OPAQUE when the pack author already
+     *  flagged the sprite as opaque. */
+    static int classifyQuad(TextureAtlasSprite sprite, float u0, float v0, float u1, float v1,
+                            float u2, float v2, float u3, float v3) {
+        if (sprite == null) {
+            return CUTOUT_KEEP;
+        }
+        if (sprite.transparency().isOpaque()) {
+            return CUTOUT_FULLY_OPAQUE;
+        }
+        if (sprite.isAnimated() || sprite.contents() == null) {
+            // Animated cutout (water / flames / etc.) — animation frames might cross the cutoff;
+            // don't second-guess the bucket choice. Keeps world.rahit on it.
+            return CUTOUT_KEEP;
+        }
+        float minU = Math.min(Math.min(u0, u1), Math.min(u2, u3));
+        float maxU = Math.max(Math.max(u0, u1), Math.max(u2, u3));
+        float minV = Math.min(Math.min(v0, v1), Math.min(v2, v3));
+        float maxV = Math.max(Math.max(v0, v1), Math.max(v2, v3));
+        int regionState = classifyQuadCached(sprite, minU, minV, maxU, maxV);
+        if (regionState == OMM_FULLY_OPAQUE) {
+            return CUTOUT_FULLY_OPAQUE;
+        }
+        if (regionState == OMM_FULLY_TRANSPARENT) {
+            return CUTOUT_FULLY_TRANSPARENT;
+        }
+        return CUTOUT_KEEP;
     }
 
     /**

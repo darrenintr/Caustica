@@ -45,7 +45,13 @@ import static dev.comfyfluffy.caustica.rt.RtContext.check;
  */
 public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
 
-    private final OfficialFfxDenoiseBackend ffx = new OfficialFfxDenoiseBackend();
+    // v0.6: FFX denoiser disabled at source level. The SPIR-V shadow+reflection filters were
+    // amplifying SPP=1 noise on the way into NRD REBLUR (the prepass weights its input
+    // by the FFX shadow/reflection channels, which carry their own per-sample variance
+    // at SPP=1). HybridFfxNrdBackend now runs NRD only -- the FFX prepass is bypassed
+    // unconditionally. The ffx field/usage lines below are commented out but kept
+    // for reference in case the upstream FFX issues are fixed and a future flag re-enables.
+    // private final OfficialFfxDenoiseBackend ffx = new OfficialFfxDenoiseBackend();
     /** When true, skip FFX prepass and feed raw S/R into prepare (config denoise=NRD). */
     private final boolean nrdOnly;
     private boolean ready;
@@ -55,6 +61,9 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     private boolean nrdFailLogged;
     /** True if last dispatch finished REBLUR + compose (caller uses light residual TAA). */
     private volatile boolean lastNrdOk;
+    private volatile boolean lastPrepareOk;
+    private volatile boolean lastDispatchOk;
+    private volatile boolean lastComposeOk;
     /** What the last frame actually did, for the debug overlay. */
     private volatile String lastPathLabel = "idle";
 
@@ -68,6 +77,10 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     private RtImage nrdDiffuse;
     private RtImage nrdSpecular;
     private RtImage viewZ;
+    private RtImage tracedViewZ;
+    private RtImage materialFlags;
+    private RtImage clearEmission;
+    private RtImage transmission;
     private RtImage nrdNormalRough; // NRD best-fit packed normal+rough
     private RtImage nrdOutDiff;
     private RtImage nrdOutSpec;
@@ -127,14 +140,10 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
 
     @Override
     public void init(long vkDevice, long vkPhysicalDevice) {
-        if (!nrdOnly) {
-            ffx.init(vkDevice, vkPhysicalDevice);
-            ready = ffx.isReady();
-        } else {
-            // NRD-only still needs prepare/compose pipelines + native REBLUR; mark ready and
-            // complete wiring in ensureSized once RtContext exists.
-            ready = true;
-        }
+        // v0.6: FFX disabled. NRD-only path always marks itself ready; the hybrid mode
+        // (nrdOnly=false) used to chain FFX for shadow+reflection prepass, but that's been
+        // bypassed too -- we just run NRD on the raw inputs.
+        ready = true;
         transparentDenoiser.init();
     }
 
@@ -142,17 +151,34 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         this.shadowHit = shadowHit;
         this.diffuse = diffuse;
         this.reflection = reflection;
-        ffx.setSplitBuffers(shadowHit, diffuse, reflection);
+        // ffx.setSplitBuffers(shadowHit, diffuse, reflection);  // v0.6: FFX disabled
     }
 
     public void setSpecMotion(RtImage specMotion) {
-        ffx.setSpecMotion(specMotion);
+        // ffx.setSpecMotion(specMotion);  // v0.6: FFX disabled
     }
 
     /** Diffuse + specular albedo for NRD material de/re-modulation. */
     public void setAlbedoGuides(RtImage diffuseAlbedo, RtImage specularAlbedo) {
         this.diffAlbedo = diffuseAlbedo;
         this.specAlbedo = specularAlbedo;
+    }
+
+    /** Linear positive view Z emitted directly by raygen. */
+    public void setViewZGuide(RtImage viewZ) {
+        this.tracedViewZ = viewZ;
+    }
+
+    public void setMaterialFlagsGuide(RtImage materialFlags) {
+        this.materialFlags = materialFlags;
+    }
+
+    public void setClearEmissionGuide(RtImage clearEmission) {
+        this.clearEmission = clearEmission;
+    }
+
+    public void setTransmissionGuide(RtImage transmission) {
+        this.transmission = transmission;
     }
 
     /**
@@ -242,13 +268,18 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         return lastNrdOk;
     }
 
+    public boolean lastPrepareOk() { return lastPrepareOk; }
+
+    public boolean lastDispatchOk() { return lastDispatchOk; }
+
+    public boolean lastComposeOk() { return lastComposeOk; }
+
     @Override
     public void ensureSized(int width, int height) {
-        if (!nrdOnly) {
-            ffx.ensureSized(width, height);
-        }
+        // v0.6: FFX disabled. We still need to wire the NRD prepare/compose pipelines + native
+        // REBLUR for the NRD-only path.
         RtContext ctx = RtContext.get();
-        if (ctx == null || (!nrdOnly && !ffx.isReady())) {
+        if (ctx == null) {
             ready = false;
             return;
         }
@@ -302,19 +333,22 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     }
 
     @Override
-    public void dispatch(MemoryStack stack, VkCommandBuffer cmd,
+    public boolean dispatch(MemoryStack stack, VkCommandBuffer cmd,
                          RtImage inColor, RtImage inNormal, RtImage inDepth, RtImage inMotion,
                          float mvScaleX, float mvScaleY,
                          RtImage outColor) {
         if (!ready || outColor == null) {
-            return;
+            return false;
         }
         RtContext ctx = RtContext.get();
         if (ctx == null) {
-            return;
+            return false;
         }
 
         lastNrdOk = false;
+        lastPrepareOk = false;
+        lastDispatchOk = false;
+        lastComposeOk = false;
         lastPathLabel = nrdOnly ? "nrd-only (pending)" : "hybrid (pending)";
 
         // Snapshot raw beauty (caller seeds outColor with raw; FFX hybrid may overwrite outColor).
@@ -326,17 +360,14 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         }
 
         // --- Stage 1: Official FFX shadow + reflection (hybrid only) ---
+        // v0.6: FFX disabled at source level. The hybrid mode no longer runs FFX for
+        // shadow/reflection; the prepare pass gets the raw split buffers directly.
         RtImage cleanS = null;
         RtImage cleanR = null;
-        if (!nrdOnly) {
-            ffx.dispatch(stack, cmd, inColor, inNormal, inDepth, inMotion, mvScaleX, mvScaleY, outColor);
-            if (ffxPlate != null && outColor != null) {
-                copyImage(stack, cmd, outColor, ffxPlate);
-                barrier(stack, cmd, ffxPlate.image);
-            }
-            cleanS = ffx.lastCleanShadow();
-            cleanR = ffx.lastCleanReflection();
-        }
+        // ffx.dispatch(stack, cmd, inColor, inNormal, inDepth, inMotion, mvScaleX, mvScaleY, outColor);
+        // if (ffxPlate != null && outColor != null) { copyImage(stack, cmd, outColor, ffxPlate); barrier(stack, cmd, ffxPlate.image); }
+        // cleanS = ffx.lastCleanShadow();
+        // cleanR = ffx.lastCleanReflection();
 
         // --- Stage 2: pack NRD inputs (YCoCg + norm hitDist; G recovered from pre-FFX beauty) ---
         // NRD-only: useRawLayers=1 so prepare reads Sraw/Rraw; clean slots still need valid
@@ -354,10 +385,12 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         if (prepPipe != 0L && beautyRawCopy != null && diffuse != null && shadowHit != null
                 && reflection != null && inDepth != null && shadowForNrd != null && specForNrd != null
                 && nrdDiffuse != null && nrdSpecular != null && viewZ != null && nrdNormalRough != null
-                && diffAlbedo != null && specAlbedo != null && inNormal != null && transparencyMask != null) {
+                && diffAlbedo != null && specAlbedo != null && inNormal != null && transparencyMask != null
+                && materialFlags != null) {
             try {
                 bindPrepare(ctx, beautyRawCopy, diffuse, shadowHit, shadowForNrd, reflection, specForNrd, inDepth,
-                        nrdDiffuse, nrdSpecular, viewZ, diffAlbedo, specAlbedo, inNormal, nrdNormalRough, transparencyMask);
+                        nrdDiffuse, nrdSpecular, viewZ, diffAlbedo, specAlbedo, inNormal, nrdNormalRough,
+                        transparencyMask, materialFlags);
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd,
                         nrdOnly ? "nrd-only prepare inputs" : "hybrid prepare NRD inputs")) {
                     VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, prepPipe);
@@ -378,11 +411,14 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                     VK10.vkCmdPushConstants(cmd, prepLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
                     VK10.vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
                 }
-                barrier(stack, cmd, nrdDiffuse.image);
-                barrier(stack, cmd, nrdSpecular.image);
-                barrier(stack, cmd, viewZ.image);
-                barrier(stack, cmd, nrdNormalRough.image);
-                barrier(stack, cmd, transparencyMask.image);
+                // Batched: 5 prepare-outputs barrier in one vkCmdPipelineBarrier2KHR call. Was 5 separate
+                // barriers (one per image) — same semantics, ~4 fewer command-buffer entries + driver
+                // dependency records. All 5 images are written by the dispatch above and read by either
+                // the transparent denoiser (transparencyMask) or NRD REBLUR (the rest); batching lets the
+                // GPU scheduler see them as one dependency group.
+                barriers(stack, cmd, nrdDiffuse.image, nrdSpecular.image, viewZ.image,
+                        nrdNormalRough.image, transparencyMask.image);
+                lastPrepareOk = true;
             } catch (Throwable t) {
                 CausticaMod.LOGGER.warn("Hybrid prepare_nrd_inputs failed", t);
             }
@@ -390,12 +426,17 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
 
         // --- Stage 3: Transparent material denoiser (glass/water/ice) ---
         // Run BEFORE NRD so we have a clean transparent result to blend later.
+        // No barrier between this and NRD: transparent writes transparentResult, NRD writes
+        // nrdOutDiff/nrdOutSpec — disjoint outputs, disjoint inputs (no shared writes). The Vulkan
+        // command buffer orders them sequentially, but the GPU scheduler is now free to overlap
+        // execution if the hardware has spare lanes. Saves one vkCmdPipelineBarrier2KHR per frame
+        // (~5-10 µs of CPU overhead, plus removes a sync point that was preventing out-of-order
+        // dispatch on the same queue).
         if (transparentDenoiser != null && transparencyMask != null && beautyRawCopy != null &&
             inNormal != null && inDepth != null && inMotion != null && transparentResult != null) {
             try {
                 transparentDenoiser.dispatch(stack, cmd, transparencyMask, beautyRawCopy, inNormal,
                         inDepth, inMotion, mvScaleX, mvScaleY, transparentResult);
-                barrier(stack, cmd, transparentResult.image);
             } catch (Throwable t) {
                 CausticaMod.LOGGER.warn("Transparent material denoiser failed", t);
             }
@@ -404,8 +445,9 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         // --- Stage 4: NRD REBLUR_DIFFUSE_SPECULAR (opaque surfaces only) ---
         boolean nrdOk = false;
         RtImage normalForNrd = nrdNormalRough != null ? nrdNormalRough : inNormal;
-        if (NrdRuntime.INSTANCE.isAvailable() && haveCamera && nrdDiffuse != null && nrdSpecular != null
-                && viewZ != null && nrdOutDiff != null && nrdOutSpec != null && normalForNrd != null && inMotion != null) {
+        RtImage viewZForNrd = tracedViewZ != null ? tracedViewZ : viewZ;
+        if (lastPrepareOk && NrdRuntime.INSTANCE.isAvailable() && haveCamera && nrdDiffuse != null && nrdSpecular != null
+                && viewZForNrd != null && nrdOutDiff != null && nrdOutSpec != null && normalForNrd != null && inMotion != null) {
             try {
                 long dev = ctx.vk().address();
                 long phys = ctx.vk().getPhysicalDevice().address();
@@ -428,7 +470,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                             nrdSpecular.image, nrdSpecular.view,
                             inMotion.image, inMotion.view,
                             normalForNrd.image, normalForNrd.view,
-                            viewZ.image, viewZ.view,
+                            viewZForNrd.image, viewZForNrd.view,
                             nrdOutDiff.image, nrdOutDiff.view,
                             nrdOutSpec.image, nrdOutSpec.view,
                             viewToClip, viewToClipPrev, worldToView, worldToViewPrev,
@@ -437,15 +479,24 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                     if (rc != 0) {
                         throw new IllegalStateException("nrd dispatch rc=" + rc);
                     }
+                    lastDispatchOk = true;
                 }
-                barrier(stack, cmd, nrdOutDiff.image);
-                barrier(stack, cmd, nrdOutSpec.image);
+                // Batched: NRD outputs + transparent result (if it ran) all need to be visible to the compose
+                // pass. Was 2 barriers (one per NRD output) + 1 separate transparent barrier earlier;
+                // now all three are gated by a single vkCmdPipelineBarrier2KHR call so the driver
+                // schedules them as one dependency.
+                if (transparentResult != null) {
+                    barriers(stack, cmd, nrdOutDiff.image, nrdOutSpec.image, transparentResult.image);
+                } else {
+                    barriers(stack, cmd, nrdOutDiff.image, nrdOutSpec.image);
+                }
                 // Radiance: clear radiance = path-traced plate (pre-FFX raw) for sky; surface = NRD
                 RtImage clear = beautyRawCopy != null ? beautyRawCopy : ffxPlate;
                 if (compPipe != 0L && diffAlbedo != null && specAlbedo != null && clear != null &&
-                    transparencyMask != null && transparentResult != null) {
+                    transparencyMask != null && transparentResult != null && clearEmission != null
+                    && transmission != null) {
                     bindCompose(ctx, nrdOutDiff, nrdOutSpec, diffAlbedo, specAlbedo, inNormal, clear,
-                            transparencyMask, transparentResult, outColor);
+                            transparencyMask, transparentResult, outColor, clearEmission, transmission);
                     try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "hybrid NRD compose beauty")) {
                         VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, compPipe);
                         VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, compLayout, 0,
@@ -462,6 +513,10 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                         VK10.vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
                     }
                     barrier(stack, cmd, outColor.image);
+                    lastComposeOk = true;
+                }
+                if (!lastComposeOk) {
+                    throw new IllegalStateException("NRD compose pipeline unavailable");
                 }
                 nrdHardReset = false;
                 nrdFrameIndex++;
@@ -505,22 +560,21 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         } else if (!nrdOk) {
             lastPathLabel = "raw (nrd fail)";
         }
+        return nrdOk;
     }
 
     @Override
     public void resetHistory() {
-        if (!nrdOnly) {
-            ffx.resetHistory();
-        }
+        // v0.6: FFX disabled. The ffx reset path is bypassed unconditionally.
+        // if (!nrdOnly) { ffx.resetHistory(); }
         requestNrdReset();
         transparentDenoiser.resetHistory();
     }
 
     @Override
     public void destroy() {
-        if (!nrdOnly) {
-            ffx.destroy();
-        }
+        // v0.6: FFX disabled. The ffx.destroy path is bypassed unconditionally.
+        // if (!nrdOnly) { ffx.destroy(); }
         NrdRuntime.INSTANCE.destroy();
         transparentDenoiser.destroy();
         RtContext ctx = RtContext.get();
@@ -549,7 +603,27 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
 
     @Override
     public boolean isReady() {
-        return ready && (nrdOnly || ffx.isReady());
+        // v0.6: FFX disabled. The ffx instance is no longer created, so isReady just
+        // returns our own ready flag. (Hybrid mode nrdOnly=false used to require both
+        // the FFX prepass pipelines AND the NRD pipelines; now NRD alone suffices.)
+        return ready;
+    }
+
+    @Override
+    public boolean supportsAsyncCompute() {
+        return true; // NRD is compute-based, supports async
+    }
+
+    @Override
+    public void dispatchAsync(
+            VkCommandBuffer computeCmd,
+            dev.comfyfluffy.caustica.rt.RtAsyncCompute asyncCompute,
+            MemoryStack stack,
+            RtImage inColor, RtImage inNormal, RtImage inDepth, RtImage inMotion,
+            float mvScaleX, float mvScaleY,
+            RtImage outColor) {
+        // NRD/Hybrid is compute-based - can directly use compute command buffer
+        dispatch(stack, computeCmd, inColor, inNormal, inDepth, inMotion, mvScaleX, mvScaleY, outColor);
     }
 
     private void destroyImages() {
@@ -601,7 +675,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
 
     private void createComposePipeline(RtContext ctx) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            final int BINDINGS = 9; // + gTransparencyMask + gTransparentDenoised
+            final int BINDINGS = 11; // + transparent inputs + explicit emission/transmission
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(BINDINGS, stack);
             for (int i = 0; i < BINDINGS; i++) {
                 binds.get(i).binding(i).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
@@ -664,9 +738,11 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     }
 
     private void bindCompose(RtContext ctx, RtImage diff, RtImage spec, RtImage diffAlb, RtImage specAlb,
-                             RtImage normal, RtImage ffx, RtImage transMask, RtImage transResult, RtImage out) {
+                             RtImage normal, RtImage ffx, RtImage transMask, RtImage transResult,
+                             RtImage out, RtImage clearEmission, RtImage transmission) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            RtImage[] imgs = {diff, spec, diffAlb, specAlb, normal, ffx, transMask, transResult, out};
+            RtImage[] imgs = {diff, spec, diffAlb, specAlb, normal, ffx, transMask, transResult, out,
+                    clearEmission, transmission};
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(imgs.length, stack);
             for (int i = 0; i < imgs.length; i++) {
                 VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
@@ -680,7 +756,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
 
     private void createPreparePipeline(RtContext ctx) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            final int BINDINGS = 15; // + gNrdNormalRough + gTransparencyMask
+            final int BINDINGS = 16; // + gNrdNormalRough + gTransparencyMask + gMaterialFlags
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(BINDINGS, stack);
             for (int i = 0; i < BINDINGS; i++) {
                 binds.get(i).binding(i).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
@@ -754,10 +830,11 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     private void bindPrepare(RtContext ctx, RtImage beauty, RtImage unshadowed, RtImage shadowRaw,
                              RtImage shadowClean, RtImage specRaw, RtImage specClean, RtImage depth,
                              RtImage nrdDiff, RtImage nrdSpec, RtImage vz,
-                             RtImage diffAlb, RtImage specAlb, RtImage normal, RtImage nrdNormal, RtImage transMask) {
+                             RtImage diffAlb, RtImage specAlb, RtImage normal, RtImage nrdNormal,
+                             RtImage transMask, RtImage materialFlags) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             RtImage[] imgs = {beauty, unshadowed, shadowRaw, shadowClean, specRaw, specClean, depth,
-                    nrdDiff, nrdSpec, vz, diffAlb, specAlb, normal, nrdNormal, transMask};
+                    nrdDiff, nrdSpec, vz, diffAlb, specAlb, normal, nrdNormal, transMask, materialFlags};
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(imgs.length, stack);
             for (int i = 0; i < imgs.length; i++) {
                 VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
@@ -779,19 +856,34 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     }
 
     private static void barrier(MemoryStack stack, VkCommandBuffer cmd, long image) {
-        VkImageMemoryBarrier2.Buffer barriers = VkImageMemoryBarrier2.calloc(1, stack);
-        barriers.get(0).sType$Default()
-                .srcStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
-                .srcAccessMask(VK10.VK_ACCESS_SHADER_WRITE_BIT)
-                .dstStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
-                .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT)
-                .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
-                .newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
-                .image(image)
-                .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
-                        .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
-        VkDependencyInfo dep = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers);
+        barriers(stack, cmd, image);
+    }
+
+    /**
+     * Batched image barrier — packs N image transitions into one {@code vkCmdPipelineBarrier2KHR} call.
+     * Saves (N-1) per-call command-buffer overhead and gives the driver one dependency-info record
+     * to schedule, instead of N small ones. Layout/access/stage flags are identical to the single-image
+     * version: compute-write → compute-read|write, GENERAL→GENERAL (these images stay in GENERAL layout
+     * throughout the denoise block).
+     */
+    private static void barriers(MemoryStack stack, VkCommandBuffer cmd, long... images) {
+        if (images.length == 0) {
+            return;
+        }
+        VkImageMemoryBarrier2.Buffer bars = VkImageMemoryBarrier2.calloc(images.length, stack);
+        for (int i = 0; i < images.length; i++) {
+            bars.get(i).sType$Default()
+                    .srcStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                    .srcAccessMask(VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                    .dstStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                    .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                    .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                    .newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                    .image(images[i])
+                    .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                            .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
+        }
+        VkDependencyInfo dep = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(bars);
         KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, dep);
     }
 }
-

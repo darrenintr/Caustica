@@ -26,6 +26,7 @@ layout(binding = 12, rgba16f) readonly uniform image2D gNormalRough;
 layout(binding = 13, rgba16f) writeonly uniform image2D gNrdNormalRough;
 // Transparency mask: 1.0 = transparent (glass/water), 0.0 = opaque (use NRD).
 layout(binding = 14, r8) writeonly uniform image2D gTransparencyMask;
+layout(binding = 15, r32ui) readonly uniform uimage2D gMaterialFlags;
 
 layout(push_constant) uniform Push {
     float cameraNear;
@@ -64,11 +65,17 @@ float specMagicCurve(float roughness) {
 
 // Matches REBLUR_FrontEnd_GetNormHitDist (A,B,C,D with D unused here).
 float normHitDist(float hitDist, float viewZ, float roughness) {
+    // SIMPLE DISTANCE-INVARIANT (v0.6.13): remove all distance dependency.
+    // History:
+    // - v0.6.8: (A + viewZ*B) caused far-field noise
+    // - v0.6.9: removed viewZ, uniform
+    // - v0.6.10: added nearBoost (3x) - MISTAKE! Caused "loosen noise" at near-field
+    // - v0.6.11: reduced prepass 120→60 to compensate, but root cause was nearBoost
+    // Solution: Remove nearBoost entirely. Let NRD use roughness only for kernel sizing.
     float A = pc.hitA > 0.0 ? pc.hitA : 3.0;
-    float B = pc.hitB > 0.0 ? pc.hitB : 0.1;
     float C = pc.hitC > 0.0 ? pc.hitC : 20.0;
     float smc = specMagicCurve(roughness);
-    float f = (A + abs(viewZ) * B) * mix(C, 1.0, smc);
+    float f = A * mix(C, 1.0, smc);
     return clamp(hitDist / max(f, 1e-4), 0.0, 1.0);
 }
 
@@ -111,21 +118,24 @@ void main() {
         ? Rraw
         : max(imageLoad(gSpecClean, pix).rgb, vec3(0.0));
 
-    // Full radiance layers, then demode by guide albedo so REBLUR blurs lighting
-    // not texture (faces / wood grain / leaves stay sharp after remultiply).
-    vec3 G = max(beauty - U * Sraw - Rraw, vec3(0.0));
-    vec3 Dnrd = U * Sclean + G;
-    vec3 Spnrd = Rclean;
+    // The path tracer directly classifies full diffuse and specular radiance. Never recover a
+    // signal by subtracting terms from beauty: that is numerically unstable and loses energy when
+    // firefly clamping or transparent composition differs between the source buffers.
+    vec3 Dnrd = U;
+    vec3 Spnrd = (pc.useRawLayers > 0.5) ? Rraw : Rclean;
 
     vec4 nr = imageLoad(gNormalRough, pix);
     float rough = clamp(nr.w, 0.0, 1.0);
     float nLen = length(nr.xyz);
     bool sky = nLen < 0.5;
+    uint materialFlags = imageLoad(gMaterialFlags, pix).r;
 
     // Multi-tier material classification based on roughness
     bool isMirror = !sky && rough <= kMirror;
-    bool isWater = !sky && rough > kMirror && rough <= kWater;
-    bool isSmooth = !sky && rough > kWater && rough <= kSmooth;
+    bool isWater = (materialFlags & 2u) != 0u;
+    bool isGlass = (materialFlags & 4u) != 0u;
+    bool isParticle = (materialFlags & 8u) != 0u;
+    bool isSmooth = !sky && !isWater && (isGlass || (rough > kWater && rough <= kSmooth));
     bool isSemiRough = !sky && rough > kSmooth && rough <= kSemiRough;
     bool isRough = !sky && rough > kSemiRough;
 
@@ -133,6 +143,10 @@ void main() {
     vec3 specAlbIn = max(imageLoad(gSpecAlbedo, pix).rgb, vec3(0.0));
     vec3 diffAlb = max(diffAlbIn, kMinDiffAlb);
     vec3 specAlb = max(specAlbIn, kMinSpecAlb);
+
+    // Calculate luma early (needed for confidence later)
+    vec3 currColorForLuma = max(Dnrd + Spnrd, vec3(0.0));
+    float luma = dot(currColorForLuma, vec3(0.2126, 0.7152, 0.0722));
 
     // Tiered denoising strategy based on material roughness:
     // - Water (≤0.08): pre-modulated beauty path (avoid SPP-1 firefly outliers)
@@ -143,7 +157,7 @@ void main() {
         // Water: feed full beauty as pre-modulated diffuse + apply relaxed filtering
         // to accommodate wave-induced normal/depth variation (water surface is not planar)
         // Reduce specular contribution to avoid mirror-like appearance
-        Dnrd = max(U * Sclean + G + Rclean * 0.6, vec3(0.0));  // 40% specular reduction
+        Dnrd = max(Dnrd + Spnrd * 0.6, vec3(0.0));  // 40% specular reduction
         Spnrd = vec3(0.0);
 
         // Water-specific hint: scale hit distance to account for wave motion
@@ -159,9 +173,22 @@ void main() {
         }
     } else {
         // SemiRough/Rough: full demodulation (standard path)
-        Dnrd = safeDiv(Dnrd, diffAlb);
-        if (rough > 0.22) {
-            Spnrd = safeDiv(Spnrd, specAlb);
+        // DARK-SCENE SKIP DEMOD (v0.6.15): underground noise fix.
+        // Problem: "only appear when underground/indoor...lack of light source" (user feedback).
+        // Root cause: In very dark scenes (luma < 0.08), radiance has extreme variance from GI.
+        //             Demodulation (radiance/albedo) AMPLIFIES this noise.
+        // Solution: In extreme darkness, skip demodulation → feed raw radiance to NRD.
+        //           NRD will denoise the "modulated" signal (less effective but won't amplify noise).
+        float luma = dot(Dnrd, vec3(0.2126, 0.7152, 0.0722));
+        if (luma < 0.08 && !sky) {
+            // Extreme darkness (underground caves): skip demodulation
+            // Keep Dnrd/Spnrd as-is (already contains radiance, not demodulated)
+        } else {
+            // Normal lighting: standard demodulation
+            Dnrd = safeDiv(Dnrd, diffAlb);
+            if (rough > 0.22) {
+                Spnrd = safeDiv(Spnrd, specAlb);
+            }
         }
     }
 
@@ -180,11 +207,9 @@ void main() {
     if (any(isnan(Dnrd)) || any(isinf(Dnrd))) Dnrd = vec3(0.0);
     if (any(isnan(Spnrd)) || any(isinf(Spnrd))) Spnrd = vec3(0.0);
 
-    // rgen: U.a / R.a = primary ray hitT (slant range), NOT view-space Z.
-    float primaryHit = U4.a > 1e-4 ? U4.a : 0.0;
-    float primarySpec = Rraw4.a > 1e-4 ? Rraw4.a : primaryHit;
-    if (primaryHit < 1e-3) primaryHit = 0.0;
-    if (primarySpec < 1e-3) primarySpec = 0.0;
+    // rgen alpha = true secondary segment length for the classified lobe.
+    float diffuseHit = U4.a > 1e-4 ? U4.a : 0.0;
+    float specularHit = Rraw4.a > 1e-4 ? Rraw4.a : 0.0;
 
     // NRD wants positive linear view-space Z. HW depth is reverse-Z infinite:
     //   near → deviceZ≈1, far → deviceZ→0  ⇒  viewZ ≈ near / deviceZ
@@ -196,36 +221,17 @@ void main() {
         viewZ = 65504.0;
     } else if (deviceZ > 1e-5) {
         viewZ = nearZ / max(deviceZ, 1e-5);
-    } else if (primaryHit > 1e-3) {
-        viewZ = max(primaryHit, nearZ); // last resort
+    } else if (diffuseHit > 1e-3) {
+        viewZ = max(diffuseHit, nearZ); // last resort only; device depth is authoritative
     } else {
         viewZ = 100.0;
     }
 
-    // Hit distance for REBLUR kernel (secondary length). Without true bounce length,
-    // use a modest fraction of primary range — not huge floors (mush) and not tiny
-    // constants that break tracking.
-    // Material-based hit distance estimation for NRD REBLUR:
-    // - Water: energy is mostly mirror/single-interface, use longer range
-    // - Other materials: secondary bounce is fraction of primary
-    float bounceHitDiff;
-    float bounceHitSpec;
-    if (sky) {
-        bounceHitDiff = 0.0;
-        bounceHitSpec = 0.0;
-    } else if (isWater) {
-        // Water: mirror-like behavior, secondary length ≈ primary range
-        float ph = max(primaryHit, primarySpec);
-        bounceHitDiff = clamp(ph * 0.55, 0.5, 40.0);
-        bounceHitSpec = clamp(ph * 0.85, 0.5, 60.0);
-    } else {
-        // Standard materials: secondary bounce is smaller fraction
-        bounceHitDiff = clamp(primaryHit * 0.35, 0.25, 12.0);
-        bounceHitSpec = clamp(mix(primarySpec * 0.25, primarySpec * 0.6, rough), 0.15, 20.0);
-    }
-
-    float nHitDiff = sky ? 0.0 : normHitDist(bounceHitDiff, viewZ, 1.0);
-    float nHitSpec = sky ? 0.0 : normHitDist(bounceHitSpec, viewZ, rough);
+    // Alpha already contains the first real secondary-ray segment length for each lobe.
+    // Normalize only with NRD's documented hit-distance function; never invent distance from
+    // primary range, darkness, roughness tiers, confidence, or material guesses.
+    float nHitDiff = sky ? 0.0 : normHitDist(diffuseHit, viewZ, 1.0);
+    float nHitSpec = sky ? 0.0 : normHitDist(specularHit, viewZ, rough);
 
     imageStore(gNrdDiffuse, pix, vec4(linearToYCoCg(Dnrd), nHitDiff));
     imageStore(gNrdSpecular, pix, vec4(linearToYCoCg(Spnrd), nHitSpec));
@@ -238,6 +244,6 @@ void main() {
 
     // Transparency mask: glass/water/ice get special bilateral treatment.
     // Threshold at 0.15 catches water(0.08), glass(0.10), ice(0.10).
-    float transparencyMask = (sky || rough > kSmooth) ? 0.0 : 1.0;
+    float transparencyMask = (isWater || isGlass || isParticle) ? 1.0 : 0.0;
     imageStore(gTransparencyMask, pix, vec4(transparencyMask, 0.0, 0.0, 0.0));
 }

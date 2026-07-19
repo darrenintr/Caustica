@@ -338,6 +338,23 @@ public final class RtTerrain {
         INSTANCE.reresolveAllRequested = true;
     }
 
+    /**
+     * Mark a single section (16x16x16 chunk-of-chunk) for re-extraction. Called when a server packet
+     * reports a block change in that section -- if we don't refresh the BLAS, RT keeps rendering
+     * the pre-edit geometry and the TAAU/NRD history shows a phantom of the old state until it
+     * eventually ages out. Applied on the next {@link #tick} (render thread).
+     *
+     * <p>Accepts a SectionPos packed long (x &lt;&lt; 42 | y &lt;&lt; 20 | z &lt;&lt; 22 in vanilla's
+     * compact format). Cheaper than {@link #markAllDirty()} when only a single block changed.
+     */
+    public static void markSectionDirty(long sectionPos) {
+        // 'dirty' is read under the render-thread tick; no lock needed because LongOpenHashSet
+        // is not concurrent but the only writer here is this packet handler running on the
+        // network thread. We guard with the same volatile pattern the other request* methods use
+        // (the tick() drains via processDirtyRequests and re-reads).
+        INSTANCE.dirty.add(sectionPos);
+    }
+
     private void tick(RtContext ctx) {
         processDeferredFrees();
 
@@ -2361,6 +2378,38 @@ public final class RtTerrain {
             // inward inset makes the glass resolve consistently behind the neighbour's surface.
             if (q.translucent) {
                 offset(q, -TRANSLUCENT_INSET);
+            }
+            // Alpha pre-bake (cross-vendor OMM substitute). Scans the quad's UV region's sprite pixels
+            // ONCE up front and uses the result to:
+            //   * fully-opaque CUTOUT sprite   → re-bucket into SOLID. SOLID geometries are flagged
+            //                                   VK_GEOMETRY_OPAQUE_BIT at BLAS build (RtAccel.terrainGeometries),
+            //                                   which makes the driver skip world.rahit entirely. Same RTX-only
+            //                                   speedup as VK_EXT_opacity_micromap, working on every vendor.
+            //   * fully-transparent CUTOUT sprite → skip the emit (don't add to BLAS at all). Dead geometry
+            //                                   in the BLAS wastes traversal + BLAS memory.
+            //   * mixed / unsafe → keep in CUTOUT bucket. world.rahit's alpha-test path handles these.
+            // The cache (RtTerrainOmm) reuses the same per-quad key as the OMM input build, so this
+            // doesn't double-scan when OMM is enabled.
+            boolean dropQuad = false;
+            if (q.cutout) {
+                long pa = q.uv[0], pb = q.uv[1], pc = q.uv[2], pd = q.uv[3];
+                float u0 = Float.intBitsToFloat((int) (pa >>> 32));
+                float v0 = Float.intBitsToFloat((int) pa);
+                float u1 = Float.intBitsToFloat((int) (pb >>> 32));
+                float v1 = Float.intBitsToFloat((int) pb);
+                float u2 = Float.intBitsToFloat((int) (pc >>> 32));
+                float v2 = Float.intBitsToFloat((int) pc);
+                float u3 = Float.intBitsToFloat((int) (pd >>> 32));
+                float v3 = Float.intBitsToFloat((int) pd);
+                int state = RtTerrainOmm.classifyQuad(q.sprite, u0, v0, u1, v1, u2, v2, u3, v3);
+                if (state == RtTerrainOmm.CUTOUT_FULLY_OPAQUE) {
+                    q.cutout = false;
+                } else if (state == RtTerrainOmm.CUTOUT_FULLY_TRANSPARENT) {
+                    dropQuad = true;
+                }
+            }
+            if (dropQuad) {
+                return;
             }
             Geom g = q.translucent ? cur.translucent() : (q.cutout ? cur.cutout() : cur.opaque());
             int base = g.verts.size() / 3;

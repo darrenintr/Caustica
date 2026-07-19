@@ -42,12 +42,12 @@ public final class NrdReBlurBackend implements CausticaDenoiseBackend {
     }
 
     @Override
-    public void dispatch(MemoryStack stack, VkCommandBuffer cmd,
+    public boolean dispatch(MemoryStack stack, VkCommandBuffer cmd,
                          RtImage inColor, RtImage inNormal, RtImage inDepth, RtImage inMotion,
                          float mvScaleX, float mvScaleY,
                          RtImage outColor) {
         if (!ready) {
-            return;
+            return false;
         }
         throw new UnsupportedOperationException(
                 "NRD ReBLUR backend: blocked on diffuse/specular radiance split in shaders/world/world.rgen");

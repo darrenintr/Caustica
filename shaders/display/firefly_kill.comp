@@ -1,0 +1,98 @@
+#version 460
+//
+// Firefly-kill pass: 3x3 per-channel median filter on the path-tracer radiance plate.
+//
+// SPP=1 path tracing produces single-pixel HDR spikes (one ray hits a torch
+// at intensity 50 -> firefly at value 50, clamped to MAX_HDR_RADIANCE = 2.2
+// but still orders of magnitude above the surrounding dark pixels). NRD's
+// spatial filter doesn't always dampen these (a 3x3 or 5x5 A-trous kernel
+// can leave a single peak if the kernel width is less than the firefly
+// radius). TAAU's temporal accumulator can also replay them frame after
+// frame, producing the "stars in the dark" symptom.
+//
+// This pass is the single source of truth for "clean radiance" -- both NRD
+// (via prepare_nrd_inputs.comp) and TAAU (via inColorLow) read this image
+// instead of the raw path-tracer output. A single-pixel firefly cannot
+// dominate 8 of its 9 neighbours in a 3x3 window, so the median rejects it
+// with probability ~100%.
+//
+// 8x8 workgroups; one invocation per output pixel. Reads from binding 0,
+// writes to binding 1. Both are rgba16f at render resolution.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) readonly  uniform image2D inRadiance;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D outRadiance;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inRadiance);
+    if (pos.x >= size.x || pos.y >= size.y) {
+        return;
+    }
+
+    // 9 source samples (the 3x3 neighbourhood of pos).
+    vec3 s00 = imageLoad(inRadiance, pos + ivec2(-1, -1)).rgb;
+    vec3 s10 = imageLoad(inRadiance, pos + ivec2( 0, -1)).rgb;
+    vec3 s20 = imageLoad(inRadiance, pos + ivec2( 1, -1)).rgb;
+    vec3 s01 = imageLoad(inRadiance, pos + ivec2(-1,  0)).rgb;
+    vec3 s11 = imageLoad(inRadiance, pos + ivec2( 0,  0)).rgb;
+    vec3 s21 = imageLoad(inRadiance, pos + ivec2( 1,  0)).rgb;
+    vec3 s02 = imageLoad(inRadiance, pos + ivec2(-1,  1)).rgb;
+    vec3 s12 = imageLoad(inRadiance, pos + ivec2( 0,  1)).rgb;
+    vec3 s22 = imageLoad(inRadiance, pos + ivec2( 1,  1)).rgb;
+
+    // -- Firefly vs real-light discrimination --
+    // A single-sample SPP=1 firefly is one bright pixel surrounded by 8
+    // dark neighbours. A *real* light from an emissive block produces
+    // multiple bright pixels (the falloff is gradual: close = bright, far
+    // = dim, but typically 2+ of the 9 neighbours are still non-trivial).
+    // So we only kill the centre if it's a strict outlier -- brighter than
+    // ALL 8 neighbours by a significant margin. Real lights are preserved.
+    float centerLuma = max(s11.r, max(s11.g, s11.b));
+    float n00 = max(s00.r, max(s00.g, s00.b));
+    float n10 = max(s10.r, max(s10.g, s10.b));
+    float n20 = max(s20.r, max(s20.g, s20.b));
+    float n01 = max(s01.r, max(s01.g, s01.b));
+    float n21 = max(s21.r, max(s21.g, s21.b));
+    float n02 = max(s02.r, max(s02.g, s02.b));
+    float n12 = max(s12.r, max(s12.g, s12.b));
+    float n22 = max(s22.r, max(s22.g, s22.b));
+    float neighborMaxLuma = max(max(max(n00, max(n10, n20)), max(n01, max(n21, n02))), max(n12, n22));
+
+    // Hard threshold: only swap out the centre if it's a >4x outlier
+    // against EVERY neighbour. Real torch / glowstone falloff will have
+    // at least one neighbour within 4x of the centre, so this filter
+    // leaves legitimate lights alone while still killing single-pixel
+    // SPP=1 fireflies.
+    if (centerLuma > 4.0 * max(neighborMaxLuma, 1e-3)) {
+        // Outlier -- replace with a 3x3 median so the firefly is squashed
+        // down to a normal value. The median is the 5th of 9 sorted values,
+        // safe to compute here because the neighbourhood by definition is
+        // a real surface (no other fireflies in a 3x3 are unlikely unless
+        // SPP=1 hits two adjacent emissives, in which case we'd want the
+        // higher one anyway).
+        vec3 t;
+        t = min(s00, s10); s10 = max(s00, s10); s00 = t;
+        t = min(s10, s20); s20 = max(s10, s20); s10 = t;
+        t = min(s00, s10); s10 = max(s00, s10); s00 = t;
+        t = min(s01, s11); s11 = max(s01, s11); s01 = t;
+        t = min(s11, s21); s21 = max(s11, s21); s11 = t;
+        t = min(s01, s11); s11 = max(s01, s11); s01 = t;
+        t = min(s02, s12); s12 = max(s02, s12); s02 = t;
+        t = min(s12, s22); s22 = max(s12, s22); s12 = t;
+        t = min(s02, s12); s12 = max(s02, s12); s02 = t;
+        vec3 m0 = s10, m1 = s11, m2 = s12;
+        t = min(m0, m1); m1 = max(m0, m1); m0 = t;
+        t = min(m1, m2); m2 = max(m1, m2); m1 = t;
+        t = min(m0, m1); m1 = max(m0, m1); m0 = t;
+        vec3 median = clamp(m1, max(max(s00, s01), s02), min(min(s20, s21), s22));
+        imageStore(outRadiance, pos, vec4(median, 0.0));
+        return;
+    }
+
+    // Not an outlier: pass the centre through unchanged. This preserves
+    // the falloff curve of real lights (a torch's close-bright / far-dim
+    // gradient) and gives the denoise + temporal paths a clean input.
+    imageStore(outRadiance, pos, vec4(s11, 0.0));
+}

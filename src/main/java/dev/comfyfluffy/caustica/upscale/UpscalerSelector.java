@@ -4,11 +4,8 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
-import dev.comfyfluffy.caustica.fsr.Fsr2ClassicUpscaler;
-import dev.comfyfluffy.caustica.fsr.FsrUpscaler;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
 import dev.comfyfluffy.caustica.vendor.GpuVendor;
-import dev.comfyfluffy.caustica.xess.XeSsUpscaler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,11 +31,13 @@ public final class UpscalerSelector {
     public enum Mode {
         OFF("off"),
         AUTO("auto"),
-        DLSS_RR("dlss-rr"),
-        FSR_3("fsr-3"),
-        FSR_4("fsr-4"),
+        TAAU("taau"),
         XESS("xess"),
-        NIS("nis");
+        FSR_3("fsr-3"),
+        // Legacy aliases kept so old caustica.toml values parse without error.
+        @Deprecated DLSS_RR("dlss-rr"),
+        @Deprecated FSR_4("fsr-4"),
+        @Deprecated NIS("nis");
 
         final String key;
         Mode(String key) { this.key = key; }
@@ -99,66 +98,12 @@ public final class UpscalerSelector {
                 resolvedMode = Mode.OFF;
                 return setActive(NoopUpscaler.INSTANCE);
             }
-            case DLSS_RR -> candidate = DlssRrUpscaler.tryCreate();
-            case FSR_3 -> {
-                candidate = FsrUpscaler.tryCreateFsr3(gpu);
-                if (candidate == null) {
-                    candidate = Fsr2ClassicUpscaler.tryCreate(gpu);
-                    if (candidate != null) {
-                        requestedReason = "fsr-3 → classic FSR2 (Vulkan)";
-                    }
-                }
-            }
-            case FSR_4 -> {
-                candidate = FsrUpscaler.tryCreateFsr4(gpu);
-                if (candidate == null) {
-                    candidate = Fsr2ClassicUpscaler.tryCreate(gpu);
-                    if (candidate != null) {
-                        requestedReason = "fsr-4 unavailable → classic FSR2 (Vulkan)";
-                    }
-                }
-            }
-            case XESS -> candidate = XeSsUpscaler.tryCreate();
-            case NIS -> candidate = NisUpscaler.tryCreate();
+            case TAAU -> candidate = TaaUpscaler.tryCreate();
             case AUTO -> {
-                // Best-mode picker.
-                if (gpu.canRunDlss()) {
-                    candidate = DlssRrUpscaler.tryCreate();
-                    if (candidate != null) {
-                        requestedReason = "auto: NVIDIA → DLSS-RR";
-                    }
-                }
-                if (candidate == null && gpu.canRunFsr41()) {
-                    candidate = FsrUpscaler.tryCreateFsr4(gpu);
-                    if (candidate != null) {
-                        requestedReason = "auto: AMD RDNA 3/4 → FSR 4.1";
-                    }
-                }
-                if (candidate == null && gpu.canRunFsr3()) {
-                    candidate = FsrUpscaler.tryCreateFsr3(gpu);
-                    if (candidate != null) {
-                        requestedReason = "auto: → modular FSR 3";
-                    }
-                }
-                // Linux Vulkan: modular FSR often has no provider — classic FSR2 is the real path.
-                if (candidate == null) {
-                    candidate = Fsr2ClassicUpscaler.tryCreate(gpu);
-                    if (candidate != null) {
-                        requestedReason = "auto: → classic FSR2 (Vulkan)";
-                    }
-                }
-                if (candidate == null && gpu.canRunXeSs()) {
-                    candidate = XeSsUpscaler.tryCreate();
-                    if (candidate != null) {
-                        requestedReason = "auto: → XeSS";
-                    }
-                }
-                // Final fallback: NIS (always works, pure shader)
-                if (candidate == null) {
-                    candidate = NisUpscaler.tryCreate();
-                    if (candidate != null) {
-                        requestedReason = "auto: → NIS (cross-vendor fallback)";
-                    }
+                // AUTO: Use TAAU (always available)
+                candidate = TaaUpscaler.tryCreate();
+                if (candidate != null) {
+                    requestedReason = "auto: → TAAU (pure compute)";
                 }
             }
         }

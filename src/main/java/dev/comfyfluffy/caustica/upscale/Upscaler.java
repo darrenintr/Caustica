@@ -8,11 +8,11 @@ import org.joml.Matrix4fc;
  * A denoise + upscale pass that takes the path-traced color (and optional guide buffers) at render
  * resolution and writes the display-resolution image.
  *
- * <p>Implementations: {@link DlssRrUpscaler} (NVIDIA DLSS-RR, eats the full 9-input contract), the
- * FSR 3 / FSR 4.1 INT8 implementation in {@link FsrUpscaler} (eats only color + depth + MV, ignores the
- * rest), and {@link XeSsUpscaler} (same input contract as FSR). The path tracer always writes all six
- * guide buffers (the cost is one per-primitive store on the GPU side; the rgen's first-hit attributes
- * are computed regardless), so each implementation picks what it needs.
+ * <p>Current implementations: {@link TaaUpscaler} (TAAU, pure compute, always available), and
+ * {@link NoopUpscaler} (1:1 blit fallback). The path tracer always writes all six guide buffers (the
+ * cost is one per-primitive store on the GPU side; the rgen's first-hit attributes are computed
+ * regardless), so the interface contract still takes them even though the only consumer today ignores
+ * everything past color + depth.
  *
  * <p>All implementations are expected to be lazy: {@link #isReady()} returns false until
  * {@link #ensureFeature(long, int, int, int, int, int)} has run successfully for the current dimensions.

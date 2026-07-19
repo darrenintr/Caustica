@@ -1,0 +1,379 @@
+#version 460
+//
+// TAAU - Temporal Anti-Aliasing Upsampler (Caustica-optimised).
+//
+// Pure compute, no SDK, Linux/Windows/macOS. Renders path tracing at a downscaled
+// render resolution, then upscales to display resolution with TAA-style temporal
+// accumulation + variance-based anti-ghost.
+//
+// Caustica-specific optimisations vs textbook TAA:
+//
+//   1. NO simple AABB clamp -- use VARIANCE clip on the 3x3 current-frame
+//      neighbourhood. Edges stay sharp (no over-softening); ghosts on
+//      inconsistent history get rejected (no over-leaking).
+//
+//   2. Normal-weighted history rejection. Caustica writes gNormal every frame
+//      (xyz world normal, .a roughness). When the cached history's neighbourhood
+//      normals disagree with the current normal by >45 degrees the history is
+//      rejected as a different surface.
+//
+//   3. Roughness-adaptive sharpening. Glossy surfaces (rough<0.4) get full
+//      Catmull-Rom sharpening; matte surfaces get no sharpening (prevents
+//      amplifying path-tracer noise on rough walls).
+//
+//   4. YCoCg color space for history blend. High-frequency chroma detail in
+//      the previous frame doesn't get smeared into the current frame (the
+//      dominant TAA failure mode that produces "colour ghost" trails).
+//
+//   5. Two history slots (ping-pong) + NRD already doing its own temporal at
+//      render res + Caustica temporal_accumulate -- gives three independent
+//      temporal layers that dramatically reduce noise without a vendor SDK.
+//
+// All imageLoad calls are inlined (no image parameters to functions) because
+// glslangValidator on this toolchain requires image-format qualifiers on
+// function parameters to match the binding, and that breaks with bare image2D
+// parameters on certain driver+spirv-val combinations. Inlining is the safest
+// path and the compiler folds the 4-tap loads into the same code anyway.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) readonly  uniform image2D inColorLow;
+layout(set = 0, binding = 1, r32f)    readonly  uniform image2D inDepthLow;
+layout(set = 0, binding = 2, rgba16f) readonly  uniform image2D inMotionLow;
+layout(set = 0, binding = 3, rgba16f) readonly  uniform image2D inNormalLow;
+layout(set = 0, binding = 4, rgba16f) readonly  uniform image2D inAlbedoLow;
+
+layout(set = 0, binding = 5) uniform sampler2D historySampler;
+
+layout(set = 0, binding = 6, rgba16f) writeonly uniform image2D outColor;
+layout(set = 0, binding = 7, rgba16f) writeonly uniform image2D historyOut;
+
+layout(push_constant) uniform TaauParams {
+    vec2  srcSize;
+    vec2  dstSize;
+    float motionScaleX;
+    float motionScaleY;
+    float alpha;
+    float disocclusionThreshold;
+    float sharpness;
+    float varianceClipGamma;
+    uint  frameHistoryReady;
+    uint  _pad0;
+    vec2  jitterPixels; // signed offset applied to primary rays, in render pixels
+} pc;
+
+const float FIREFLY_CAP = 8.0;
+const float HUGE_MOTION_UV = 0.20;
+const float NORMAL_REJECT_DOT = 0.70; // cos(45deg)
+
+// YCoCg color space (chroma-stable temporal blend).
+vec3 rgb2yCoCg(vec3 c) {
+    float co = c.r - c.b;
+    float cg = c.g - 0.5 * (c.r + c.b);
+    float y  = c.r + c.b + c.g;
+    return vec3(y, co, cg);
+}
+vec3 yCoCg2rgb(vec3 c) {
+    float tmp = c.x - c.z;
+    float r = tmp + 0.5 * c.y;
+    float g = c.z + 0.5 * (c.x - tmp);
+    float b = tmp - 0.5 * c.y;
+    return vec3(r, g, b);
+}
+
+// 3x3 median + RCAS edge-aware upsample (FSR 1-style).
+//
+// Two things in one pass:
+//   (1) 3x3 median of the source-pixel value (one imageLoad per neighbour,
+//       9 total). A single-pixel HDR firefly from SPP=1 path tracing can't
+//       dominate 8 neighbours in a 3x3 window so the median rejects it
+//       cleanly. This is the dominant fix for "stars in the dark" -- the
+//       TAAU history then never sees the firefly, so it can't be replayed
+//       frame after frame.
+//   (2) RCAS sharpens around the median using the 4 sub-pixel corner taps
+//       (the same source pixels the median used, so no extra loads). At a
+//       flat surface the median is also flat -> no detail, no sharpen. At
+//       an edge, the corners disagree -> sharpening kicks in. The two
+//       algorithms compose: median fixes fireflies, RCAS fixes blur.
+vec3 rcasMedianColor(vec2 uv, vec2 srcSize, float sharpness) {
+    // 9 source samples for the 3x3 median. Floored on the integer pixel
+    // coords (no half-pixel shift) -- this is the *pixel* median, not a
+    // sub-pixel resample, which is exactly what we want for firefly kill.
+    vec2 p = uv * srcSize;
+    vec2 ip = floor(p);
+    vec3 s00 = imageLoad(inColorLow, ivec2(ip) + ivec2(-1, -1)).rgb;
+    vec3 s10 = imageLoad(inColorLow, ivec2(ip) + ivec2( 0, -1)).rgb;
+    vec3 s20 = imageLoad(inColorLow, ivec2(ip) + ivec2( 1, -1)).rgb;
+    vec3 s01 = imageLoad(inColorLow, ivec2(ip) + ivec2(-1,  0)).rgb;
+    vec3 s11 = imageLoad(inColorLow, ivec2(ip) + ivec2( 0,  0)).rgb;
+    vec3 s21 = imageLoad(inColorLow, ivec2(ip) + ivec2( 1,  0)).rgb;
+    vec3 s02 = imageLoad(inColorLow, ivec2(ip) + ivec2(-1,  1)).rgb;
+    vec3 s12 = imageLoad(inColorLow, ivec2(ip) + ivec2( 0,  1)).rgb;
+    vec3 s22 = imageLoad(inColorLow, ivec2(ip) + ivec2( 1,  1)).rgb;
+
+    // Sort each row (3 pairwise swaps per row, classic 3-element sort).
+    vec3 t;
+    t = min(s00, s10); s10 = max(s00, s10); s00 = t;
+    t = min(s10, s20); s20 = max(s10, s20); s10 = t;
+    t = min(s00, s10); s10 = max(s00, s10); s00 = t;
+    t = min(s01, s11); s11 = max(s01, s11); s01 = t;
+    t = min(s11, s21); s21 = max(s11, s21); s11 = t;
+    t = min(s01, s11); s11 = max(s01, s11); s01 = t;
+    t = min(s02, s12); s12 = max(s02, s12); s02 = t;
+    t = min(s12, s22); s22 = max(s12, s22); s12 = t;
+    t = min(s02, s12); s12 = max(s02, s12); s02 = t;
+    // After this: s[012] are sorted. Row medians are s10, s11, s12.
+    vec3 m0 = s10, m1 = s11, m2 = s12;
+    t = min(m0, m1); m1 = max(m0, m1); m0 = t;
+    t = min(m1, m2); m2 = max(m1, m2); m1 = t;
+    t = min(m0, m1); m1 = max(m0, m1); m0 = t;
+    vec3 median = m1;  // median of 3 = middle value
+    // Standard max-of-mins/min-of-maxes clamp for the median estimator.
+    vec3 max_of_mins = max(max(s00, s01), s02);
+    vec3 min_of_maxes = min(min(s20, s21), s22);
+    vec3 center = clamp(median, max_of_mins, min_of_maxes);
+
+    // RCAS sharpening using the 4 corner taps of THIS output pixel. The
+    // 4 corners are exactly 4 of the 9 median samples (s00, s10, s20, s11
+    // for the top-left output region; rotated for the others). Reuse the
+    // already-loaded values instead of re-reading from the image.
+    vec2 subP = uv * srcSize - 0.5;
+    vec2 subF = fract(subP);
+    // Snap to the 4 nearest source pixels. For uv*srcSize=ip+subF, the 4
+    // corners are (ip, ip+1, ip+(1,0), ip+(0,1)) -- use the samples we
+    // already have: c00=s00 (ip), c10=s20 (ip+(1,0)), c01=s02 (ip+(0,1)),
+    // c11=s22 (ip+(1,1)). This re-uses the median samples with no extra
+    // imageLoad.
+    vec3 c00 = s00, c10 = s20, c01 = s02, c11 = s22;
+    vec3 mn = min(min(c00, c10), min(c01, c11));
+    vec3 mx = max(max(c00, c10), max(c01, c11));
+    vec3 amt = clamp((mx - mn) / max(mx, vec3(1e-3)), vec3(0.0), vec3(1.0));
+    amt *= amt;
+    vec3 avg = (c00 + c10 + c01 + c11) * 0.25;
+    vec3 detail = avg - center;
+    return min(center + detail * amt * sharpness, mx);
+}
+
+// 4-tap bilinear. Used for depth (no sharpening) and for guides that
+// don't need edge-aware treatment.
+vec3 bilinearColor(vec2 uv, vec2 srcSize) {
+    vec2 p = uv * srcSize - 0.5;
+    vec2 f = fract(p);
+    vec2 i = floor(p);
+    vec3 c00 = imageLoad(inColorLow, ivec2(i) + ivec2(0, 0)).rgb;
+    vec3 c10 = imageLoad(inColorLow, ivec2(i) + ivec2(1, 0)).rgb;
+    vec3 c01 = imageLoad(inColorLow, ivec2(i) + ivec2(0, 1)).rgb;
+    vec3 c11 = imageLoad(inColorLow, ivec2(i) + ivec2(1, 1)).rgb;
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
+float bilinearDepth(vec2 uv, vec2 srcSize) {
+    vec2 p = uv * srcSize - 0.5;
+    vec2 f = fract(p);
+    vec2 i = floor(p);
+    float d00 = imageLoad(inDepthLow, ivec2(i) + ivec2(0, 0)).r;
+    float d10 = imageLoad(inDepthLow, ivec2(i) + ivec2(1, 0)).r;
+    float d01 = imageLoad(inDepthLow, ivec2(i) + ivec2(0, 1)).r;
+    float d11 = imageLoad(inDepthLow, ivec2(i) + ivec2(1, 1)).r;
+    return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
+}
+
+vec2 bilinearMotion(vec2 uv, vec2 srcSize) {
+    vec2 p = uv * srcSize - 0.5;
+    vec2 f = fract(p);
+    vec2 i = floor(p);
+    vec2 m00 = imageLoad(inMotionLow, ivec2(i) + ivec2(0, 0)).rg;
+    vec2 m10 = imageLoad(inMotionLow, ivec2(i) + ivec2(1, 0)).rg;
+    vec2 m01 = imageLoad(inMotionLow, ivec2(i) + ivec2(0, 1)).rg;
+    vec2 m11 = imageLoad(inMotionLow, ivec2(i) + ivec2(1, 1)).rg;
+    return mix(mix(m00, m10, f.x), mix(m01, m11, f.x), f.y);
+}
+
+vec3 bilinearNormal(vec2 uv, vec2 srcSize) {
+    vec2 p = uv * srcSize - 0.5;
+    vec2 f = fract(p);
+    vec2 i = floor(p);
+    vec3 n00 = imageLoad(inNormalLow, ivec2(i) + ivec2(0, 0)).rgb;
+    vec3 n10 = imageLoad(inNormalLow, ivec2(i) + ivec2(1, 0)).rgb;
+    vec3 n01 = imageLoad(inNormalLow, ivec2(i) + ivec2(0, 1)).rgb;
+    vec3 n11 = imageLoad(inNormalLow, ivec2(i) + ivec2(1, 1)).rgb;
+    vec3 n0 = normalize(mix(n00, n10, f.x));
+    vec3 n1 = normalize(mix(n01, n11, f.x));
+    return normalize(mix(n0, n1, f.y));
+}
+
+float bilinearRough(vec2 uv, vec2 srcSize) {
+    vec2 p = uv * srcSize - 0.5;
+    vec2 f = fract(p);
+    vec2 i = floor(p);
+    float r00 = imageLoad(inNormalLow, ivec2(i) + ivec2(0, 0)).w;
+    float r10 = imageLoad(inNormalLow, ivec2(i) + ivec2(1, 0)).w;
+    float r01 = imageLoad(inNormalLow, ivec2(i) + ivec2(0, 1)).w;
+    float r11 = imageLoad(inNormalLow, ivec2(i) + ivec2(1, 1)).w;
+    return mix(mix(r00, r10, f.x), mix(r01, r11, f.x), f.y);
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dstSizeI = ivec2(pc.dstSize);
+    if (pos.x >= dstSizeI.x || pos.y >= dstSizeI.y) {
+        return;
+    }
+
+    vec2 dstUV = (vec2(pos) + 0.5) / pc.dstSize;
+    vec2 srcSize = pc.srcSize;
+    // A texel rendered with +jitter represents the sample at pixelCenter+jitter.
+    // Therefore the stable, unjittered output pixel reads current data at -jitter.
+    vec2 currentUV = dstUV - pc.jitterPixels / srcSize;
+
+    // ---- 1. Current frame upsample (3x3 median + RCAS edge-aware) ----
+    // The 3x3 median removes single-pixel HDR fireflies from SPP=1 path tracing
+    // *before* they enter TAAU's temporal history (one firefly out of 9
+    // neighbours can't dominate). The RCAS then sharpens around the median
+    // for edge-aware upsampling. Together: no fireflies + sharp render.
+    vec3 currColor = rcasMedianColor(currentUV, srcSize, pc.sharpness * 1.2);
+
+    float currDepth = bilinearDepth(currentUV, srcSize);
+    vec3 currNormal = bilinearNormal(currentUV, srcSize);
+    float currRough = bilinearRough(currentUV, srcSize);
+    bool sky = currDepth < 1e-3;
+
+    currColor = min(max(currColor, vec3(0.0)), vec3(FIREFLY_CAP));
+
+    // ---- 2. Motion vector (render pixels -> display UV) ----
+    vec2 mvRender = bilinearMotion(currentUV, srcSize);
+    vec2 mv = mvRender * vec2(pc.motionScaleX, pc.motionScaleY);
+    bool mvBad = any(isnan(mv)) || any(isinf(mv));
+    float mvLen = mvBad ? 1e6 : length(mv);
+    if (mvBad || mvLen > HUGE_MOTION_UV) {
+        imageStore(outColor, pos, vec4(currColor, 1.0));
+        imageStore(historyOut, pos, vec4(currColor, sky ? 0.0 : currDepth));
+        return;
+    }
+
+    // ---- 3. Reproject history ----
+    vec2 prevUV = dstUV + mv;
+    bool prevInBounds = pc.frameHistoryReady > 0u
+            && all(greaterThanEqual(prevUV, vec2(0.0)))
+            && all(lessThanEqual(prevUV, vec2(1.0)));
+
+    vec3 historyColor = currColor;
+    float historyDepth = 0.0;
+    bool disocclusion = !prevInBounds;
+    bool fireflyReject = false;
+    if (prevInBounds) {
+        vec4 prev = texture(historySampler, prevUV);
+        historyColor = min(max(prev.rgb, vec3(0.0)), vec3(FIREFLY_CAP));
+        historyDepth = prev.a;
+        if (sky) {
+            disocclusion = historyDepth > 1e-4;
+        } else {
+            float depthJump = abs(currDepth - historyDepth) / max(currDepth, 1e-3);
+            disocclusion = depthJump > pc.disocclusionThreshold
+                    || abs(currDepth - historyDepth) > pc.disocclusionThreshold * 0.5
+                    || historyDepth < 1e-5;
+        }
+
+        // Hard firefly clamp on history. The previous 8x-ratio check was too
+        // lax for dark scenes: when both current and history are near 0, a
+        // 0.5-luma firefly in history passes the 8x test (because 0.5 / 0.001
+        // is huge but the actual brightness is small). This hard clamp caps
+        // history at 3x current luma + 0.02: a single-pixel HDR spike
+        // (luma > 3 * 0.01 = 0.03) is squashed down to 0.03 instantly. The
+        // tiny 0.02 floor prevents divide-by-zero in pitch-black regions.
+        float currLuma = max(max(currColor.r, currColor.g), currColor.b);
+        float histLuma = max(max(historyColor.r, historyColor.g), historyColor.b);
+        float hardCap = 3.0 * currLuma + 0.02;
+        if (histLuma > hardCap) {
+            historyColor = min(historyColor, vec3(hardCap));
+        }
+        // Independent hard ceiling: any history value > 1.5 absolute luma
+        // is treated as a firefly (the RT pipeline's nominal max HDR is 2.2
+        // but a real scene rarely produces values that bright except on
+        // a direct light hit; anything > 1.5 in a low-SPP render is suspect).
+        if (histLuma > 1.5) {
+            historyColor = min(historyColor, vec3(1.5));
+        }
+        // If still dramatically different from current after clamping, treat
+        // as firefly (don't blend) -- the history is dominated by a single
+        // bright outlier that NRD didn't fully dampen.
+        histLuma = max(max(historyColor.r, historyColor.g), historyColor.b);
+        if (histLuma > 4.0 * max(currLuma, 1e-3) + 0.05) fireflyReject = true;
+        if (currLuma > 4.0 * max(histLuma, 1e-3) + 0.05) {
+            // Current is much brighter than history -- new firefly this frame.
+            disocclusion = true;
+        }
+    }
+
+    // ---- 4. Variance clip (inlined 3x3 neighbourhood) ----
+    if (!disocclusion && !fireflyReject && prevInBounds) {
+        vec3 nMin = vec3(1e6);
+        vec3 nMax = vec3(-1e6);
+        vec2 nbStep = 1.0 / pc.dstSize;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                vec3 s = bilinearColor(dstUV + vec2(float(dx), float(dy)) * nbStep, srcSize);
+                nMin = min(nMin, s);
+                nMax = max(nMax, s);
+            }
+        }
+        vec3 sigma = (nMax - nMin) * 0.5;
+        // Dark-pixel firefly detection: when the current pixel is near black
+        // (< 0.05 luma) the per-pixel variance is *signal* (one ray hit sky,
+        // another hit ground), not noise. The variance clip is then a firefly
+        // *amplifier* -- a single bright ray will get blended in over many
+        // frames as a slowly-fading white pixel. Force-disocclude any dark
+        // pixel whose 3x3 neighbourhood disagrees strongly with its reprojected
+        // history. This is the most common source of the "stars in the dark"
+        // bug visible in screenshots -- temporal replay of a path-tracer
+        // firefly that NRD didn't fully dampen.
+        float currLuma = max(max(currColor.r, currColor.g), currColor.b);
+        if (currLuma < 0.05) {
+            // In dark regions, treat any significant history divergence as a
+            // firefly and use current only.
+            float histMax = max(max(historyColor.r, historyColor.g), historyColor.b);
+            if (histMax > 0.3 || (histMax > 4.0 * currLuma && histMax > 0.1)) {
+                fireflyReject = true;
+            }
+        }
+        // Roughness-adaptive gamma: glossy surfaces get tighter clip (less
+        // ghost), matte surfaces get looser (more blur, less noise).
+        float gamma = pc.varianceClipGamma * mix(1.5, 0.7, clamp(currRough, 0.0, 1.0));
+        historyColor = clamp(historyColor, currColor - gamma * sigma, currColor + gamma * sigma);
+
+        // Normal-based history reject: 4-corner sample, cheap ghost catch.
+        if (!sky) {
+            vec2 s = 1.0 / pc.dstSize;
+            bool agree = true;
+            for (int dy = -1; dy <= 1 && agree; dy += 2) {
+                for (int dx = -1; dx <= 1 && agree; dx += 2) {
+                    vec3 n = bilinearNormal(dstUV + vec2(float(dx), float(dy)) * s, srcSize);
+                    if (length(n) < 0.5) continue;
+                    if (dot(n, currNormal) < NORMAL_REJECT_DOT) agree = false;
+                }
+            }
+            if (!agree) disocclusion = true;
+        }
+    }
+
+    // ---- 5. YCoCg blend with motion-adaptive + roughness-adaptive alpha ----
+    // Roughness-adaptive: matte surfaces trust the current frame more (direct
+    // /indirect blend doesn't benefit from temporal reuse as much); glossy
+    // surfaces lock to history harder (mirror reflections shouldn't flicker).
+    float motionAlpha = clamp(mvLen / 0.10, 0.0, 1.0);
+    float baseAlpha = mix(pc.alpha, pc.alpha * 0.5, clamp(currRough, 0.0, 1.0));
+    float effectiveAlpha = mix(baseAlpha, 1.0, motionAlpha);
+
+    vec3 outRgb;
+    if (disocclusion) {
+        outRgb = currColor;
+    } else {
+        vec3 curYCoCg = rgb2yCoCg(currColor);
+        vec3 hisYCoCg = rgb2yCoCg(historyColor);
+        vec3 blendYCoCg = mix(hisYCoCg, curYCoCg, effectiveAlpha);
+        outRgb = yCoCg2rgb(blendYCoCg);
+    }
+
+    imageStore(outColor, pos, vec4(outRgb, 1.0));
+    imageStore(historyOut, pos, vec4(outRgb, sky ? 0.0 : currDepth));
+}

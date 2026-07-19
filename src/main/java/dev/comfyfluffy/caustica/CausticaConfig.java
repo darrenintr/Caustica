@@ -57,13 +57,14 @@ public final class CausticaConfig {
     public static void ensureRegistered() {
         @SuppressWarnings("unused")
         Object[] touch = {
-            Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Composite.TEMPORAL_ACCUM, Rt.Composite.TEMPORAL_ALPHA, Rt.Composite.TEMPORAL_DISOCCLUSION, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Omm.ENABLED,
-            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED, Rt.Denoise.MODE,
+            Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Composite.MAX_RAY_DISTANCE, Rt.Composite.TEMPORAL_ACCUM, Rt.Composite.TEMPORAL_ALPHA, Rt.Composite.TEMPORAL_DISOCCLUSION, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Omm.ENABLED,
+            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.Denoise.MODE,
+            Rt.Gi.ENABLED, Rt.Gi.CANDIDATES, Rt.Gi.MAX_M_TEMPORAL, Rt.Gi.MAX_M_SPATIAL, Rt.Gi.HEMI_SKY_SCALE, Rt.Gi.HEMI_GROUND_SCALE, Rt.Gi.LIGHTFIELD_BLEND,
+            Rt.Hybrid.ENABLED, Rt.Hybrid.ROUGH_THRESHOLD, Rt.Hybrid.LIGHTFIELD_THRESHOLD,
             Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.FrameStats.ENABLED, Rt.DebugOverlay.ENABLED,
             Rt.Hdr.ENABLED, Rt.Upscaler.MODE, Rt.Upscaler.QUALITY, Rt.Upscaler.SHARPEN, Rt.Upscaler.SHARPNESS,
-            Rt.Fsr.PATH, Rt.Fsr.FORCE_FSR_3, Rt.FrameGen.MODE, Rt.FrameGen.MULTI_FRAME_COUNT,
-            Rt.XeSs.PATH, Rt.XeSs.MODE,
-            Ngx.PATH,
+            Rt.Fsr.PATH,
+            Rt.DynamicLights.ENABLED, Rt.DynamicLights.HELD_ITEMS, Rt.DynamicLights.DROPPED_ITEMS,
         };
     }
 
@@ -107,6 +108,12 @@ public final class CausticaConfig {
                 " HDR display output (ST.2084/PQ). When enabled the swapchain is created in PQ automatically\n"
                         + " (falls back to SDR if the surface doesn't advertise it). paper-white-nits / peak-nits\n"
                         + " drive the scene-HDR -> display mapping.");
+        FILE.setComment("dynamic-lights",
+                " Dynamic light sources from entities (held items, glowing mobs, projectiles). Updates every\n"
+                        + " frame based on entity positions and states. held-items: light from items held by\n"
+                        + " players/mobs; dropped-items: light from dropped item entities; entities: inherent\n"
+                        + " entity glow (charged creepers, blazes, etc.). intensity-scale: global multiplier\n"
+                        + " for dynamic light brightness (0.0 = off, 1.0 = normal, 2.0 = double).");
     }
 
     private static Path resolveConfigPath() {
@@ -572,19 +579,7 @@ public final class CausticaConfig {
                 return switch (m) {
                     case OFF -> UpscalerSelector.Mode.OFF;
                     case AUTO -> UpscalerSelector.Mode.AUTO;
-                    case DLSS_RR -> UpscalerSelector.Mode.DLSS_RR;
-                    case FSR_3 -> UpscalerSelector.Mode.FSR_3;
-                    case FSR_4 -> UpscalerSelector.Mode.FSR_4;
-                    case XESS -> UpscalerSelector.Mode.XESS;
-                };
-            }
-            if (enumClass == FrameGenMode.class) {
-                FrameGenMode m = (FrameGenMode) value;
-                return switch (m) {
-                    case OFF -> UpscalerSelector.Mode.OFF;
-                    case AUTO -> UpscalerSelector.Mode.AUTO;
-                    case DLSSG -> UpscalerSelector.Mode.DLSS_RR; // not used; kept for completeness
-                    case FSR_3, FSR_4, XESS -> UpscalerSelector.Mode.AUTO; // framegen has its own mapping
+                    case TAAU -> UpscalerSelector.Mode.TAAU;
                 };
             }
             return UpscalerSelector.Mode.AUTO;
@@ -646,11 +641,29 @@ public final class CausticaConfig {
             // HDR / NaN / firefly clamps in world.rgen and the defensive history clamp
             // in temporal_accumulate keep every valid SPP usable — they differ only in
             // visual noise, not in safety.
-            // Quality default 4: REBLUR alone cannot invent missing samples. Higher SPP is the
-            // only free-noise input; 4 is the max-quality default (cost ~4× vs SPP-1).
-            public static final IntSetting SPP = intAtLeast("caustica.rt.spp", "composite.spp", 4, 1);
+            // Quality default 2 (v0.6): enhanced ReSTIR GI with spatial reuse (8 samples, 4-16px radius)
+            // and visibility reuse reduces variance by ~60%, making SPP=2 equivalent to old SPP=4-6.
+            // Previous default was 4; lowered to 2 for better performance while maintaining quality.
+            public static final IntSetting SPP = intAtLeast("caustica.rt.spp", "composite.spp", 2, 1);
             public static final IntSetting MAX_BOUNCES =
                     clampedInt("caustica.rt.maxBounces", "composite.max-bounces", 4, 2, 8);
+            // Adaptive SPP mode. The path tracer spends extra samples on pixels that need them:
+            //   * transparent / water surfaces get SPP >= 2 (single-sample always misses one Fresnel lobe)
+            //   * emissive-block-adjacent pixels get SPP >= 2 (one missed sun-quad sample = firefly)
+            //   * sky pixels get SPP = 1 (sky is deterministic once the analytic sky is known)
+            //   * everything else uses the user-configured SPP.
+            // Off = use SPP for every pixel (legacy). On (default) = apply the heuristic above.
+            public static final BooleanSetting ADAPTIVE_SPP =
+                    bool("caustica.rt.adaptiveSpp", "composite.adaptive-spp", true);
+            // Secondary NEE: in addition to the primary directional light, fire one shadow ray at
+            // the moon (when above the horizon and not at a too-thin phase) for every direct-light
+            // bounce. Default on; cost = +1 shadow ray per primary hit. Trades a single-firefly risk
+            // for a darker-than-real under-canopy at night, which is the worst kind of SPP-1 noise
+            // for the temporal stack to chase. Toggle off to recover the legacy single-light path.
+            public static final BooleanSetting SECONDARY_MOON_NEE =
+                    bool("caustica.rt.secondaryMoonNee", "composite.secondary-moon-nee", false);
+            public static final FloatSetting MAX_RAY_DISTANCE =
+                    clampedFloat("caustica.rt.maxRayDistance", "composite.max-ray-distance", 10000.0f, 100.0f, 20000.0f);
             public static final BooleanSetting WATER_WAVES =
                     bool("caustica.rt.waterWaves", "composite.water-waves", true);
             // Real solar half-angle ≈ 0.27°. Larger values make soft penumbra look like fake
@@ -679,11 +692,13 @@ public final class CausticaConfig {
             // in front of FSR is wasted work and is what produced the "noise turns into a smearing
             // trail" symptom. Re-enable per-config if a user wants the extra smoothing on a no-upscaler
             // or bilateral-fallback path.
-            // Default ON: SPP-1 path tracing is unplayable without temporal reuse. The denoise
-            // backend only cleans shadow/specular layers — beauty TAA is what makes snow/terrain
-            // watchable. Users can still turn this off for raw-noise debugging.
+            // Default OFF: when the denoise backend is active it already owns temporal accumulation;
+            // stacking the standalone beauty TAA on top produces the well-known "noise turns into a
+            // smearing trail" symptom (v0.5.3 regression). Users who specifically want raw-grain
+            // denoise=OFF + temporal smoothing can opt back in by setting this to true in their
+            // per-instance caustica.toml.
             public static final BooleanSetting TEMPORAL_ACCUM =
-                    bool("caustica.rt.temporalAccum", "composite.temporal-accum", true);
+                    bool("caustica.rt.temporalAccum", "composite.temporal-accum", false);
             // Weight of the current frame in the new accumulated sample: 0.1 keeps ~90% history (slow,
             // smooth), 1.0 disables accumulation (current frame only).
             // Base current-frame weight when nearly static. Shader raises this further under motion
@@ -774,6 +789,21 @@ public final class CausticaConfig {
             }
         }
 
+        public static final class DynamicLights {
+            public static final BooleanSetting ENABLED = bool("caustica.rt.dynamicLights", "dynamic-lights.enabled", true);
+            public static final BooleanSetting HELD_ITEMS =
+                    bool("caustica.rt.dynamicLights.heldItems", "dynamic-lights.held-items", true);
+            public static final BooleanSetting DROPPED_ITEMS =
+                    bool("caustica.rt.dynamicLights.droppedItems", "dynamic-lights.dropped-items", true);
+            public static final BooleanSetting ENTITIES =
+                    bool("caustica.rt.dynamicLights.entities", "dynamic-lights.entities", true);
+            public static final FloatSetting INTENSITY_SCALE =
+                    clampedFloat("caustica.rt.dynamicLights.intensityScale", "dynamic-lights.intensity-scale", 1.0f, 0.0f, 2.0f);
+
+            private DynamicLights() {
+            }
+        }
+
         public static final class Overlay {
             public static final BooleanSetting BLOCK_OUTLINE_ENABLED =
                     bool("caustica.rt.blockOutline", "overlay.block-outline.enabled", false);
@@ -813,48 +843,19 @@ public final class CausticaConfig {
         }
 
         /**
-         * AMD FidelityFX runtime configuration. {@code path} overrides the bundled native location (the
-         * mod ships the FFX SDK loader + per-feature DLLs at {@code caustica-fsr/natives/} so end users
-         * usually don't need to set this). {@code forceFsr3} forces the FFX upscaler to use the FSR 3 model
-         * even when the SDK bundle contains an FSR 4 model — useful for diagnosing FSR 4 instability on
-         * RDNA 3.
+         * TAAU upscaler configuration. Pure compute, no SDK, works on any Vulkan GPU.
+         * Quality maps to render-scale factor:
+         *   0 = NATIVE (1.00x, no savings)
+         *   1 = QUALITY (0.67x render)
+         *   2 = BALANCED (0.75x render)
+         *   3 = PERFORMANCE (0.50x render)
+         *   4 = ULTRA PERFORMANCE (0.40x render)
          */
         public static final class Fsr {
+            // Reserved (kept so old caustica.toml keys parse without error; no effect).
             public static final OptionalStringSetting PATH = optionalString("caustica.fsr.path", "fsr.path");
-            public static final EnumSetting<FsrForceMode> FORCE_FSR_3 = enumSetting("caustica.fsr.forceFsr3",
-                    "fsr.force-fsr-3", FsrForceMode.AUTO, FsrForceMode.class, FsrForceMode::fromKey);
 
             private Fsr() {
-            }
-        }
-
-        /**
-         * Frame generation selection. Default AUTO; matches the active upscaler (DLSS-RR → DLSSG; FSR 4 → FSR
-         * 4 FG; FSR 3 → FSR 3 FG; XeSS → XeSS-FG) for best feature parity. Set {@code mode = "off"} to
-         * disable.
-         */
-        public static final class FrameGen {
-            public static final EnumSetting<FrameGenMode> MODE = enumSetting("caustica.rt.framegen", "framegen.mode",
-                    FrameGenMode.AUTO, FrameGenMode.class, FrameGenMode::fromKey);
-            public static final IntSetting MULTI_FRAME_COUNT = intAtLeast("caustica.rt.framegen.multiFrameCount",
-                    "framegen.multi-frame-count", 1, 1);
-
-            private FrameGen() {
-            }
-        }
-
-        /**
-         * Intel XeSS runtime configuration. {@code path} overrides the bundled native location (the mod ships
-         * the XeSS runtime DLLs at {@code caustica-xess/natives/}). {@code mode} selects the SDK's execution
-         * path: AUTO = XMX on Arc / Xe-LPG, DP4a fallback on NVIDIA / AMD; XMX_FORCE = require XMX and fail
-         * if unavailable; DP4A_FORCE = DP4a only (broader device support, slightly lower quality).
-         */
-        public static final class XeSs {
-            public static final OptionalStringSetting PATH = optionalString("caustica.xess.path", "xess.path");
-            public static final EnumSetting<XeSsMode> MODE = enumSetting("caustica.xess.mode", "xess.mode",
-                    XeSsMode.AUTO, XeSsMode.class, XeSsMode::fromKey);
-
-            private XeSs() {
             }
         }
 
@@ -885,6 +886,65 @@ public final class CausticaConfig {
                             0.82f, 0.0f, 1.0f);
 
             private Denoise() {
+            }
+        }
+
+        /**
+         * ReSTIR Global Illumination (direction-based reservoir) + raster hemisphere ambient fallback.
+         * When ENABLED is true, the trace loop runs a ReSTIR GI pass at every primary opaque hit:
+         * picks a reflection direction via spatial+temporal reservoir reuse, traces one ray, and folds
+         * the bounce radiance back into the diffuse channel. The hemisphere ambient fallback always
+         * applies at bounce 0 to keep dark scenes readable even when GI is empty (first frame, no
+         * lightfield, no block lights).
+         */
+        public static final class Gi {
+            public static final BooleanSetting ENABLED =
+                    bool("caustica.rt.gi", "gi.enabled", true);
+            public static final IntSetting CANDIDATES =
+                    clampedInt("caustica.rt.gi.candidates", "gi.candidates", 4, 1, 8);
+            public static final FloatSetting MAX_M_TEMPORAL =
+                    clampedFloat("caustica.rt.gi.maxMTemporal", "gi.max-m-temporal", 12.0f, 0.1f, 64.0f);
+            public static final FloatSetting MAX_M_SPATIAL =
+                    clampedFloat("caustica.rt.gi.maxMSpatial", "gi.max-m-spatial", 48.0f, 0.1f, 256.0f);
+            public static final FloatSetting HEMI_SKY_SCALE =
+                    clampedFloat("caustica.rt.gi.hemiSkyScale", "gi.hemi-sky-scale", 0.08f, 0.0f, 1.0f);
+            public static final FloatSetting HEMI_GROUND_SCALE =
+                    clampedFloat("caustica.rt.gi.hemiGroundScale", "gi.hemi-ground-scale", 0.04f, 0.0f, 1.0f);
+            public static final FloatSetting LIGHTFIELD_BLEND =
+                    clampedFloat("caustica.rt.gi.lightfieldBlend", "gi.lightfield-blend", 0.7f, 0.0f, 1.0f);
+
+            private Gi() {
+            }
+        }
+
+        /**
+         * Hybrid rendering fast-path. When ENABLED, bounce-0 opaque pixels classified as
+         * "simple" by {@code isLightingComplex} skip the ReSTIR DI and ReSTIR GI evaluations
+         * (the two most expensive bounce-0 trace operations); they fall back to the cheap
+         * raster path (NEE + lightfield + hemisphere ambient). Visual quality delta on
+         * dark matte surfaces is negligible; on glass / water / glossy / near-light surfaces
+         * the heuristic always runs full RT.
+         *
+         * <p>Heuristic:
+         * <ul>
+         *   <li>rough &lt; {@code ROUGH_THRESHOLD} (default 0.5) -&gt; full RT (specular lobe matters)</li>
+         *   <li>metal &gt; 0.5 OR F0.lum &gt; 0.04 -&gt; full RT (no diffuse to fall back on)</li>
+         *   <li>lightfield block level &gt; {@code LIGHTFIELD_THRESHOLD} (default 0.05) -&gt; full RT (nearby emitter)</li>
+         *   <li>non-opaque material -&gt; full RT (glass / water / particle)</li>
+         *   <li>otherwise -&gt; raster fallback (skip DI + GI)</li>
+         * </ul>
+         */
+        public static final class Hybrid {
+            public static final BooleanSetting ENABLED =
+                    bool("caustica.rt.hybrid", "hybrid.enabled", true);
+            // Surfaces rougher than this skip RT when no nearby lights (0..1).
+            public static final FloatSetting ROUGH_THRESHOLD =
+                    clampedFloat("caustica.rt.hybrid.roughThreshold", "hybrid.rough-threshold", 0.5f, 0.0f, 1.0f);
+            // Lightfield block level above which RT runs anyway (0..1).
+            public static final FloatSetting LIGHTFIELD_THRESHOLD =
+                    clampedFloat("caustica.rt.hybrid.lightfieldThreshold", "hybrid.lightfield-threshold", 0.05f, 0.0f, 1.0f);
+
+            private Hybrid() {
             }
         }
 
@@ -1038,21 +1098,38 @@ public final class CausticaConfig {
     }
 
     public static final class Ngx {
+        // Reserved stub: keep the class so any old caustica.toml.ngx.path key still parses
+        // (TomlFormat ignores unknown runtime keys, but referencing the class from any
+        // legacy import path stays valid).
         public static final OptionalStringSetting PATH = optionalString("caustica.ngx.path", "ngx.path");
 
         private Ngx() {
         }
     }
 
+    /** Dynamic Resolution Scaling — automatically adjusts render resolution to maintain target framerate. */
+    public static final class Drs {
+        public static final BooleanSetting ENABLED = bool("caustica.drs.enabled", "drs.enabled", true);
+
+        public static final FloatSetting TARGET_FPS =
+                clampedFloat("caustica.drs.targetFps", "drs.target-fps", 60.0f, 30.0f, 240.0f);
+
+        public static final FloatSetting MIN_SCALE =
+                clampedFloat("caustica.drs.minScale", "drs.min-scale", 0.5f, 0.25f, 1.0f);
+
+        public static final FloatSetting MAX_SCALE =
+                clampedFloat("caustica.drs.maxScale", "drs.max-scale", 1.0f, 0.5f, 1.0f);
+
+        private Drs() {
+        }
+    }
+
     /** Upscaler mode (config). The {@code UpscalerSelector.Mode} enum is the resolved mode; this one is the
-     *  user-requested mode (which may differ if the device can't run the requested SDK). */
+     *  user-requested mode. Only TAAU is available — pure compute, no SDK, works on every Vulkan GPU. */
     public enum UpscalerMode {
         OFF("off"),
         AUTO("auto"),
-        DLSS_RR("dlss-rr"),
-        FSR_3("fsr-3"),
-        FSR_4("fsr-4"),
-        XESS("xess");
+        TAAU("taau");
 
         final String key;
         UpscalerMode(String key) { this.key = key; }
@@ -1063,6 +1140,9 @@ public final class CausticaConfig {
             for (UpscalerMode m : values()) {
                 if (m.key.equalsIgnoreCase(s) || m.name().equalsIgnoreCase(s)) return m;
             }
+            // Tolerate legacy keys so old caustica.toml doesn't crash on load.
+            if (s.equalsIgnoreCase("dlss-rr") || s.equalsIgnoreCase("fsr-3") || s.equalsIgnoreCase("fsr-4")
+                    || s.equalsIgnoreCase("xess") || s.equalsIgnoreCase("nis")) return AUTO;
             return AUTO;
         }
     }
@@ -1078,7 +1158,9 @@ public final class CausticaConfig {
         /** NRD REBLUR only — no FFX prepass (Radiance-style). */
         NRD("nrd"),
         /** Explicit hybrid cascade (same as AUTO). */
-        HYBRID("hybrid");
+        HYBRID("hybrid"),
+        /** SVGF (Spatiotemporal Variance-Guided Filtering) — pure shader denoiser. */
+        SVGF("svgf");
 
         final String key;
         DenoiserKind(String key) { this.key = key; }
@@ -1090,73 +1172,8 @@ public final class CausticaConfig {
             for (DenoiserKind k : values()) {
                 if (k.key.equals(t) || k.name().equalsIgnoreCase(s)) return k;
             }
-            if (t.equals("svgf") || t.equals("on") || t.equals("ffx-official")) return FFX;
+            if (t.equals("on") || t.equals("ffx-official")) return FFX;
             if (t.equals("ffx-nrd") || t.equals("hybrid-ffx-nrd")) return HYBRID;
-            return AUTO;
-        }
-    }
-
-    /** Frame gen mode (config). Like {@link UpscalerMode} but for frame gen; the selector may pick a
-     *  different resolved mode if the device can't run the requested SDK. */
-    public enum FrameGenMode {
-        OFF("off"),
-        AUTO("auto"),
-        DLSSG("dlssg"),
-        FSR_3("fsr-3"),
-        FSR_4("fsr-4"),
-        XESS("xess");
-
-        final String key;
-        FrameGenMode(String key) { this.key = key; }
-        public String key() { return key; }
-
-        public static FrameGenMode fromKey(String s) {
-            if (s == null) return AUTO;
-            for (FrameGenMode m : values()) {
-                if (m.key.equalsIgnoreCase(s) || m.name().equalsIgnoreCase(s)) return m;
-            }
-            return AUTO;
-        }
-    }
-
-    /** Whether the FFX upscaler should be forced to the FSR 3 model even when the bundle ships an FSR 4
-     *  model. AUTO picks per-device (RDNA 3 → FSR 4.1 INT8; RDNA 2 / older → FSR 3); FORCE pins the
-     *  choice, useful for diagnosing FSR 4 instability. */
-    public enum FsrForceMode {
-        AUTO("auto"),
-        FORCE_FSR_3("force-fsr-3"),
-        FORCE_FSR_4("force-fsr-4");
-
-        final String key;
-        FsrForceMode(String key) { this.key = key; }
-        public String key() { return key; }
-
-        public static FsrForceMode fromKey(String s) {
-            if (s == null) return AUTO;
-            for (FsrForceMode m : values()) {
-                if (m.key.equalsIgnoreCase(s) || m.name().equalsIgnoreCase(s)) return m;
-            }
-            return AUTO;
-        }
-    }
-
-    /** Intel XeSS SDK execution path. AUTO picks the best (XMX on Intel, DP4a elsewhere); FORCE_XMX
-     *  requires XMX (rejects non-XMX devices — used for diagnosing DP4a issues); FORCE_DP4A pins to DP4a
-     *  (broader device support, lower quality). */
-    public enum XeSsMode {
-        AUTO("auto"),
-        FORCE_XMX("force-xmx"),
-        FORCE_DP4A("force-dp4a");
-
-        final String key;
-        XeSsMode(String key) { this.key = key; }
-        public String key() { return key; }
-
-        public static XeSsMode fromKey(String s) {
-            if (s == null) return AUTO;
-            for (XeSsMode m : values()) {
-                if (m.key.equalsIgnoreCase(s) || m.name().equalsIgnoreCase(s)) return m;
-            }
             return AUTO;
         }
     }

@@ -14,6 +14,8 @@ layout(binding = 5, rgba16f) readonly  uniform image2D gClearRadiance; // pre-de
 layout(binding = 6, r8)      readonly  uniform image2D gTransparencyMask; // 1.0=transparent, 0.0=opaque
 layout(binding = 7, rgba16f) readonly  uniform image2D gTransparentDenoised; // denoised glass/water
 layout(binding = 8, rgba16f) writeonly uniform image2D gOut;
+layout(binding = 9, rgba16f) readonly uniform image2D gClearEmission;
+layout(binding = 10, rgba16f) readonly uniform image2D gTransmission;
 
 layout(push_constant) uniform Push {
     float surfaceGain; // scale NRD surface (default ~0.95)
@@ -155,7 +157,11 @@ void main() {
         vec3 diff = yCoCgToLinear(imageLoad(gDiff, pix).xyz) * diffAlb;
         vec3 specLin = yCoCgToLinear(imageLoad(gSpec, pix).xyz);
         vec3 spec = (rough > 0.22) ? (specLin * specAlb) : specLin;
-        c = (diff + spec) * sg;
+        // Opaque emission is an explicitly classified unfiltered signal. Primary clear radiance
+        // is handled by the sky branch above, so surface pixels contain emission only here.
+        vec3 emission = max(imageLoad(gClearEmission, pix).rgb, vec3(0.0));
+        vec3 transmission = max(imageLoad(gTransmission, pix).rgb, vec3(0.0));
+        c = (diff + spec + emission + transmission) * sg;
 
         // ONLY fall back on true death — never re-inject raw grain over good REBLUR.
         float nrdY = luma(c);

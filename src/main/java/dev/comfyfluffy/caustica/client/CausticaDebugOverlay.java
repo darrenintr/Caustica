@@ -24,7 +24,7 @@ public final class CausticaDebugOverlay {
     }
 
     public static List<String> build() {
-        List<String> out = new ArrayList<>(8);
+        List<String> out = new ArrayList<>(12);
         RtComposite c = RtComposite.INSTANCE;
         UpscalerSelector.Mode mode = UpscalerSelector.resolvedMode();
         String modeStr = mode == null ? "?" : mode.key();
@@ -36,7 +36,8 @@ public final class CausticaDebugOverlay {
         String pathHint;
         if (c.getLastUpscalerPath()) {
             pathHint = "ran";
-        } else if (mode == UpscalerSelector.Mode.DLSS_RR
+        } else if (mode == UpscalerSelector.Mode.TAAU
+                || mode == UpscalerSelector.Mode.DLSS_RR
                 || mode == UpscalerSelector.Mode.FSR_3
                 || mode == UpscalerSelector.Mode.FSR_4
                 || mode == UpscalerSelector.Mode.XESS) {
@@ -55,12 +56,27 @@ public final class CausticaDebugOverlay {
                 + " §8(" + (c.getLastDenoiseOn()
                 ? "§a" + c.getLastDenoisePath()
                 : "§7off") + "§8)");
-        // Render/display resolution is private on RtComposite; resolveSummary exposes both compactly.
-        out.add(" §7geometry: §r" + c.debugSummary());
+        out.add(" §7NRD prepare: §r" + status(c.getLastNrdPrepareOk()));
+        out.add(" §7NRD dispatch: §r" + status(c.getLastNrdDispatchOk()));
+        out.add(" §7NRD compose: §r" + status(c.getLastNrdComposeOk()));
+        out.add(" §7TAAU evaluate: §r" + status(mode == UpscalerSelector.Mode.TAAU
+                && c.getLastUpscalerPath()));
+        out.add(String.format(" §7render: §r%d×%d → %d×%d",
+                c.getRenderWidth(), c.getRenderHeight(), c.getDisplayWidth(), c.getDisplayHeight()));
+        out.add(String.format(" §7jitter: §r(%+.4f, %+.4f) render px (applied to primary ray)",
+                c.getLastJitterPixelsX(), c.getLastJitterPixelsY()));
+        // Render/display resolution is private on RtComposite; debugSummary exposes upscale + denoise +
+        // render/display res + frame counter + RR status. Misleading to label this "geometry" — it's the
+        // composite state, not the geometry pass.
+        out.add(" §7composite: §r" + c.debugSummary());
         // Frame-stage timing — only meaningful when frame-stats is on, but reading is safe when it's off.
         long traceMs = RtFrameStats.FRAME.stageTotalMs("frame.trace");
         long upMs = RtFrameStats.FRAME.stageTotalMs("frame.upscale");
         out.add(" §7stages: §rtrace=" + traceMs + "ms upscale=" + upMs + "ms");
         return out;
+    }
+
+    private static String status(boolean ok) {
+        return ok ? "§aok" : "§cfailed/not-run";
     }
 }

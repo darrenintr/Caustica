@@ -41,12 +41,12 @@ public final class NoopDenoiseBackend implements CausticaDenoiseBackend {
     }
 
     @Override
-    public void dispatch(MemoryStack stack, VkCommandBuffer cmd,
+    public boolean dispatch(MemoryStack stack, VkCommandBuffer cmd,
                          RtImage inColor, RtImage inNormal, RtImage inDepth, RtImage inMotion,
                          float mvScaleX, float mvScaleY,
                          RtImage outColor) {
         if (!ready || width == 0 || height == 0) {
-            return;
+            return false;
         }
         VkImageSubresourceLayers layers = VkImageSubresourceLayers.calloc(stack)
                 .aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
@@ -60,6 +60,7 @@ public final class NoopDenoiseBackend implements CausticaDenoiseBackend {
         region.dstSubresource(layers);
         VK10.vkCmdBlitImage(cmd, inColor.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                 outColor.image, VK10.VK_IMAGE_LAYOUT_GENERAL, region, VK10.VK_FILTER_NEAREST);
+        return false;
     }
 
     @Override

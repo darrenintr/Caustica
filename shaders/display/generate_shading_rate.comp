@@ -1,0 +1,104 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+
+// Variable Rate Shading (VRS) shading rate generator
+// Analyzes depth and albedo to determine optimal sampling rate per tile
+// Output: R8_UINT shading rate image (VK_FRAGMENT_SHADING_RATE_*)
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Input textures
+layout(binding = 0) uniform texture2D gDepth;
+layout(binding = 1) uniform texture2D gAlbedo;
+
+// Output shading rate image (one texel per tile)
+layout(binding = 2, r8ui) uniform writeonly uimage2D shadingRateImage;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 renderSize;        // full render resolution
+    uvec2 tileSize;          // shading rate tile size (typically 8x8 or 16x16)
+    float depthThreshold;    // depth threshold for sky detection (default: 0.01)
+    float varianceThreshold; // depth variance threshold for half-rate (default: 0.05)
+} pc;
+
+// VK_FRAGMENT_SHADING_RATE_* encodings
+const uint RATE_1x1 = 0x0;  // 1 pixel  / 1 sample  = full rate    (high detail)
+const uint RATE_2x2 = 0x5;  // 4 pixels / 1 sample  = half rate    (medium detail)
+const uint RATE_4x4 = 0xA;  // 16 pixels / 1 sample = quarter rate (sky/flat surfaces)
+
+void main() {
+    // Each workgroup analyzes one tile
+    uvec2 tileID = gl_WorkGroupID.xy;
+    uvec2 pixelBase = tileID * pc.tileSize;
+
+    // Bounds check
+    if (pixelBase.x >= pc.renderSize.x || pixelBase.y >= pc.renderSize.y) {
+        return;
+    }
+
+    // Analyze the tile: compute depth statistics
+    float avgDepth = 0.0;
+    float minDepth = 1.0;
+    float maxDepth = 0.0;
+    float avgLuminance = 0.0;
+    uint validPixels = 0;
+
+    // Sample all pixels in the tile
+    for (uint y = 0; y < pc.tileSize.y; y++) {
+        for (uint x = 0; x < pc.tileSize.x; x++) {
+            uvec2 pixel = pixelBase + uvec2(x, y);
+
+            // Clamp to render bounds
+            if (pixel.x >= pc.renderSize.x || pixel.y >= pc.renderSize.y) {
+                continue;
+            }
+
+            // Fetch depth
+            float d = texelFetch(gDepth, ivec2(pixel), 0).r;
+            avgDepth += d;
+            minDepth = min(minDepth, d);
+            maxDepth = max(maxDepth, d);
+
+            // Fetch albedo luminance (for flat-color detection)
+            vec3 albedo = texelFetch(gAlbedo, ivec2(pixel), 0).rgb;
+            avgLuminance += dot(albedo, vec3(0.299, 0.587, 0.114));
+
+            validPixels++;
+        }
+    }
+
+    if (validPixels == 0) {
+        // Empty tile - use quarter rate
+        imageStore(shadingRateImage, ivec2(tileID), uvec4(RATE_4x4));
+        return;
+    }
+
+    avgDepth /= float(validPixels);
+    avgLuminance /= float(validPixels);
+
+    // Calculate depth variance
+    float depthVariance = maxDepth - minDepth;
+
+    // Rate selection strategy:
+    // 1. Sky detection: very far depth (< threshold) → 4x4 quarter rate
+    // 2. Low variance: flat/smooth surfaces → 2x2 half rate
+    // 3. High variance: edges/details → 1x1 full rate
+
+    uint rate;
+
+    if (avgDepth < pc.depthThreshold) {
+        // Sky: quarter rate (16 pixels per sample)
+        rate = RATE_4x4;
+    } else if (depthVariance < pc.varianceThreshold) {
+        // Low variance: half rate (4 pixels per sample)
+        // Flat walls, floors, distant geometry
+        rate = RATE_2x2;
+    } else {
+        // High variance: full rate (1:1)
+        // Edges, fine details, close-up geometry
+        rate = RATE_1x1;
+    }
+
+    // Write to shading rate image
+    imageStore(shadingRateImage, ivec2(tileID), uvec4(rate));
+}

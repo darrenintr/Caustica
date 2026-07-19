@@ -44,6 +44,9 @@ public final class RtFrameStats {
                     "frame.prepareTlas",
                     "frame.recordTlas",
                     "frame.trace",
+                    "frame.denoise",
+                    "frame.temporalAccum",
+                    "frame.upscaler",
                     "frame.exposure",
                     "frame.dlssRr",
                     "frame.upscale",
@@ -99,6 +102,10 @@ public final class RtFrameStats {
         private final String[] counterNames;
         private final boolean trackGc;
         private final long[] stageNanos;
+        // Snapshot of the last completed frame's stage nanos. Kept around `end()` so the in-game debug
+        // overlay (which reads after `end()` flips active=false) still sees real numbers — otherwise
+        // post-end `stageNanos()` calls hit the !active branch and always returned 0.
+        private final long[] lastStageNanos;
         private final long[] counters;
         private final long[] history = new long[MEDIAN_WINDOW];
         private int historyCount;
@@ -121,6 +128,7 @@ public final class RtFrameStats {
             this.counterNames = counterNames;
             this.trackGc = trackGc;
             this.stageNanos = new long[stageNames.length];
+            this.lastStageNanos = new long[stageNames.length];
             this.counters = new long[counterNames.length];
         }
 
@@ -167,15 +175,17 @@ public final class RtFrameStats {
 
         /**
          * Total nanoseconds spent in {@code stageName} over the current frame's accumulated scopes.
-         * Returns 0 when the profile is inactive, the stage name is unknown, or the stage hasn't run yet.
+         * When the profile is inactive (between frames), returns the snapshot from the last completed
+         * frame so the in-game debug overlay sees real numbers instead of zero. Returns 0 only when
+         * the stage name is unknown or no frame has completed yet.
          * Public read-only access is for the in-game debug overlay; callers must not mutate.
          */
         public long stageNanos(String stageName) {
-            if (!active) {
+            int idx = indexOfOrNegative(stageNames, stageName);
+            if (idx < 0) {
                 return 0L;
             }
-            int idx = indexOfOrNegative(stageNames, stageName);
-            return idx < 0 ? 0L : stageNanos[idx];
+            return active ? stageNanos[idx] : lastStageNanos[idx];
         }
 
         /** Millisecond convenience wrapper for {@link #stageNanos(String)}. */
@@ -198,6 +208,9 @@ public final class RtFrameStats {
                 return;
             }
             active = false;
+            // Snapshot stage nanos BEFORE the enabled() early-return so the overlay can read this frame
+            // even when frame-stats was just disabled mid-frame (otherwise lastStageNanos would be stale).
+            System.arraycopy(stageNanos, 0, lastStageNanos, 0, stageNanos.length);
             if (!enabled()) {
                 return;
             }

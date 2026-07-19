@@ -21,18 +21,20 @@ public final class BlockLightBuffer {
     public void upload(RtContext ctx, List<BlockLight> lights) {
         count = Math.min(lights.size(), MAX_LIGHTS);
         if (count == 0) {
+            // Keep any existing buffer; shader gates on blockLightCount == 0.
             return;
         }
 
         long requiredSize = (long) count * 16; // vec4 = 16 bytes
 
-        // Create or recreate buffer if size changed
+        // Create or grow buffer if needed (never shrink mid-frame — avoids thrash).
         if (buffer == null || buffer.size < requiredSize) {
             if (buffer != null) {
                 buffer.destroy();
             }
-            // Create host-visible buffer (persistently mapped)
-            buffer = ctx.createBuffer(requiredSize,
+            // Create host-visible buffer (persistently mapped). Round up a bit for growth.
+            long allocSize = Math.max(requiredSize, 64L * 16L);
+            buffer = ctx.createBuffer(allocSize,
                 org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 true, // hostVisible
                 "block lights");
@@ -46,6 +48,7 @@ public final class BlockLightBuffer {
                 lights.get(i).writeToBuffer(vec4, 0);
                 fb.put(vec4);
             }
+            fb.flip();
         }
     }
 

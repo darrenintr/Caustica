@@ -52,8 +52,9 @@ layout(binding = 2, set = 0) uniform sampler2D blockAtlas;
 // sprite layout (RtBlockMaterials), sampled at the SAME uv as blockAtlas. Read only when the prim is
 // flagged (pr.mat.z for _s, pr.mat.w for _n).
 // Bindings follow raygen extras (GUIDE_COUNT=9 → storage images at 3..11); materials start at 12.
-layout(binding = 12, set = 0) uniform sampler2D blockSpecAtlas;
-layout(binding = 13, set = 0) uniform sampler2D blockNormalAtlas;
+// materialBase = firstExtra(3) + GUIDE_COUNT(13) = 16 (must match RtPipeline)
+layout(binding = 25, set = 0) uniform sampler2D blockSpecAtlas;
+layout(binding = 26, set = 0) uniform sampler2D blockNormalAtlas;
 // Bindless entity textures — a runtime-sized array indexed per-prim (tint.w) by the entity
 // hit path. Slot 0 is a fallback. Entities use per-type texture files, so each RenderType gets a slot.
 layout(binding = 0, set = 1) uniform sampler2D entityTex[];
@@ -374,13 +375,13 @@ void main() {
         // block items / falling / contained blocks; sampled from the terrain parallel atlases at the same UV,
         // since their geometry textures come from the block atlas), 1 = per-type bindless entity arrays.
         if (pr.mat.z > 1.5) {
-            decodeSpec(textureLod(blockSpecAtlas, euvCoord, blockEntityLod), albedo, rough, metal, f0, emission, sss);
+            decodeSpec(textureLod(blockSpecAtlas, euvCoord, max(0.0, blockEntityLod - 1.5)), albedo, rough, metal, f0, emission, sss);
         } else if (pr.mat.z > 0.5) {
             decodeSpec(textureLod(entitySpecTex[nonuniformEXT(texSlot)], euvCoord, entityLod), albedo, rough, metal, f0, emission, sss);
         }
         if (pr.mat.w > 1.5) {
             n = perturbNormal(n, ep0, ep1, ep2, euv.uv[e0], euv.uv[e1], euv.uv[e2], vdir,
-                    textureLod(blockNormalAtlas, euvCoord, blockEntityLod), ao);
+                    textureLod(blockNormalAtlas, euvCoord, max(0.0, blockEntityLod - 1.5)), ao);
         } else if (pr.mat.w > 0.5) {
             n = perturbNormal(n, ep0, ep1, ep2, euv.uv[e0], euv.uv[e1], euv.uv[e2], vdir,
                     textureLod(entityNormalTex[nonuniformEXT(texSlot)], euvCoord, entityLod), ao);
@@ -439,10 +440,11 @@ void main() {
     }
 
     // LabPBR normal map (_n), gated by mat.w — shared decode (TBN from position-fetch + UVs).
+    // PBR atlases: bias LOD -1.5 to reduce mipmap bleed from adjacent sprites (packs often lack padding).
     float ao = 1.0;
     if (pr.mat.w > 0.5) {
         n = perturbNormal(n, tp0, tp1, tp2, uv0, uv1, uv2, vdir,
-                textureLod(blockNormalAtlas, uv, blockLod), ao);
+                textureLod(blockNormalAtlas, uv, max(0.0, blockLod - 1.5)), ao);
     }
 
     // Stained glass / ice (tint.w == 2, flagged at extraction): a thin colored filter resolved in raygen
@@ -492,7 +494,7 @@ void main() {
     // Blue channel: porosity 0-64 is ignored; SSS 65-255 decodes into sss (0 if no _s map or porosity range).
     float sss = 0.0;
     if (pr.mat.z > 0.5) {
-        decodeSpec(textureLod(blockSpecAtlas, uv, blockLod), payload.albedo, rough, metal, f0, emission, sss);
+        decodeSpec(textureLod(blockSpecAtlas, uv, max(0.0, blockLod - 1.5)), payload.albedo, rough, metal, f0, emission, sss);
         if (!nonSolid) sss = 0.0; // SSS only on non-SOLID terrain (leaves/foliage); SOLID blocks opt out
     }
     payload.f0 = f0;

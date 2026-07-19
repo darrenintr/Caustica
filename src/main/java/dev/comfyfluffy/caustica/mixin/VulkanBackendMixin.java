@@ -32,13 +32,12 @@ import java.util.Set;
  * Vulkan device-negotiation hook: adds the device extensions the Caustica runtime needs to the extension
  * list vanilla enables at vkCreateDevice time.
  *
- * <p>FFX resolves vkGetImageMemoryRequirements2KHR etc. through
- * vkGetDeviceProcAddr using the KHR-suffixed extension names; per Vulkan spec
- * that returns NULL unless the corresponding extension was enabled — even
- * though the functionality is core since 1.1 — and FFX then calls the NULL
- * pointer (verified: crash at amd_fidelityfx_vk.dll+0x1e5b0 building
- * VkMemoryRequirements2). Enabling the alias extensions is a behavioral no-op
- * for the rest of the engine.
+ * <p>FFX-style callers (the libffx_*_caustica shims) resolve vkGetImageMemoryRequirements2KHR etc.
+ * through vkGetDeviceProcAddr using the KHR-suffixed extension names; per Vulkan spec that returns
+ * NULL unless the corresponding extension was enabled — even though the functionality is core since
+ * 1.1 — and the shim then calls the NULL pointer (a build of an earlier FFX 1.1 path crashed inside
+ * VkMemoryRequirements2 on this exact call site). Enabling the alias extensions is a behavioral
+ * no-op for the rest of the engine.
  */
 @Mixin(VulkanBackend.class)
 public abstract class VulkanBackendMixin {

@@ -51,6 +51,10 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
     private long frameIndex;
     private boolean hardReset = true;
 
+    // Frame timing for accurate temporal accumulation
+    private long lastFrameNanos = -1;
+    private float lastDeltaTimeMs = 16.6f;
+
     private Fsr2ClassicUpscaler(Fsr2ClassicLibrary lib, VulkanDevice device) {
         this.lib = lib;
         this.device = device;
@@ -197,37 +201,61 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
             return false;
         }
         try {
-            // RtComposite convention: pass (-appliedJitter) for raw PT. When the color plate is
-            // already NRD-resolved, the caller passes (0,0) — re-applying Halton on a stable
-            // denoise plate causes whole-frame camera swim/shake.
-            float jx = -jitterX;
-            float jy = -jitterY;
+            // === FIX 1: 动态帧时间计算 ===
+            long currentNanos = System.nanoTime();
+            if (lastFrameNanos > 0) {
+                float deltaMs = (currentNanos - lastFrameNanos) / 1_000_000.0f;
+                // 钳制到合理范围 (避免暂停后的巨大跳变)
+                deltaMs = Math.max(1.0f, Math.min(100.0f, deltaMs));
+                lastDeltaTimeMs = deltaMs;
+            }
+            lastFrameNanos = currentNanos;
+
+            // === FIX 2: Jitter 方向 - 不反转 (FSR2 期望正向) ===
+            // RtComposite 传入的是已应用的 jitter，FSR2 需要知道它以便反向重投影
+            float jx = jitterX;  // 不反转
+            float jy = jitterY;
+
+            // === FIX 3: 正确提取 FOV 和相机参数 ===
             // Vertical FOV from the real projection (m11 = 1/tan(fovy/2) for JOML perspective).
             float fovY = (float) Math.toRadians(70.0);
+            float cameraNear = 0.05f;
+
             if (viewToClip != null) {
                 float m11 = viewToClip.m11();
                 if (Math.abs(m11) > 1e-5f) {
                     fovY = 2.0f * (float) Math.atan(1.0f / Math.abs(m11));
                 }
+                // 尝试从投影矩阵提取 near plane (reverse-Z)
+                // 对于 reverse-Z infinite: m22 = 0, m32 = -near
+                float m22 = viewToClip.m22();
+                float m32 = viewToClip.m32();
+                if (Math.abs(m22) < 0.001f && m32 < 0) {
+                    cameraNear = -m32;
+                }
             }
+
             // Pack sharpness into preExposure channel: 2.0 + sharpness (export enables RCAS).
             float sharp = CausticaConfig.Rt.Upscaler.SHARPEN.value()
                     ? Math.max(0f, Math.min(1f, CausticaConfig.Rt.Upscaler.SHARPNESS.value()))
                     : -1f; // negative → export disables sharpening
             float preExpPacked = sharp < 0f ? -1f : (2.0f + sharp);
+
+            // === FIX 4: 使用实际帧时间而不是固定 16.6ms ===
             int rc = lib.dispatch(ctx, cmd,
                     color.image, color.view,
                     depth.image, depth.view,
                     motion.image, motion.view,
                     out.image, out.view,
                     renderWidth, renderHeight,
-                    jx, jy, 16.6f, preExpPacked,
+                    jx, jy, lastDeltaTimeMs, preExpPacked,  // ← 动态帧时间
                     // Reverse-Z infinite: near plane + far=0 with DEPTH_INFINITE flag.
-                    0.05f, 0.0f, fovY,
+                    cameraNear, 0.0f, fovY,  // ← 动态 near plane
                     hardReset ? 1 : 0);
+
             if (frameIndex < 5 || frameIndex % 300 == 0) {
-                LOGGER.info("FSR2 dispatch #{} rc={} jitter=({}, {}) fovY={}° sharp={} render={}x{} → {}x{} reset={}",
-                        frameIndex, rc, jx, jy, Math.toDegrees(fovY), sharp,
+                LOGGER.info("FSR2 dispatch #{} rc={} jitter=({:.3f}, {:.3f}) fovY={:.1f}° near={:.3f} dt={:.2f}ms sharp={:.2f} render={}x{} → {}x{} reset={}",
+                        frameIndex, rc, jx, jy, Math.toDegrees(fovY), cameraNear, lastDeltaTimeMs, sharp,
                         renderWidth, renderHeight, displayWidth, displayHeight, hardReset);
             }
             hardReset = false;

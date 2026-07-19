@@ -176,16 +176,16 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
     }
 
     @Override
-    public void dispatch(MemoryStack stack, VkCommandBuffer cmd,
+    public boolean dispatch(MemoryStack stack, VkCommandBuffer cmd,
                          RtImage inColor, RtImage inNormal, RtImage inDepth, RtImage inMotion,
                          float mvScaleX, float mvScaleY,
                          RtImage outColor) {
         if (!ready || width <= 0 || height <= 0 || outColor == null) {
-            return;
+            return false;
         }
         RtContext ctx = RtContext.get();
         if (ctx == null) {
-            return;
+            return false;
         }
 
         lastCleanShadow = null;
@@ -203,7 +203,7 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
             }
             barrier(stack, cmd, outColor.image);
         } else {
-            return;
+            return false;
         }
 
         int flags = 0;
@@ -269,6 +269,7 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
                 dispatchComposite(stack, cmd, flags);
             }
             barrier(stack, cmd, outColor.image);
+            return true;
         } catch (Throwable t) {
             CausticaMod.LOGGER.warn("OfficialFfx composite failed; restoring beauty seed", t);
             try {
@@ -277,6 +278,7 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
                 lastCompositeFlags = 0;
             } catch (Throwable ignored) {
             }
+            return false;
         }
     }
 
@@ -371,7 +373,29 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
 
     @Override
     public boolean isReady() {
-        return ready && compPipe != 0L;
+        // v0.6: FFX denoiser disabled at source level. The SPIR-V shadow+reflection
+        // filters were amplifying SPP=1 noise on the way into NRD REBLUR (the prepass
+        // weights its input by the FFX shadow/reflection channels, which carry
+        // their own per-sample variance at SPP=1). CausticaConfig.Denoise.FFX_TEMPORAL_WEIGHT_MAX
+        // is also dead now -- see Denoise mode options in caustica.toml (NRD, REBLUR, TAAU only).
+        return false;
+    }
+
+    @Override
+    public boolean supportsAsyncCompute() {
+        return true; // FFX denoiser is compute-based, supports async (when enabled)
+    }
+
+    @Override
+    public void dispatchAsync(
+            VkCommandBuffer computeCmd,
+            dev.comfyfluffy.caustica.rt.RtAsyncCompute asyncCompute,
+            MemoryStack stack,
+            RtImage inColor, RtImage inNormal, RtImage inDepth, RtImage inMotion,
+            float mvScaleX, float mvScaleY,
+            RtImage outColor) {
+        // FFX is compute-based - can directly use compute command buffer
+        dispatch(stack, computeCmd, inColor, inNormal, inDepth, inMotion, mvScaleX, mvScaleY, outColor);
     }
 
     private void createPipelines(RtContext ctx) {

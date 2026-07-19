@@ -60,8 +60,15 @@ public final class DenoiseBackendSelector {
     }
 
     private static CausticaDenoiseBackend pick(CausticaConfig.DenoiserKind mode, GpuVendor gpu) {
+        // WINDOWS-OPTIMIZED: Use FFX denoiser (native Windows/AMD support, better than NRD)
+        CausticaMod.LOGGER.info("Windows-optimized mode - using FFX denoiser for best performance");
+
         if (mode == CausticaConfig.DenoiserKind.OFF) {
             return NoopDenoiseBackend.INSTANCE;
+        }
+        // SVGF: pure shader denoiser (cross-vendor, no SDK dependency)
+        if (mode == CausticaConfig.DenoiserKind.SVGF) {
+            return tryCreate(new SvgfDenoiseBackend(), gpu, false);
         }
         // AUTO: cross-vendor optimized selection based on GPU vendor
         if (mode == CausticaConfig.DenoiserKind.AUTO) {
@@ -83,24 +90,24 @@ public final class DenoiseBackendSelector {
     }
 
     /**
-     * Cross-vendor optimized denoiser selection for AUTO mode:
+     * Cross-vendor optimized denoiser selection for AUTO mode (Windows-optimized):
+     * - AMD: NRD-only while the FFX path is disabled/unreliable
      * - NVIDIA: Hybrid FFX+NRD (leverages NRD's quality on Tensor cores)
-     * - AMD: FFX-only (native FidelityFX optimization on RDNA)
      * - Intel: NRD-only (XMX acceleration for REBLUR on Arc)
-     * - Unknown: Hybrid with Bilateral fallback (safe default)
+     * - Unknown: FFX with Bilateral fallback (Windows-friendly default)
      */
     private static CausticaDenoiseBackend autoPick(GpuVendor gpu) {
-        CausticaMod.LOGGER.info("AUTO mode: selecting optimal denoiser for GPU vendor {}", gpu.vendor);
+        CausticaMod.LOGGER.info("AUTO mode: selecting optimal denoiser for GPU vendor {} (Windows-optimized)", gpu.vendor);
         return switch (gpu.vendor) {
+            case AMD -> {
+                // Stable cross-vendor baseline until the disabled FFX path is proven again.
+                CausticaMod.LOGGER.info("  → NRD-only (AMD AUTO baseline; FFX bypassed)");
+                yield tryCreate(new HybridFfxNrdBackend(true), gpu, true);
+            }
             case NVIDIA -> {
                 // Hybrid: FFX shadow/reflection + NRD REBLUR = best quality on RTX
                 CausticaMod.LOGGER.info("  → Hybrid FFX+NRD (NVIDIA optimized)");
                 yield tryCreate(new HybridFfxNrdBackend(false), gpu, true);
-            }
-            case AMD -> {
-                // FFX-only: native FidelityFX on RDNA, skip NRD overhead
-                CausticaMod.LOGGER.info("  → FFX-only (AMD RDNA optimized)");
-                yield tryCreate(new OfficialFfxDenoiseBackend(), gpu, true);
             }
             case INTEL -> {
                 // NRD-only: XMX accelerated REBLUR on Arc, skip FFX prepass
@@ -108,9 +115,9 @@ public final class DenoiseBackendSelector {
                 yield tryCreate(new HybridFfxNrdBackend(true), gpu, true);
             }
             default -> {
-                // Unknown GPU: Hybrid with Bilateral fallback for safety
-                CausticaMod.LOGGER.info("  → Hybrid (unknown GPU, safe default)");
-                yield tryCreate(new HybridFfxNrdBackend(false), gpu, true);
+                // Unknown GPU: FFX with Bilateral fallback for Windows compatibility
+                CausticaMod.LOGGER.info("  → FFX-only (unknown GPU, Windows-friendly default)");
+                yield tryCreate(new OfficialFfxDenoiseBackend(), gpu, true);
             }
         };
     }

@@ -1,0 +1,114 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+
+// SVGF - À-trous Wavelet Spatial Filter Pass
+//
+// Edge-aware spatial filter using À-trous (with holes) wavelet decomposition.
+// Multiple passes with increasing filter radius (1, 2, 4, 8 pixels) progressively
+// blur while preserving edges.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Input: color to filter
+layout(set = 0, binding = 0) uniform sampler2D u_color_in;
+
+// Input: variance (guides filter strength)
+layout(set = 0, binding = 1) uniform sampler2D u_variance;
+
+// Input: depth
+layout(set = 0, binding = 2) uniform sampler2D u_depth;
+
+// Input: normal
+layout(set = 0, binding = 3) uniform sampler2D u_normal;
+
+// Output: filtered color
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D o_color_out;
+
+layout(push_constant, scalar) uniform PushConstants {
+    vec2 resolution;
+    vec2 inv_resolution;
+    int step_size;           // À-trous step size (1, 2, 4, 8...)
+    float depth_sigma;       // Depth edge preservation (0.1 - 1.0)
+    float normal_sigma;      // Normal edge preservation (0.5 - 2.0)
+    float luminance_sigma;   // Luminance edge preservation (0.5 - 4.0)
+} pc;
+
+// 5x5 À-trous kernel (Gaussian-like weights)
+const float kernel[3][3] = {
+    {1.0 / 16.0, 2.0 / 16.0, 1.0 / 16.0},
+    {2.0 / 16.0, 4.0 / 16.0, 2.0 / 16.0},
+    {1.0 / 16.0, 2.0 / 16.0, 1.0 / 16.0}
+};
+
+float luminance(vec3 rgb) {
+    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(pc.resolution)))) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) * pc.inv_resolution;
+
+    // Read center pixel data
+    vec3 color_center = texture(u_color_in, uv).rgb;
+    float variance_center = texture(u_variance, uv).r;
+    float depth_center = texture(u_depth, uv).r;
+    vec3 normal_center = normalize(texture(u_normal, uv).xyz * 2.0 - 1.0);
+    float lum_center = luminance(color_center);
+
+    // Adaptive sigma based on variance
+    float variance_scale = max(0.1, variance_center);
+    float adaptive_lum_sigma = pc.luminance_sigma * variance_scale;
+
+    vec3 color_sum = vec3(0.0);
+    float weight_sum = 0.0;
+
+    // À-trous spatial filter with edge-stopping functions
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            // À-trous sampling: step size increases per iteration
+            vec2 offset = vec2(dx, dy) * float(pc.step_size);
+            vec2 sample_uv = uv + offset * pc.inv_resolution;
+
+            // Boundary check
+            if (any(lessThan(sample_uv, vec2(0.0))) || any(greaterThan(sample_uv, vec2(1.0)))) {
+                continue;
+            }
+
+            // Sample neighbor
+            vec3 color_sample = texture(u_color_in, sample_uv).rgb;
+            float depth_sample = texture(u_depth, sample_uv).r;
+            vec3 normal_sample = normalize(texture(u_normal, sample_uv).xyz * 2.0 - 1.0);
+            float lum_sample = luminance(color_sample);
+
+            // Base kernel weight
+            float w_kernel = kernel[dy + 1][dx + 1];
+
+            // Edge-stopping function: depth
+            float depth_diff = abs(depth_center - depth_sample) / max(depth_center, 1e-6);
+            float w_depth = exp(-depth_diff * depth_diff / (pc.depth_sigma * pc.depth_sigma));
+
+            // Edge-stopping function: normal
+            float normal_sim = max(0.0, dot(normal_center, normal_sample));
+            float w_normal = pow(normal_sim, pc.normal_sigma);
+
+            // Edge-stopping function: luminance
+            float lum_diff = abs(lum_center - lum_sample);
+            float w_luminance = exp(-lum_diff * lum_diff / (adaptive_lum_sigma * adaptive_lum_sigma));
+
+            // Combined weight
+            float w = w_kernel * w_depth * w_normal * w_luminance;
+
+            color_sum += color_sample * w;
+            weight_sum += w;
+        }
+    }
+
+    // Normalize
+    vec3 color_out = weight_sum > 1e-6 ? (color_sum / weight_sum) : color_center;
+
+    imageStore(o_color_out, pixel, vec4(color_out, 1.0));
+}

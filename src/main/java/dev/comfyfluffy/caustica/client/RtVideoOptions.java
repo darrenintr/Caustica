@@ -176,9 +176,11 @@ public final class RtVideoOptions {
 
     private static OptionInstance<String> upscalerMode() {
         EnumSetting<CausticaConfig.UpscalerMode> setting = CausticaConfig.Rt.Upscaler.MODE;
-        // User-facing list mirrors CausticaConfig.UpscalerMode in declared order; auto picks the best
-        // backend for the current GPU, the rest force one. The "off" entry shows up as "Off (1:1)".
-        List<String> values = List.of("auto", "off", "dlss-rr", "fsr-3", "fsr-4", "xess", "nis");
+        // TAAU is the primary option (pure compute, cross-vendor, Linux-friendly).
+        // FSR2 added for quality comparison (v0.6.19).
+        // Legacy DLSS-RR / XeSS / NIS keys are still accepted in caustica.toml
+        // (mapped to AUTO) but no longer shown in the dropdown.
+        List<String> values = List.of("auto", "taau", "fsr2", "off");
         return new OptionInstance<>(
             "caustica.options.rt.upscalerMode",
             OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.upscalerMode.tooltip")),
@@ -195,7 +197,7 @@ public final class RtVideoOptions {
 
     private static OptionInstance<String> denoiseMode() {
         EnumSetting<CausticaConfig.DenoiserKind> setting = CausticaConfig.Rt.Denoise.MODE;
-        List<String> values = List.of("auto", "ffx", "nrd", "off");
+        List<String> values = List.of("auto", "ffx", "nrd", "svgf", "off");
         return new OptionInstance<>(
             "caustica.options.rt.denoiseMode",
             OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.denoiseMode.tooltip")),

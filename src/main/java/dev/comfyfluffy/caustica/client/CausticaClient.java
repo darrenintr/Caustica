@@ -15,6 +15,8 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.InvalidateRenderStateCallback;
+import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+import net.minecraft.core.SectionPos;
 
 public final class CausticaClient implements ClientModInitializer {
 	private static boolean rtInitDone = false;
@@ -38,8 +40,10 @@ public final class CausticaClient implements ClientModInitializer {
 				RtContext ctx = RtContext.get();
 				if (ctx != null) {
 					rtInitDone = true;
-					// P0: probe official FidelityFX Denoiser native once (no-op if .so missing).
-					dev.comfyfluffy.caustica.ffx.denoiser.FfxDenoiserRuntime.INSTANCE.tryLoad();
+					// v0.6: FFX disabled at source level. The probe below used to tryLoad the
+					// official FFX Denoiser native + initialise the SPIR-V shadow/reflection
+					// filters; both are bypassed now. (Kept commented for future re-enable.)
+					// dev.comfyfluffy.caustica.ffx.denoiser.FfxDenoiserRuntime.INSTANCE.tryLoad();
 				}
 			}
 
@@ -67,6 +71,20 @@ public final class CausticaClient implements ClientModInitializer {
 		// setLevel, render-distance change, F3+A) — drop RT terrain residency so it rebuilds for the new
 		// world. Fixes stale geometry persisting across an End→Overworld switch (coords alone aren't
 		// world-unique). Resource reloads do NOT fire this; that path is handled separately.
+		// Block break hook: when the player breaks a block, mark the affected section
+		// dirty (terrain re-extracts on the next tick) AND clear temporal history
+		// (TAAU/NRD's accumulator). Without this, RT keeps rendering the pre-edit block
+		// geometry for one full frame and TAAU/NRD ghosts the old colour over the new
+		// state -- visible as "I broke the block but it came back".
+		PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, blockEntity) -> {
+			long section = SectionPos.asLong(
+					SectionPos.blockToSectionCoord(pos.getX()),
+					SectionPos.blockToSectionCoord(pos.getY()),
+					SectionPos.blockToSectionCoord(pos.getZ()));
+			RtTerrain.markSectionDirty(section);
+			RtComposite.INSTANCE.invalidateHistory();
+		});
+
 		InvalidateRenderStateCallback.EVENT.register(() -> {
 			RtTerrain.requestFullClear();
 			RtComposite.INSTANCE.resetFailureLatch(); // F3+A doubles as manual RT recovery after a latched failure

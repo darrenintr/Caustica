@@ -115,16 +115,16 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
     }
 
     @Override
-    public void dispatch(MemoryStack stack, VkCommandBuffer cmd,
+    public boolean dispatch(MemoryStack stack, VkCommandBuffer cmd,
                          RtImage inColor, RtImage inNormal, RtImage inDepth, RtImage inMotion,
                          float mvScaleX, float mvScaleY,
                          RtImage outColor) {
         if (!ready || pipeline == 0L || temp == null || width <= 0 || height <= 0) {
-            return;
+            return false;
         }
         RtContext ctx = RtContext.get();
         if (ctx == null) {
-            return;
+            return false;
         }
 
         // Odd passes → final result in outColor after ping-pong with temp.
@@ -153,6 +153,7 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
             }
             barrier(stack, cmd, dst.image);
         }
+        return true;
     }
 
     @Override

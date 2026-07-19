@@ -46,8 +46,12 @@ void main() {
     }
 
     vec3 currColor = imageLoad(inColor, pos).rgb;
-    // Firefly guard — history must never re-amplify spikes.
+    // DARK-SCENE FIREFLY GUARD (v0.6.7): adaptive clamp based on scene luminance.
+    // Problem: vec3(8.0) clamp is too high for dark scenes (0.1 luma) — fireflies survive.
+    // Solution: clamp relative to neighborhood average + variance.
+    // First pass: hard clamp to prevent extreme outliers
     currColor = min(max(currColor, vec3(0.0)), vec3(8.0));
+
     vec3 currNormal = imageLoad(inNormal, pos).xyz;
     bool sky = isSkyByNormal(currNormal);
 
@@ -55,9 +59,10 @@ void main() {
     vec2 mv = imageLoad(inMotion, pos).rg;
 
     bool mvBad = any(isnan(mv)) || any(isinf(mv));
-    // Large pan/sprint: drop history entirely (no multi-frame smear).
+    // Large pan/sprint: drop history entirely (no multi-frame smear). Threshold matched to
+    // ffx_reproject.comp line ~92 (80 render pixels) so both passes reject at the same motion magnitude.
     float mvLen = mvBad ? 1e6 : length(mv);
-    bool hugeMotion = mvLen > 48.0;
+    bool hugeMotion = mvLen > 80.0;
     if (mvBad || hugeMotion) {
         imageStore(outAccum, pos, vec4(currColor, 1.0));
         imageStore(historyOut, pos, vec4(currColor, sky ? 0.0 : currDepth));
@@ -75,7 +80,12 @@ void main() {
     bool disocclusion = !prevInBounds;
     if (prevInBounds) {
         vec4 prev = texture(historySampler, prevUV);
-        historyColor = min(max(prev.rgb, vec3(0.0)), vec3(8.0));
+        // Clamp history radiance to the same finite upper bound used elsewhere in the pipeline.
+        // Without this, a single un-clamped HDR firefly that slipped through a previous frame (denoise
+        // toggle, hot-reload, etc.) gets replayed as a tail along the motion vector for many frames —
+        // matches the world.rgen MAX_HDR_RADIANCE = 8.0 ceiling.
+        historyColor = max(prev.rgb, vec3(0.0));
+        historyColor = min(historyColor, vec3(8.0));
         float prevDepth = prev.a;
         if (sky) {
             // Sky: no reliable reverse-Z; only reject if history was terrain.
@@ -91,21 +101,65 @@ void main() {
     // 3×3 neighbourhood AABB of *current* frame — classic TAA anti-ghost clamp.
     vec3 nMin = currColor;
     vec3 nMax = currColor;
+    vec3 nSum = currColor;  // v0.6.7: accumulate for spatial average
+    int nCount = 1;
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
             ivec2 q = clamp(pos + ivec2(dx, dy), ivec2(0), size - 1);
             vec3 s = min(max(imageLoad(inColor, q).rgb, vec3(0.0)), vec3(8.0));
             nMin = min(nMin, s);
             nMax = max(nMax, s);
+            nSum += s;
+            nCount++;
         }
     }
+    vec3 nAvg = nSum / float(nCount);  // v0.6.7: 3×3 spatial average
     // Neighbourhood AABB clamp — keep expand modest. A large "darkBoost" used to let
     // bright snow history survive the clamp on dark ice/water → milky snow smear.
+    // Inverted: dark scenes should TIGHTEN the clamp (less signal = stricter reject of stale history),
+    // not loosen it. The original "let bright history survive" trade-off was the main ghost source
+    // underground (frozen lakes, deep caves, night).
     float luma = dot(currColor, vec3(0.2126, 0.7152, 0.0722));
+    float avgLuma = dot(nAvg, vec3(0.2126, 0.7152, 0.0722));  // v0.6.7: use neighborhood average
     float histLuma = dot(historyColor, vec3(0.2126, 0.7152, 0.0722));
-    // Slightly more room in dark grain, but never enough to admit full snow albedo.
-    float darkBoost = 1.0 + 0.6 * (1.0 - smoothstep(0.0, 0.15, luma));
-    vec3 expand = (vec3(0.10) + 0.30 * abs(nMax - nMin)) * darkBoost;
+
+    // DARK-SCENE FIREFLY SUPPRESSION (v0.6.7): tighter clamp for very dark scenes
+    // Problem: fireflies (single bright pixel) in dark areas (luma < 0.15) survive AABB clamp.
+    // Solution: in dark scenes, clamp current to neighborhood mean ± 2σ (statistical outlier rejection).
+    //
+    // NEAR-FIELD EXTRA CLAMP (v0.6.12): also apply statistical clamp to near surfaces.
+    // User feedback: near walls (1-2 blocks) show "loosen noise" - NRD alone can't handle near-field variance.
+    // Solution: Apply tighter statistical clamp to near-field in TAA (pre-NRD filtering).
+    // We don't have direct viewZ here, so use depth as proxy: reversed-Z, near=1.0, far→0.
+    float deviceZ = imageLoad(inDepth, pos).r;
+    bool isNearField = deviceZ > 0.8;  // near surfaces (reversed-Z)
+
+    bool needsStatClamp = (avgLuma < 0.20 && !sky) || (isNearField && !sky);
+    if (needsStatClamp) {
+        // Compute neighborhood variance
+        vec3 nVar = vec3(0.0);
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                ivec2 q = clamp(pos + ivec2(dx, dy), ivec2(0), size - 1);
+                vec3 s = min(max(imageLoad(inColor, q).rgb, vec3(0.0)), vec3(8.0));
+                vec3 diff = s - nAvg;
+                nVar += diff * diff;
+            }
+        }
+        nVar = sqrt(nVar / float(nCount));
+        // TIGHTER for near-field: 1.2σ instead of 2σ (more aggressive outlier rejection)
+        float sigmaScale = isNearField ? 1.2 : 2.0;
+        vec3 statMin = max(nAvg - sigmaScale * nVar, vec3(0.0));
+        vec3 statMax = nAvg + sigmaScale * nVar;
+        // Tighten AABB with statistical bounds
+        nMin = max(nMin, statMin);
+        nMax = min(nMax, statMax);
+        // Also clamp current color immediately
+        currColor = clamp(currColor, nMin, nMax);
+    }
+
+    float darkTighten = 1.0 - 0.4 * (1.0 - smoothstep(0.0, 0.15, luma));
+    vec3 expand = (vec3(0.10) + 0.30 * abs(nMax - nMin)) * darkTighten;
     if (sky) {
         expand = vec3(0.30) + 0.45 * abs(nMax - nMin);
     }
@@ -123,9 +177,18 @@ void main() {
     float baseA = clamp(pc.alpha, 0.05, 1.0);
     float motionT = smoothstep(0.5, 8.0, mvLen);
     float a = mix(baseA, max(baseA, 0.88), motionT);
+
+    // BALANCED DARK TEMPORAL (v0.6.19): prioritize NO white-screen over noise reduction.
+    // v0.6.18's alpha=0.12 still caused white-screen on block-break.
+    // Solution: Only use dark bias when static; on disocclusion, use higher alpha.
+    // This ensures fast recovery from geometry changes.
+    if (!sky && avgLuma < 0.12 && !disocclusion) {
+        // Dark + static: boost temporal
+        a = min(a, 0.20);  // 20% current max → still 5x boost
+    }
+
     // Dark ice/water: prefer CURRENT so residual snow history cannot re-stick.
-    // (Previously we leaned hard on history here → "光糊一脸" on frozen lakes.)
-    if (!sky && luma < 0.18) {
+    if (!sky && luma < 0.18 && avgLuma >= 0.12) {
         float darkT = 1.0 - smoothstep(0.0, 0.18, luma);
         a = mix(a, max(a, 0.70), 0.85 * darkT);
     }
@@ -133,7 +196,34 @@ void main() {
         a = mix(min(baseA, 0.12), 0.75, motionT);
     }
 
-    vec3 accumulated = disocclusion ? currColor : mix(historyColor, currColor, a);
+    // v0.6.23: NUCLEAR OPTION for block-break bug.
+    // Problem: ALL previous fixes failed. Black square persists.
+    // Last resort: when ANY disocclusion-like condition is detected, BYPASS history entirely
+    // and use ONLY current frame data with stronger clamping.
+    bool bypassHistory = disocclusion;
+    if (!bypassHistory) {
+        // Check 1: hist/curr luma ratio > 3x
+        float histLum2 = dot(historyColor, vec3(0.2126, 0.7152, 0.0722));
+        float currLum2 = dot(currColor, vec3(0.2126, 0.7152, 0.0722));
+        if (currLum2 > 0.01 && histLum2 > 0.01) {
+            float ratio2 = max(currLum2 / histLum2, histLum2 / currLum2);
+            if (ratio2 > 3.0) bypassHistory = true;
+        }
+        // Check 2: very dark history vs normal current
+        if (histLum2 < 0.01 && currLum2 > 0.03) bypassHistory = true;
+        // Check 3: very bright history vs dark current
+        if (histLum2 > 4.0 && currLum2 < 0.5) bypassHistory = true;
+    }
+
+    if (bypassHistory) {
+        // Use raw current, clamped to neighbor AABB (prevents single-pixel fireflies)
+        vec3 accumulated = clamp(currColor, nMin, nMax);
+        accumulated = min(max(accumulated, vec3(0.0)), vec3(8.0));
+        imageStore(outAccum, pos, vec4(accumulated, 1.0));
+        imageStore(historyOut, pos, vec4(accumulated, sky ? 0.0 : currDepth));
+        return;
+    }
+    vec3 accumulated = mix(historyColor, currColor, a);
     accumulated = min(max(accumulated, vec3(0.0)), vec3(8.0));
 
     imageStore(outAccum, pos, vec4(accumulated, 1.0));

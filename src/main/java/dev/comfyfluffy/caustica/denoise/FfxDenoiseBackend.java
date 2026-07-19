@@ -155,21 +155,21 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
     }
 
     @Override
-    public void dispatch(MemoryStack stack, VkCommandBuffer cmd,
+    public boolean dispatch(MemoryStack stack, VkCommandBuffer cmd,
                          RtImage inColor, RtImage inNormal, RtImage inDepth, RtImage inMotion,
                          float mvScaleX, float mvScaleY,
                          RtImage outColor) {
         if (!ready) {
             System.err.println("[Caustica FFX] dispatch() early-return: backend not ready (no init or ensureSized)");
-            return;
+            return false;
         }
         if (resolveDenoisedBuf == null) {
             System.err.println("[Caustica FFX] dispatch() early-return: resolveDenoisedBuf is null after ensureSized");
-            return;
+            return false;
         }
         if (TEMPORAL_ENABLED && historyRadiance[0] == null) {
             System.err.println("[Caustica FFX] dispatch() early-return: historyRadiance[0] is null after ensureSized (image allocation may have failed)");
-            return;
+            return false;
         }
         RtContext ctx = RtContext.get();
 
@@ -178,7 +178,7 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
         if (SPATIAL_PASSTHROUGH && !TEMPORAL_ENABLED) {
             copyStorageImage(stack, cmd, inColor, outColor);
             frameCounter++;
-            return;
+            return false;
         }
 
         if (TEMPORAL_ENABLED) {
@@ -241,6 +241,7 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
             barrierTransferToShader(stack, cmd, historyRadiance[writeSlot].image);
         }
         frameCounter++;
+        return true;
     }
 
     /** Same-format same-size storage image copy (GENERAL layout). Avoids rgba16f blit. */

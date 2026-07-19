@@ -155,8 +155,14 @@ public final class RtPipeline {
                 binds.get(2).binding(2).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                         .descriptorCount(1).stageFlags(atlasStages);
             }
+            // Mixed extra slots: most are storage images (guides), but a few are SSBOs
+            // (ReSTIR lights @slot9, light-field @slot12). Descriptor type must match
+            // the write path in setExtraStorageBuffer / setExtraStorageImage.
             for (int e = 0; e < extraStorageImages; e++) {
-                binds.get(firstExtraBinding + e).binding(firstExtraBinding + e).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                boolean ssbo = (e == 9 || e == 12);
+                binds.get(firstExtraBinding + e).binding(firstExtraBinding + e)
+                        .descriptorType(ssbo ? VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                : VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                         .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             }
             if (blockMaterialAtlases) {
@@ -176,13 +182,27 @@ public final class RtPipeline {
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, dsl, label + " descriptor set layout");
 
             int combinedSamplers = (withAtlasSampler ? 1 : 0) + materialSamplers + skySamplers; // block atlas + _s/_n + celestials
-            int poolSizeCount = 2 + (combinedSamplers > 0 ? 1 : 0);
+            // Count SSBO extra slots (ReSTIR lights + light field) so the pool has room.
+            int extraSsbo = 0;
+            int extraImages = 0;
+            for (int e = 0; e < extraStorageImages; e++) {
+                if (e == 9 || e == 12) {
+                    extraSsbo++;
+                } else {
+                    extraImages++;
+                }
+            }
+            int poolSizeCount = 2 + (combinedSamplers > 0 ? 1 : 0) + (extraSsbo > 0 ? 1 : 0);
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(poolSizeCount, stack);
-            poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(RING);
-            // output image (binding 1) + the extra guide images share the storage-image type.
-            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(RING * (1 + extraStorageImages));
+            int psi = 0;
+            poolSizes.get(psi++).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(RING);
+            // output image (binding 1) + guide storage images
+            poolSizes.get(psi++).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(RING * (1 + extraImages));
+            if (extraSsbo > 0) {
+                poolSizes.get(psi++).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(RING * extraSsbo);
+            }
             if (combinedSamplers > 0) {
-                poolSizes.get(2).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(RING * combinedSamplers);
+                poolSizes.get(psi).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(RING * combinedSamplers);
             }
             VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(RING).pPoolSizes(poolSizes);
             check(VK10.vkCreateDescriptorPool(vk, dpci, null, p), "vkCreateDescriptorPool");

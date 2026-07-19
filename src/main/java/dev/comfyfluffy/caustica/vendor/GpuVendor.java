@@ -158,10 +158,9 @@ public final class GpuVendor {
             return AmdArch.RDNA4;
         }
         // RDNA 3 — RX 7000 series. Also covers RDNA 3.5 iGPUs (Strix Halo etc.) which contain "Radeon 8xxM"
-        // / "Radeon Graphics" — the iGPU is gated to FSR 3 in practice (no AI accelerator on the
-        // RDNA-3.5 die), but we conservatively bucket them with RDNA 3 so the upscaler picker at least
-        // considers FSR 4.1 INT8; the actual runtime check in FsrUpscaler verifies the DLL's hardware
-        // query and falls back if the iGPU's INT8 rate is insufficient.
+        // / "Radeon Graphics" — the iGPU has no AI accelerator on the RDNA-3.5 die, so INT8 is gated
+        // out in practice. We conservatively bucket them with RDNA 3 here; the upscaler picker in
+        // UpscalerSelector is the runtime source of truth (currently TAAU-only).
         if (deviceName.contains("RX 7") || deviceName.contains("RX 70")
                 || deviceName.contains("Radeon 8") || deviceName.contains("Radeon 7")
                 || deviceName.contains("Radeon Graphics")) {
