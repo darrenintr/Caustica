@@ -126,6 +126,17 @@ const uint MATERIAL_GLASS = 3u;
 // flags bits 0..1 material; bit 2 celestial (miss only); bit 3 water-entering (hit only).
 const uint PAYLOAD_WATER_ENTERING = 8u;
 
+
+// Vanilla block/entity atlases are sRGB PNGs through a UNORM view (no hardware sRGB decode).
+// BRDF / Beer–Lambert / NEE need linear albedo; data maps (_s/_n) stay raw.
+vec3 srgbToLinear(vec3 c) {
+    vec3 lo = c / 12.92;
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    bvec3 isHi = greaterThanEqual(c, vec3(0.04045));
+    return mix(lo, hi, vec3(isHi));
+}
+
+
 void payloadSetPacked(uint material, float roughness, float metalness, float emission, float sss) {
     payload.flags = material;
     payload.roughMetal = packHalf2x16(vec2(roughness, metalness));
@@ -284,7 +295,7 @@ vec3 applyBreaking(vec3 albedo, vec3 rayOrigin, vec3 rayDir, float hitT, vec3 n)
                          : (an.y >= an.z) ? local.xz
                          : local.xy;
             float decalLod = rayConeUnitUvLod(vec2(textureSize(entityTex[nonuniformEXT(ps.w)], 0)));
-            vec3 crack = textureLod(entityTex[nonuniformEXT(ps.w)], decalUv, decalLod).rgb;
+            vec3 crack = srgbToLinear(textureLod(entityTex[nonuniformEXT(ps.w)], decalUv, decalLod).rgb);
             return clamp(crack * albedo, 0.0, 1.0);
         }
     }
@@ -316,7 +327,7 @@ void main() {
         if (dot(pn, gl_WorldRayDirectionEXT) > 0.0) {
             pn = -pn;
         }
-        payload.albedo = textureLod(entityTex[nonuniformEXT(pslot)], puv, particleLod).rgb * pr.tint.rgb;
+        payload.albedo = srgbToLinear(textureLod(entityTex[nonuniformEXT(pslot)], puv, particleLod).rgb) * pr.tint.rgb;
         payload.normal = pn;
         payload.hitT = gl_HitTEXT;
         // Per-particle motion vector: interpolate the captured per-vertex displacement (uniform across the
@@ -366,7 +377,7 @@ void main() {
         float blockEntityLod = rayConeTextureLod(vec2(textureSize(blockAtlas, 0)),
                 ep0, ep1, ep2, euv.uv[e0], euv.uv[e1], euv.uv[e2]);
 
-        vec3 albedo = textureLod(entityTex[nonuniformEXT(texSlot)], euvCoord, entityLod).rgb * pr.tint.rgb;
+        vec3 albedo = srgbToLinear(textureLod(entityTex[nonuniformEXT(texSlot)], euvCoord, entityLod).rgb) * pr.tint.rgb;
         float rough = pr.mat.x;          // heuristic material default
         float metal = pr.mat.y;
         vec3 f0 = mix(vec3(0.02), albedo, metal);
@@ -460,9 +471,10 @@ void main() {
     // a more opaque texel tints transmitted light more strongly.
     if (pr.tint.w > 1.5) {
         vec4 gtex = textureLod(blockAtlas, uv, blockLod);
+        vec3 gtexRgb = srgbToLinear(gtex.rgb);
         // Translucent blocks (glass, ice, …) are breakable too — apply the same overlay here, reusing
         // gtex (already sampled above) rather than re-fetching blockAtlas.
-        payload.albedo = applyBreaking(mix(vec3(1.0), gtex.rgb * tint * ao, gtex.a),
+        payload.albedo = applyBreaking(mix(vec3(1.0), gtexRgb * tint * ao, gtex.a),
                 gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT, gl_HitTEXT, n);
         payload.normal = n;
         payload.hitT = gl_HitTEXT;
@@ -475,7 +487,7 @@ void main() {
     // Water (tint.w == 1) carries the pure biome water tint (no grey water-texture multiply): raygen
     // shades the surface as a clear dielectric and only needs the tint to derive the per-channel
     // Beer–Lambert absorption. Opaque terrain uses textured albedo.
-    payload.albedo = (pr.tint.w > 0.5) ? tint : textureLod(blockAtlas, uv, blockLod).rgb * tint * ao;
+    payload.albedo = (pr.tint.w > 0.5) ? tint : srgbToLinear(textureLod(blockAtlas, uv, blockLod).rgb) * tint * ao;
     payload.normal = n;
     payload.hitT = gl_HitTEXT;
     payload.motionPrev = vec3(0.0); // static terrain: camera-only motion vector

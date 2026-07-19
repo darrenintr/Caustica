@@ -2485,13 +2485,18 @@ void main() {
         vec4 curClipRefr = pc.curViewProj * vec4(gv_motionHitCamRel, 1.0);
         curNdc = curClipRefr.xy / max(curClipRefr.w, 1e-6);
     }
-    // 2D screen MV in pixels: NRD expects pixelUvPrev = pixelUv + mv.xy * scale (scale=1/res).
-    // z left 0 — 2.5D was disabled in NRD common settings (clip.w ≠ prepare viewZ).
+    // Screen MV in pixels for NRD: pixelUvPrev = pixelUv + mv.xy * (1/res).
+    // z = previous linear viewZ − current linear viewZ (2.5D), both from unjittered clip.w so
+    // they match gViewZ / prepare_nrd_inputs (fixes the old clip.w vs deviceZ mismatch).
     vec2 motion = (prevNdc - curNdc) * 0.5 * size;
+    float currViewZ = length(gv_normal) < 0.5 ? 65504.0 : max(curClip.w, 0.0);
+    float prevViewZ = length(gv_normal) < 0.5 ? 65504.0 : max(prevClip.w, 0.0);
+    float motionZ = prevViewZ - currViewZ;
     if (length(gv_normal) < 0.5) {
         motion = vec2(0.0);
+        motionZ = 0.0;
     }
-    imageStore(gMotion, pix, vec4(motion, 0.0, 0.0));
+    imageStore(gMotion, pix, vec4(motion, motionZ, 0.0));
     vec2 specMotion = specularReflectionMotion(gv_hitCamRel + pc.camOffset, dir, ndc, size, rayConeSpread);
     imageStore(gSpecMotion, pix, vec4(specMotion, 0.0, 0.0));
 

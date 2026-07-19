@@ -150,9 +150,13 @@ void main() {
     bool isRough = !sky && rough > kSemiRough;
 
     vec3 diffAlbIn = max(imageLoad(gDiffAlbedo, pix).rgb, vec3(0.0));
-    vec3 specAlbIn = max(imageLoad(gSpecAlbedo, pix).rgb, vec3(0.0));
+    vec4 specAlb4 = imageLoad(gSpecAlbedo, pix);
+    vec3 specAlbIn = max(specAlb4.rgb, vec3(0.0));
+    // rgen packs metalness in gSpecAlbedo.a — metals keep more specular energy in REBLUR.
+    float metalness = clamp(specAlb4.a, 0.0, 1.0);
+    bool isMetal = metalness > 0.5 || (materialFlags & 64u) != 0u;
     vec3 diffAlb = max(diffAlbIn, kMinDiffAlb);
-    vec3 specAlb = max(specAlbIn, kMinSpecAlb);
+    vec3 specAlb = max(specAlbIn, isMetal ? vec3(0.02) : kMinSpecAlb);
 
     bool diffuseDemodulated = false;
     bool specularDemodulated = false;
@@ -192,10 +196,15 @@ void main() {
         // SemiRough/Rough: standard material-independent lighting contract in all exposure ranges.
         Dnrd = safeDiv(Dnrd, diffAlb);
         diffuseDemodulated = true;
-        if (rough > 0.22) {
+        if (rough > 0.22 || isMetal) {
             Spnrd = safeDiv(Spnrd, specAlb);
             specularDemodulated = true;
         }
+    }
+
+    // Metals: diffuse is residual only; keep specular as the primary REBLUR lobe.
+    if (isMetal && !isDielectricInterface) {
+        Dnrd *= (1.0 - 0.85 * metalness);
     }
 
     // Aggressive firefly clamp — leftover spikes become visible grain after REBLUR.

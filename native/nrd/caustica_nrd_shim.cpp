@@ -622,49 +622,39 @@ extern "C" int caustica_nrd_create_v2(
         return -8;
     }
 
-    // Conservative one-path-per-pixel baseline. Valid guides, confidence and disocclusion
-    // drive rejection; spatial radius is not a substitute for the standard NRD contract.
+    // Dielectric-aware REBLUR baseline (water/glass now feed specular + diffuse lobes).
+    // Temporal is primary; spatial prepass stays modest so near-field edges don't fall back to raw.
     nrd::ReblurSettings reblur{};
-    reblur.maxAccumulatedFrameNum = 24;
-    reblur.maxFastAccumulatedFrameNum = 4;
-    reblur.maxStabilizedFrameNum = 24;
+    reblur.maxAccumulatedFrameNum = 32;
+    reblur.maxFastAccumulatedFrameNum = 6;
+    reblur.maxStabilizedFrameNum = 32;
     reblur.historyFixFrameNum = 3;
     reblur.historyFixBasePixelStride = 6;
     reblur.historyFixAlternatePixelStride = 12;
-    // Spatial: ADAPTIVE prepass blur (v0.6.11) - fix near-field raw noise.
-    // Problem: 120px prepass works at distance but FAILS at near-field (1-2 blocks).
-    // Root cause: At near-field, 120px radius samples across HUGE depth discontinuities
-    //             (edge of nearby wall) → invalid samples → NRD falls back to raw input.
-    // Solution: Use SMALLER prepass at near-field, LARGER at distance.
-    // But NRD doesn't support per-pixel radius, so we choose a MIDDLE GROUND:
-    //   - Reduce from 120/150 to 60/80 (still aggressive but won't fail near-field)
-    //   - Rely more on temporal accumulation (64 frames) than spatial
-    reblur.diffusePrepassBlurRadius = 8.0f;
-    reblur.specularPrepassBlurRadius = 12.0f;
-    reblur.usePrepassOnlyForSpecularMotionEstimation = true;
+    // Specular prepass slightly stronger than diffuse: water/glass reflections are sparse at SPP-1.
+    reblur.diffusePrepassBlurRadius = 10.0f;
+    reblur.specularPrepassBlurRadius = 16.0f;
+    reblur.usePrepassOnlyForSpecularMotionEstimation = false;
     reblur.minBlurRadius = 1.0f;
-    reblur.maxBlurRadius = 30.0f;
-    reblur.fastHistoryClampingSigmaScale = 2.0f;
-    reblur.lobeAngleFraction = 0.30f;
-    reblur.roughnessFraction = 0.30f;
-    reblur.planeDistanceSensitivity = 0.02f;
-    reblur.minHitDistanceWeight = 0.10f;
-    reblur.fireflySuppressorMinRelativeScale = 2.0f;
+    reblur.maxBlurRadius = 36.0f;
+    reblur.fastHistoryClampingSigmaScale = 2.2f;
+    // Slightly looser lobe/roughness so wave normals + thin glass don't thrash history.
+    reblur.lobeAngleFraction = 0.35f;
+    reblur.roughnessFraction = 0.35f;
+    reblur.planeDistanceSensitivity = 0.025f;
+    reblur.minHitDistanceWeight = 0.08f;
+    reblur.fireflySuppressorMinRelativeScale = 1.8f;
     reblur.enableAntiFirefly = true;
     reblur.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_5X5;
-    reblur.responsiveAccumulationSettings.roughnessThreshold = 0.15f;
-    reblur.responsiveAccumulationSettings.minAccumulatedFrameNum = 2;
-    // Antilag remains enabled; confidence/disocclusion inputs accelerate unstable history.
-    // Problem: "peripheral noise around a clear central area" - NRD works in center but fails at edges.
-    // Root cause: Antilag at 4.0/6.0 is TOO AGGRESSIVE at screen edges where:
-    //   - Motion vectors are less reliable (reprojection OOB)
-    //   - Spatial samples are asymmetric (fewer neighbors)
-    //   - History is frequently rejected → fallback to raw noisy input
-    reblur.antilagSettings.luminanceSigmaScale = 2.0f;
-    reblur.antilagSettings.luminanceSensitivity = 3.0f;
+    // Responsive accumulation kicks in earlier for smooth dielectrics (guide roughness ~0.06).
+    reblur.responsiveAccumulationSettings.roughnessThreshold = 0.12f;
+    reblur.responsiveAccumulationSettings.minAccumulatedFrameNum = 3;
+    // Milder antilag: confidence/disocclusion already drive rejection for water/glass.
+    reblur.antilagSettings.luminanceSigmaScale = 2.4f;
+    reblur.antilagSettings.luminanceSensitivity = 2.6f;
     reblur.convergenceSettings.s = 1.0f;
-    reblur.convergenceSettings.b = 0.20f;
-    reblur.convergenceSettings.p = 0.80f;
+    reblur.convergenceSettings.b = 0.18f;
+    reblur.convergenceSettings.p = 0.82f;
     nrd::SetDenoiserSettings(*c->instance, nrd::Identifier(nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR), &reblur);
 
     nrd::SigmaSettings sigma{};
@@ -773,15 +763,16 @@ extern "C" int caustica_nrd_dispatch_v2(
     cs.accumulationMode = (reset || frame_index == 0)
         ? nrd::AccumulationMode::CLEAR_AND_RESTART
         : nrd::AccumulationMode::CONTINUE;
-    // 2D screen-space MV only. (2.5D mv.z from clip.w was inconsistent with prepare viewZ
-    // and caused mass history rejection → undenoised firefly grain.)
+    // 2.5D MV: xy in screen pixels (scale 1/res), z = prevViewZ - currViewZ from rgen using
+    // the same unjittered clip.w as gViewZ / prepare_nrd_inputs (no more unit mismatch).
     cs.motionVectorScale[0] = 1.0f / float(c->width);
     cs.motionVectorScale[1] = 1.0f / float(c->height);
-    cs.motionVectorScale[2] = 0.0f;
+    cs.motionVectorScale[2] = 1.0f;
     cs.viewZScale = 1.0f;
     // Standard primary threshold plus an alternate selected by the application mix texture.
-    cs.disocclusionThreshold = 0.03f;
-    cs.disocclusionThresholdAlternate = 0.05f;
+    // Primary threshold for opaque geometry; alternate (via mix texture) for water/glass/particles.
+    cs.disocclusionThreshold = 0.025f;
+    cs.disocclusionThresholdAlternate = 0.08f;
     cs.isHistoryConfidenceAvailable = true;
     cs.isDisocclusionThresholdMixAvailable = true;
     cs.isMotionVectorInWorldSpace = false;

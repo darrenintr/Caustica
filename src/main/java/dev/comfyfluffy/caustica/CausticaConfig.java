@@ -717,9 +717,9 @@ public final class CausticaConfig {
 
         public static final class Terrain {
             public static final IntSetting ASYNC_DISPATCH_PER_TICK =
-                    intAtLeast("caustica.rt.asyncDispatchPerTick", "terrain.async-dispatch-per-tick", 64, 0);
+                    intAtLeast("caustica.rt.asyncDispatchPerTick", "terrain.async-dispatch-per-tick", 48, 0);
             public static final IntSetting SECTION_RESULTS_PER_TICK =
-                    intAtLeast("caustica.rt.sectionResultsPerTick", "terrain.section-results-per-tick", 64, 0);
+                    intAtLeast("caustica.rt.sectionResultsPerTick", "terrain.section-results-per-tick", 48, 0);
             public static final FloatSetting STREAM_BUDGET_MS =
                     clampedFloat("caustica.rt.streamBudgetMs", "terrain.stream-budget-ms", 1.5f, 0.05f, 100f);
             public static final FloatSetting STREAM_BUDGET_MAX_MS =
@@ -727,7 +727,7 @@ public final class CausticaConfig {
             public static final FloatSetting STREAM_FALLBACK_BUDGET_MS =
                     clampedFloat("caustica.rt.streamFallbackBudgetMs", "terrain.stream-fallback-budget-ms", 8f, 0.05f, 100f);
             public static final IntSetting MAX_INFLIGHT_SECTIONS =
-                    intAtLeast("caustica.rt.maxInflightSections", "terrain.max-inflight-sections", 192, 0);
+                    intAtLeast("caustica.rt.maxInflightSections", "terrain.max-inflight-sections", 128, 0);
             public static final IntSetting SECTION_TABLE_INITIAL_CAPACITY =
                     intAtLeast("caustica.rt.sectionTableInitialCapacity", "terrain.section-table-initial-capacity", 512, 1);
             public static final IntSetting REBASE_DISTANCE_BLOCKS =
@@ -740,7 +740,7 @@ public final class CausticaConfig {
         public static final class Omm {
             public static final BooleanSetting ENABLED = bool("caustica.rt.omm", "omm.enabled", true);
             public static final IntSetting SUBDIVISION =
-                    clampedInt("caustica.rt.ommSubdivision", "omm.subdivision", 4, 0, 12);
+                    clampedInt("caustica.rt.ommSubdivision", "omm.subdivision", 4, 0, 6);
             public static final BooleanSetting STATS = bool("caustica.rt.ommStats", "omm.stats", false);
 
             private Omm() {
@@ -986,7 +986,7 @@ public final class CausticaConfig {
             public static final FloatSetting MIN_EV =
                     finiteFloat("caustica.rt.exposure.minEv", "exposure.min-ev", -1.5f);
             public static final FloatSetting MAX_EV =
-                    finiteFloat("caustica.rt.exposure.maxEv", "exposure.max-ev", 1.75f);
+                    finiteFloat("caustica.rt.exposure.maxEv", "exposure.max-ev", 2.5f);
             public static final FloatSetting ADAPT_UP =
                     exposureScale("caustica.rt.exposure.adaptUp", "exposure.adapt-up", 0.14f);
             public static final FloatSetting ADAPT_DOWN =
