@@ -8,9 +8,11 @@
 #include <vulkan/vulkan.h>
 
 #include <array>
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <new>
+#include <utility>
 #include <vector>
 
 #ifndef VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR
@@ -25,7 +27,7 @@
 #endif
 
 #define NRD_ARRAYSIZE(x) (sizeof(x) / sizeof(*(x)))
-static constexpr uint32_t FALLBACK_FRAME_SLOTS = 4;
+static constexpr uint32_t FALLBACK_DESCRIPTOR_VARIANTS = 8;
 
 static const VkFormat g_NRDFormatToVkFormat[] = {
     VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT,
@@ -71,6 +73,12 @@ struct NrdPipe {
     uint32_t numBindings = 0;
 };
 
+struct CachedDescriptorSet {
+    uint16_t pipelineIndex = 0;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    std::vector<VkImageView> imageViews;
+};
+
 struct CausticaNrd {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -79,7 +87,6 @@ struct CausticaNrd {
     uint32_t queueFamilies[2] = {VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED};
     uint32_t queueFamilyCount = 0;
     bool poolsNeedInit = false;
-    uint64_t descriptorFrame = 0;
 
     nrd::Instance* instance = nullptr;
     uint32_t width = 0, height = 0;
@@ -99,7 +106,8 @@ struct CausticaNrd {
     VkDescriptorSetLayout samplerSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool samplerPool = VK_NULL_HANDLE;
     VkDescriptorSet samplerSet = VK_NULL_HANDLE;
-    std::array<VkDescriptorPool, FALLBACK_FRAME_SLOTS> resourcePools{};
+    VkDescriptorPool resourcePool = VK_NULL_HANDLE;
+    std::vector<CachedDescriptorSet> cachedResourceSets;
 
     std::vector<NrdPipe> pipelines;
 };
@@ -299,22 +307,24 @@ static int createPipelines(CausticaNrd* c) {
 
     if (!c->cmdPushDescriptorSetKHR) {
         const nrd::DescriptorPoolDesc& dp = iDesc->descriptorPoolDesc;
-        for (VkDescriptorPool& pool : c->resourcePools) {
-            VkDescriptorPoolSize sizes[] = {
-                {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, dp.totalTexturesNum},
-                {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dp.totalStorageTexturesNum},
-            };
-            VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-            pci.maxSets = dp.setsMaxNum;
-            pci.poolSizeCount = 2;
-            pci.pPoolSizes = sizes;
-            if (vkCreateDescriptorPool(c->device, &pci, nullptr, &pool) != VK_SUCCESS) return -25;
-        }
+        VkDescriptorPoolSize sizes[] = {
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, dp.totalTexturesNum * FALLBACK_DESCRIPTOR_VARIANTS},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dp.totalStorageTexturesNum * FALLBACK_DESCRIPTOR_VARIANTS},
+        };
+        VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pci.maxSets = dp.setsMaxNum * FALLBACK_DESCRIPTOR_VARIANTS;
+        pci.poolSizeCount = 2;
+        pci.pPoolSizes = sizes;
+        if (vkCreateDescriptorPool(c->device, &pci, nullptr, &c->resourcePool) != VK_SUCCESS) return -25;
     }
     return 0;
 }
 
 static int recreatePools(CausticaNrd* c, uint32_t w, uint32_t h) {
+    if (c->resourcePool) {
+        vkResetDescriptorPool(c->device, c->resourcePool, 0);
+        c->cachedResourceSets.clear();
+    }
     for (auto& t : c->permanent) destroyTex(c->device, t);
     for (auto& t : c->transient) destroyTex(c->device, t);
     c->permanent.clear();
@@ -343,9 +353,7 @@ static int recreatePools(CausticaNrd* c, uint32_t w, uint32_t h) {
 
 static void destroyAll(CausticaNrd* c) {
     if (!c) return;
-    for (VkDescriptorPool pool : c->resourcePools) {
-        if (pool) vkDestroyDescriptorPool(c->device, pool, nullptr);
-    }
+    if (c->resourcePool) vkDestroyDescriptorPool(c->device, c->resourcePool, nullptr);
     for (auto& p : c->pipelines) {
         if (p.pipeline) vkDestroyPipeline(c->device, p.pipeline, nullptr);
         if (p.layout) vkDestroyPipelineLayout(c->device, p.layout, nullptr);
@@ -423,8 +431,7 @@ static GpuTex* resolveTex(CausticaNrd* c, const nrd::ResourceDesc& r) {
     return &c->user[i];
 }
 
-static bool dispatchOne(CausticaNrd* c, VkCommandBuffer cmd, VkDescriptorPool fallbackPool,
-                        const nrd::DispatchDesc& dDesc) {
+static bool dispatchOne(CausticaNrd* c, VkCommandBuffer cmd, const nrd::DispatchDesc& dDesc) {
     const nrd::LibraryDesc* lDesc = nrd::GetLibraryDesc();
     const nrd::InstanceDesc* iDesc = nrd::GetInstanceDesc(*c->instance);
     const nrd::PipelineDesc& pDesc = iDesc->pipelines[dDesc.pipelineIndex];
@@ -484,14 +491,26 @@ static bool dispatchOne(CausticaNrd* c, VkCommandBuffer cmd, VkDescriptorPool fa
         c->cmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.layout,
                                    iDesc->resourcesSpaceIndex, nUp, writes.data());
     } else if (nUp > 0) {
+        std::vector<VkImageView> signature(nUp);
+        for (uint32_t i = 0; i < nUp; ++i)
+            signature[i] = infos[i].imageView;
+        auto cached = std::find_if(c->cachedResourceSets.begin(), c->cachedResourceSets.end(),
+            [&signature, &dDesc](const CachedDescriptorSet& entry) {
+                return entry.pipelineIndex == dDesc.pipelineIndex && entry.imageViews == signature;
+            });
         VkDescriptorSet set = VK_NULL_HANDLE;
-        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        dai.descriptorPool = fallbackPool;
-        dai.descriptorSetCount = 1;
-        dai.pSetLayouts = &pipe.resourceLayout;
-        if (vkAllocateDescriptorSets(c->device, &dai, &set) != VK_SUCCESS) return false;
-        for (uint32_t i = 0; i < nUp; ++i) writes[i].dstSet = set;
-        vkUpdateDescriptorSets(c->device, nUp, writes.data(), 0, nullptr);
+        if (cached != c->cachedResourceSets.end()) {
+            set = cached->set;
+        } else {
+            VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            dai.descriptorPool = c->resourcePool;
+            dai.descriptorSetCount = 1;
+            dai.pSetLayouts = &pipe.resourceLayout;
+            if (vkAllocateDescriptorSets(c->device, &dai, &set) != VK_SUCCESS) return false;
+            for (uint32_t i = 0; i < nUp; ++i) writes[i].dstSet = set;
+            vkUpdateDescriptorSets(c->device, nUp, writes.data(), 0, nullptr);
+            c->cachedResourceSets.push_back({dDesc.pipelineIndex, set, std::move(signature)});
+        }
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.layout,
                                 iDesc->resourcesSpaceIndex, 1, &set, 0, nullptr);
     }
@@ -560,8 +579,14 @@ extern "C" int caustica_nrd_create_v2(
     c->device = (VkDevice)vk_device;
     c->physical = (VkPhysicalDevice)vk_physical;
     c->getDeviceProcAddr = (PFN_vkGetDeviceProcAddr)get_device_proc_addr;
-    c->cmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)
-        c->getDeviceProcAddr(c->device, "vkCmdPushDescriptorSetKHR");
+    VkPhysicalDeviceProperties deviceProperties{};
+    vkGetPhysicalDeviceProperties(c->physical, &deviceProperties);
+    // AMDVLK has historically been less forgiving around push descriptors. Core descriptor
+    // sets also let us cache immutable NRD bindings instead of rewriting driver state per pass.
+    if (deviceProperties.vendorID != 0x1002) {
+        c->cmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)
+            c->getDeviceProcAddr(c->device, "vkCmdPushDescriptorSetKHR");
+    }
     if (!queueFamilySupportsCompute(c->physical, graphics_queue_family) ||
         (compute_queue_family != UINT32_MAX &&
          !queueFamilySupportsCompute(c->physical, compute_queue_family))) {
@@ -772,13 +797,8 @@ extern "C" int caustica_nrd_dispatch_v2(
     uint32_t nDisp = 0;
     if (nrd::GetComputeDispatches(*c->instance, ids, 2, dispatches, nDisp) != nrd::Result::SUCCESS)
         return -3;
-    VkDescriptorPool fallbackPool = VK_NULL_HANDLE;
-    if (!c->cmdPushDescriptorSetKHR) {
-        fallbackPool = c->resourcePools[c->descriptorFrame++ % FALLBACK_FRAME_SLOTS];
-        if (vkResetDescriptorPool(c->device, fallbackPool, 0) != VK_SUCCESS) return -4;
-    }
     for (uint32_t i = 0; i < nDisp; ++i) {
-        if (!dispatchOne(c, cmd, fallbackPool, dispatches[i])) return -5;
+        if (!dispatchOne(c, cmd, dispatches[i])) return -5;
     }
     return 0;
 }
