@@ -123,7 +123,10 @@ public final class RtComposite {
     private static final int GUIDE_COUNT = 23; // bindings 3..25 (guides + standard RT outputs)
 
     // ReSTIR Direct Illumination feature flag
-    private static final boolean ENABLE_RESTIR_DI = true;
+    // ReSTIR DI currently loses the AMD device after the live light set grows while NRD is
+    // active (VK_ERROR_DEVICE_LOST is reported later by swapchain acquire). Keep the stable
+    // direct-light path as the baseline until the reservoir/resource lifetime path is rebuilt.
+    private static final boolean ENABLE_RESTIR_DI = false;
     private static final boolean ENABLE_RESTIR_GI = false;
     private static final boolean ENABLE_LIGHTFIELD_GI = false;
     // Stable profiling baseline: keep VRS and pseudo-async compute out of the frame until their
