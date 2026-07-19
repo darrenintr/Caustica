@@ -66,6 +66,10 @@ dependencies {
 
 processResources {
 	inputs.property "version", project.version
+	// Local native backups and manually compiled legacy SPIR-V may live under resources while
+	// diagnosing a driver issue. They are not runtime inputs and must never leak into release jars.
+	exclude "caustica/natives/**/*.bak-*"
+	exclude "caustica/rt/denoise/svgf_*.comp.spv"
 
 	filesMatching("fabric.mod.json") {
 		expand "version": inputs.properties.version
