@@ -42,7 +42,6 @@ target_link_libraries(caustica_nrd PRIVATE Vulkan::Vulkan ${CMAKE_DL_LIBS})
 if(MSVC)
   target_link_libraries(caustica_nrd PRIVATE ${NRD_LIBRARY} ${SHADERMAKE_BLOB_LIB})
   target_link_options(caustica_nrd PRIVATE
-    "/WHOLEARCHIVE:${NRD_LIBRARY}"
     "/WHOLEARCHIVE:${SHADERMAKE_BLOB_LIB}")
 else()
   target_link_libraries(caustica_nrd PRIVATE
