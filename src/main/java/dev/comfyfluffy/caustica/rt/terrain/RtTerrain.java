@@ -85,6 +85,10 @@ import java.util.concurrent.Future;
  * (no {@code waitIdle} on the hot path).
  */
 public final class RtTerrain {
+    // Keep the RT residency window bounded independently of Minecraft's render distance while
+    // the terrain BLAS retirement path is being rebuilt. Vanilla still renders its full view;
+    // this only limits the ray-traced terrain working set on AMD.
+    private static final int MAX_RT_RENDER_DISTANCE = 6;
     // CPU tessellation runs on RtWorkerPool. The render thread snapshots RenderSectionRegions, uploads
     // completed meshes, prepares BLASes, and submits the GPU build. Those render-thread pieces run as one
     // "streaming pass" per render frame (driven by RtComposite), bounded by a wall-clock budget so the
@@ -844,7 +848,7 @@ public final class RtTerrain {
     }
 
     private int horizontalChunks(Minecraft mc) {
-        return Math.max(1, mc.options.getEffectiveRenderDistance());
+        return Math.max(1, Math.min(MAX_RT_RENDER_DISTANCE, mc.options.getEffectiveRenderDistance()));
     }
 
     private void drainDirty() {
