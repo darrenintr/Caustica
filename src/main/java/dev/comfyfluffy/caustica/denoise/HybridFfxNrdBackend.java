@@ -382,6 +382,18 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         lastComposeOk = false;
         lastPathLabel = nrdOnly ? "nrd-only (pending)" : "hybrid (pending)";
 
+        // A forced NRD mode with a missing/incompatible native must be a true no-op. Recording
+        // prepare/transparent work before eventually returning false can still mutate auxiliary
+        // resources and stress a driver even though RtComposite correctly keeps raw beauty.
+        if (!NrdRuntime.INSTANCE.isAvailable()) {
+            lastPathLabel = nrdOnly ? "raw (nrd unavailable)" : "ffx-only (nrd unavailable)";
+            if (!nrdFailLogged) {
+                nrdFailLogged = true;
+                CausticaMod.LOGGER.info("NRD native unavailable; skipping every NRD prepare/dispatch/compose command");
+            }
+            return false;
+        }
+
         // Snapshot raw beauty (caller seeds outColor with raw; FFX hybrid may overwrite outColor).
         if (beautyRawCopy != null && inColor != null) {
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "hybrid snapshot beauty")) {
@@ -597,11 +609,11 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
             if (nrdOnly) {
                 lastPathLabel = "raw (nrd unavailable)";
                 CausticaMod.LOGGER.info(
-                        "Denoise: NRD-only requested but native unavailable; raw beauty + TAA");
+                        "Denoise: NRD-only context not ready; raw beauty + TAA");
             } else {
                 lastPathLabel = "ffx-only";
                 CausticaMod.LOGGER.info(
-                        "Hybrid denoise: FFX prepass only (NRD native unavailable); beauty TAA still applies");
+                        "Hybrid denoise: NRD context not ready; beauty TAA still applies");
             }
         } else if (!nrdOk && !nrdOnly) {
             lastPathLabel = "ffx-only";
