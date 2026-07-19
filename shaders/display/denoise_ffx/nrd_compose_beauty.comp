@@ -16,6 +16,9 @@ layout(binding = 7, rgba16f) readonly  uniform image2D gTransparentDenoised; // 
 layout(binding = 8, rgba16f) writeonly uniform image2D gOut;
 layout(binding = 9, rgba16f) readonly uniform image2D gClearEmission;
 layout(binding = 10, rgba16f) readonly uniform image2D gTransmission;
+layout(binding = 11, rgba16f) readonly uniform image2D gSigmaShadow;
+layout(binding = 12, rgba16f) readonly uniform image2D gUnshadowedDirect;
+layout(binding = 13, rg8) readonly uniform image2D gDemodulationMask;
 
 layout(push_constant) uniform Push {
     float surfaceGain; // scale NRD surface (default ~0.95)
@@ -154,14 +157,22 @@ void main() {
         // All other surfaces: remodulate denoised irradiance with albedo
         vec3 diffAlb = max(imageLoad(gDiffAlbedo, pix).rgb, kMinDiffAlb);
         vec3 specAlb = max(imageLoad(gSpecAlbedo, pix).rgb, kMinSpecAlb);
-        vec3 diff = yCoCgToLinear(imageLoad(gDiff, pix).xyz) * diffAlb;
+        vec2 demodulated = imageLoad(gDemodulationMask, pix).rg;
+        vec3 diff = yCoCgToLinear(imageLoad(gDiff, pix).xyz);
+        if (demodulated.r > 0.5) diff *= diffAlb;
         vec3 specLin = yCoCgToLinear(imageLoad(gSpec, pix).xyz);
-        vec3 spec = (rough > 0.22) ? (specLin * specAlb) : specLin;
+        vec3 spec = specLin;
+        if (demodulated.g > 0.5) spec *= specAlb;
+        // SIGMA encodes shadow as sqrt(visibility); unpack exactly once before applying it
+        // to the separately classified, already material-weighted direct-light term.
+        float sigmaEncoded = clamp(imageLoad(gSigmaShadow, pix).r, 0.0, 1.0);
+        float shadow = sigmaEncoded * sigmaEncoded;
+        vec3 direct = max(imageLoad(gUnshadowedDirect, pix).rgb, vec3(0.0)) * shadow;
         // Opaque emission is an explicitly classified unfiltered signal. Primary clear radiance
         // is handled by the sky branch above, so surface pixels contain emission only here.
         vec3 emission = max(imageLoad(gClearEmission, pix).rgb, vec3(0.0));
         vec3 transmission = max(imageLoad(gTransmission, pix).rgb, vec3(0.0));
-        c = (diff + spec + emission + transmission) * sg;
+        c = (direct + diff + spec + emission + transmission) * sg;
 
         // ONLY fall back on true death — never re-inject raw grain over good REBLUR.
         float nrdY = luma(c);

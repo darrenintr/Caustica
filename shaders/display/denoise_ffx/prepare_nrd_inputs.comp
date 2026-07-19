@@ -27,6 +27,12 @@ layout(binding = 13, rgba16f) writeonly uniform image2D gNrdNormalRough;
 // Transparency mask: 1.0 = transparent (glass/water), 0.0 = opaque (use NRD).
 layout(binding = 14, r8) writeonly uniform image2D gTransparencyMask;
 layout(binding = 15, r32ui) readonly uniform uimage2D gMaterialFlags;
+layout(binding = 16, rgba16f) readonly uniform image2D gConfidenceDisocclusion;
+layout(binding = 17, r16f) writeonly uniform image2D gSigmaPenumbra;
+layout(binding = 18, r8) writeonly uniform image2D gDiffConfidence;
+layout(binding = 19, r8) writeonly uniform image2D gSpecConfidence;
+layout(binding = 20, r8) writeonly uniform image2D gDisocclusionMix;
+layout(binding = 21, rg8) writeonly uniform image2D gDemodulationMask;
 
 layout(push_constant) uniform Push {
     float cameraNear;
@@ -144,9 +150,8 @@ void main() {
     vec3 diffAlb = max(diffAlbIn, kMinDiffAlb);
     vec3 specAlb = max(specAlbIn, kMinSpecAlb);
 
-    // Calculate luma early (needed for confidence later)
-    vec3 currColorForLuma = max(Dnrd + Spnrd, vec3(0.0));
-    float luma = dot(currColorForLuma, vec3(0.2126, 0.7152, 0.0722));
+    bool diffuseDemodulated = false;
+    bool specularDemodulated = false;
 
     // Tiered denoising strategy based on material roughness:
     // - Water (≤0.08): pre-modulated beauty path (avoid SPP-1 firefly outliers)
@@ -167,28 +172,19 @@ void main() {
     } else if (isMirror || isSmooth) {
         // Mirror/Smooth: light demode to preserve sharp reflections
         Dnrd = safeDiv(Dnrd, diffAlb);
+        diffuseDemodulated = true;
         // Only demode specular on semi-rough+ surfaces to avoid inflating fireflies
         if (rough > 0.22) {
             Spnrd = safeDiv(Spnrd, specAlb);
+            specularDemodulated = true;
         }
     } else {
-        // SemiRough/Rough: full demodulation (standard path)
-        // DARK-SCENE SKIP DEMOD (v0.6.15): underground noise fix.
-        // Problem: "only appear when underground/indoor...lack of light source" (user feedback).
-        // Root cause: In very dark scenes (luma < 0.08), radiance has extreme variance from GI.
-        //             Demodulation (radiance/albedo) AMPLIFIES this noise.
-        // Solution: In extreme darkness, skip demodulation → feed raw radiance to NRD.
-        //           NRD will denoise the "modulated" signal (less effective but won't amplify noise).
-        float luma = dot(Dnrd, vec3(0.2126, 0.7152, 0.0722));
-        if (luma < 0.08 && !sky) {
-            // Extreme darkness (underground caves): skip demodulation
-            // Keep Dnrd/Spnrd as-is (already contains radiance, not demodulated)
-        } else {
-            // Normal lighting: standard demodulation
-            Dnrd = safeDiv(Dnrd, diffAlb);
-            if (rough > 0.22) {
-                Spnrd = safeDiv(Spnrd, specAlb);
-            }
+        // SemiRough/Rough: standard material-independent lighting contract in all exposure ranges.
+        Dnrd = safeDiv(Dnrd, diffAlb);
+        diffuseDemodulated = true;
+        if (rough > 0.22) {
+            Spnrd = safeDiv(Spnrd, specAlb);
+            specularDemodulated = true;
         }
     }
 
@@ -246,4 +242,13 @@ void main() {
     // Threshold at 0.15 catches water(0.08), glass(0.10), ice(0.10).
     float transparencyMask = (isWater || isGlass || isParticle) ? 1.0 : 0.0;
     imageStore(gTransparencyMask, pix, vec4(transparencyMask, 0.0, 0.0, 0.0));
+
+    // SIGMA hard-shadow baseline: open rays use FP16_MAX, blocked/NoL<=0 rays use zero.
+    imageStore(gSigmaPenumbra, pix, vec4(Sraw > 0.5 ? 65504.0 : 0.0, 0.0, 0.0, 0.0));
+    vec4 confidenceMix = clamp(imageLoad(gConfidenceDisocclusion, pix), vec4(0.0), vec4(1.0));
+    imageStore(gDiffConfidence, pix, vec4(confidenceMix.r, 0.0, 0.0, 0.0));
+    imageStore(gSpecConfidence, pix, vec4(confidenceMix.g, 0.0, 0.0, 0.0));
+    imageStore(gDisocclusionMix, pix, vec4(confidenceMix.b, 0.0, 0.0, 0.0));
+    imageStore(gDemodulationMask, pix, vec4(diffuseDemodulated ? 1.0 : 0.0,
+            specularDemodulated ? 1.0 : 0.0, 0.0, 0.0));
 }

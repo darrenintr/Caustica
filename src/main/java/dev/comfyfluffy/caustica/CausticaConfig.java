@@ -644,9 +644,9 @@ public final class CausticaConfig {
             // Quality default 2 (v0.6): enhanced ReSTIR GI with spatial reuse (8 samples, 4-16px radius)
             // and visibility reuse reduces variance by ~60%, making SPP=2 equivalent to old SPP=4-6.
             // Previous default was 4; lowered to 2 for better performance while maintaining quality.
-            public static final IntSetting SPP = intAtLeast("caustica.rt.spp", "composite.spp", 2, 1);
+            public static final IntSetting SPP = intAtLeast("caustica.rt.spp", "composite.spp", 1, 1);
             public static final IntSetting MAX_BOUNCES =
-                    clampedInt("caustica.rt.maxBounces", "composite.max-bounces", 4, 2, 8);
+                    clampedInt("caustica.rt.maxBounces", "composite.max-bounces", 2, 2, 8);
             // Adaptive SPP mode. The path tracer spends extra samples on pixels that need them:
             //   * transparent / water surfaces get SPP >= 2 (single-sample always misses one Fresnel lobe)
             //   * emissive-block-adjacent pixels get SPP >= 2 (one missed sun-quad sample = firefly)
@@ -654,7 +654,7 @@ public final class CausticaConfig {
             //   * everything else uses the user-configured SPP.
             // Off = use SPP for every pixel (legacy). On (default) = apply the heuristic above.
             public static final BooleanSetting ADAPTIVE_SPP =
-                    bool("caustica.rt.adaptiveSpp", "composite.adaptive-spp", true);
+                    bool("caustica.rt.adaptiveSpp", "composite.adaptive-spp", false);
             // Secondary NEE: in addition to the primary directional light, fire one shadow ray at
             // the moon (when above the horizon and not at a too-thin phase) for every direct-light
             // bounce. Default on; cost = +1 shadow ray per primary hit. Trades a single-firefly risk
@@ -663,7 +663,7 @@ public final class CausticaConfig {
             public static final BooleanSetting SECONDARY_MOON_NEE =
                     bool("caustica.rt.secondaryMoonNee", "composite.secondary-moon-nee", false);
             public static final FloatSetting MAX_RAY_DISTANCE =
-                    clampedFloat("caustica.rt.maxRayDistance", "composite.max-ray-distance", 10000.0f, 100.0f, 20000.0f);
+                    clampedFloat("caustica.rt.maxRayDistance", "composite.max-ray-distance", 96.0f, 64.0f, 20000.0f);
             public static final BooleanSetting WATER_WAVES =
                     bool("caustica.rt.waterWaves", "composite.water-waves", true);
             // Real solar half-angle ≈ 0.27°. Larger values make soft penumbra look like fake
@@ -899,7 +899,7 @@ public final class CausticaConfig {
          */
         public static final class Gi {
             public static final BooleanSetting ENABLED =
-                    bool("caustica.rt.gi", "gi.enabled", true);
+                    bool("caustica.rt.gi", "gi.enabled", false);
             public static final IntSetting CANDIDATES =
                     clampedInt("caustica.rt.gi.candidates", "gi.candidates", 4, 1, 8);
             public static final FloatSetting MAX_M_TEMPORAL =
@@ -1109,7 +1109,7 @@ public final class CausticaConfig {
 
     /** Dynamic Resolution Scaling — automatically adjusts render resolution to maintain target framerate. */
     public static final class Drs {
-        public static final BooleanSetting ENABLED = bool("caustica.drs.enabled", "drs.enabled", true);
+        public static final BooleanSetting ENABLED = bool("caustica.drs.enabled", "drs.enabled", false);
 
         public static final FloatSetting TARGET_FPS =
                 clampedFloat("caustica.drs.targetFps", "drs.target-fps", 60.0f, 30.0f, 240.0f);

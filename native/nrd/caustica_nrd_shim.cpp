@@ -489,26 +489,23 @@ extern "C" int caustica_nrd_create(
 
     nrd::DenoiserDesc denoisers[] = {
         {nrd::Identifier(nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR), nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR},
+        {nrd::Identifier(nrd::Denoiser::SIGMA_SHADOW), nrd::Denoiser::SIGMA_SHADOW},
     };
-    nrd::InstanceCreationDesc idesc{{}, denoisers, 1};
+    nrd::InstanceCreationDesc idesc{{}, denoisers, 2};
     if (nrd::CreateInstance(idesc, c->instance) != nrd::Result::SUCCESS) {
         delete c;
         return -4;
     }
 
-    // NUCLEAR DENOISING FOR SPP=1 (v0.6.2): ABSOLUTE ZERO noise tolerance.
-    // User feedback: v0.6.1 (75px prepass) still shows visible grain on stone/water.
-    // Strategy: INSANE spatial blur (120px+ prepass) + ultra-loose edge checks + ignore all
-    // geometry variance. This will blur EVERYTHING into smoothness. Edges will be soft but
-    // there will be ZERO visible grain. User explicitly wants "no noise visible to eyes".
+    // Conservative one-path-per-pixel baseline. Valid guides, confidence and disocclusion
+    // drive rejection; spatial radius is not a substitute for the standard NRD contract.
     nrd::ReblurSettings reblur{};
-    // Temporal: ULTRA-slow accumulation for maximum smoothness
-    reblur.maxAccumulatedFrameNum = 64;          // ultra-long history (was 48)
-    reblur.maxFastAccumulatedFrameNum = 2;       // slower fast mode (was 3)
-    reblur.maxStabilizedFrameNum = 96;           // hold statics even longer (was 64)
-    reblur.historyFixFrameNum = 4;               // 4-frame checkerboard (was 3)
-    reblur.historyFixBasePixelStride = 2;        // ultra-dense grid (was 3)
-    reblur.historyFixAlternatePixelStride = 2;
+    reblur.maxAccumulatedFrameNum = 24;
+    reblur.maxFastAccumulatedFrameNum = 4;
+    reblur.maxStabilizedFrameNum = 24;
+    reblur.historyFixFrameNum = 3;
+    reblur.historyFixBasePixelStride = 6;
+    reblur.historyFixAlternatePixelStride = 12;
     // Spatial: ADAPTIVE prepass blur (v0.6.11) - fix near-field raw noise.
     // Problem: 120px prepass works at distance but FAILS at near-field (1-2 blocks).
     // Root cause: At near-field, 120px radius samples across HUGE depth discontinuities
@@ -517,42 +514,38 @@ extern "C" int caustica_nrd_create(
     // But NRD doesn't support per-pixel radius, so we choose a MIDDLE GROUND:
     //   - Reduce from 120/150 to 60/80 (still aggressive but won't fail near-field)
     //   - Rely more on temporal accumulation (64 frames) than spatial
-    reblur.diffusePrepassBlurRadius = 60.0f;     // REDUCED (was 120) - near-field fix
-    reblur.specularPrepassBlurRadius = 80.0f;    // REDUCED (was 150) - near-field fix
-    reblur.usePrepassOnlyForSpecularMotionEstimation = false;
-    reblur.minBlurRadius = 6.0f;                 // never below 6px (was 4.0)
-    reblur.maxBlurRadius = 96.0f;                // allow MASSIVE blur (was 64)
-    // Variance rejection: ULTRA-LOOSE - accept everything to avoid grain
-    reblur.fastHistoryClampingSigmaScale = 4.0f; // extremely loose (was 2.5)
-    // Edge-stopping: DISABLED - blur across ALL edges (zero geometry awareness)
-    reblur.lobeAngleFraction = 0.50f;            // ignore normal differences (was 0.30)
-    reblur.roughnessFraction = 0.50f;            // ignore roughness differences (was 0.30)
-    reblur.planeDistanceSensitivity = 0.10f;     // ignore depth edges (was 0.05)
-    reblur.minHitDistanceWeight = 0.02f;         // completely ignore hit-dist (was 0.05)
-    // Firefly suppression: BEYOND NUCLEAR
-    reblur.fireflySuppressorMinRelativeScale = 8.0f; // OBLITERATE outliers (was 5.0)
+    reblur.diffusePrepassBlurRadius = 8.0f;
+    reblur.specularPrepassBlurRadius = 12.0f;
+    reblur.usePrepassOnlyForSpecularMotionEstimation = true;
+    reblur.minBlurRadius = 1.0f;
+    reblur.maxBlurRadius = 30.0f;
+    reblur.fastHistoryClampingSigmaScale = 2.0f;
+    reblur.lobeAngleFraction = 0.30f;
+    reblur.roughnessFraction = 0.30f;
+    reblur.planeDistanceSensitivity = 0.02f;
+    reblur.minHitDistanceWeight = 0.10f;
+    reblur.fireflySuppressorMinRelativeScale = 2.0f;
     reblur.enableAntiFirefly = true;
     reblur.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_5X5;
-    // Responsive accumulation: HYPER-AGGRESSIVE
-    reblur.responsiveAccumulationSettings.roughnessThreshold = 0.25f; // trigger on everything (was 0.18)
-    reblur.responsiveAccumulationSettings.minAccumulatedFrameNum = 1; // instant blur (was 2)
-    // EDGE STABILIZATION (v0.6.8): DISABLE antilag to fix peripheral noise.
+    reblur.responsiveAccumulationSettings.roughnessThreshold = 0.15f;
+    reblur.responsiveAccumulationSettings.minAccumulatedFrameNum = 2;
+    // Antilag remains enabled; confidence/disocclusion inputs accelerate unstable history.
     // Problem: "peripheral noise around a clear central area" - NRD works in center but fails at edges.
     // Root cause: Antilag at 4.0/6.0 is TOO AGGRESSIVE at screen edges where:
     //   - Motion vectors are less reliable (reprojection OOB)
     //   - Spatial samples are asymmetric (fewer neighbors)
     //   - History is frequently rejected → fallback to raw noisy input
-    // Solution: DISABLE antilag entirely. At 1 SPP, prefer smooth ghosting over edge noise.
-    // Trade-off: May see trailing on fast-moving objects, but eliminates peripheral noise ring.
-    reblur.antilagSettings.luminanceSigmaScale = 0.0f;     // DISABLE (was 4.0)
-    reblur.antilagSettings.luminanceSensitivity = 0.0f;    // DISABLE (was 6.0)
-    reblur.antilagSettings.hitDistanceSigmaScale = 0.0f;   // DISABLE (was 4.0)
-    reblur.antilagSettings.hitDistanceSensitivity = 0.0f;  // DISABLE (was 6.0)
-    // Convergence: ULTRA-slow - blend as many frames as possible
+    reblur.antilagSettings.luminanceSigmaScale = 2.0f;
+    reblur.antilagSettings.luminanceSensitivity = 3.0f;
     reblur.convergenceSettings.s = 1.0f;
-    reblur.convergenceSettings.b = 0.10f;          // ultra-slow convergence (was 0.15)
-    reblur.convergenceSettings.p = 0.95f;          // maximum temporal weight (was 0.90)
+    reblur.convergenceSettings.b = 0.20f;
+    reblur.convergenceSettings.p = 0.80f;
     nrd::SetDenoiserSettings(*c->instance, nrd::Identifier(nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR), &reblur);
+
+    nrd::SigmaSettings sigma{};
+    sigma.planeDistanceSensitivity = 0.02f;
+    sigma.maxStabilizedFrameNum = 5;
+    nrd::SetDenoiserSettings(*c->instance, nrd::Identifier(nrd::Denoiser::SIGMA_SHADOW), &sigma);
 
     if (recreatePools(c, width, height) != 0) {
         destroyAll(c);
@@ -583,18 +576,24 @@ extern "C" int caustica_nrd_resize(void* ctx, uint32_t width, uint32_t height) {
     return recreatePools(c, width, height);
 }
 
-extern "C" int caustica_nrd_dispatch(
+extern "C" int caustica_nrd_dispatch_v2(
     void* ctx, uint64_t vk_command_buffer,
     uint64_t in_diff_image, uint64_t in_diff_view,
     uint64_t in_spec_image, uint64_t in_spec_view,
     uint64_t in_mv_image, uint64_t in_mv_view,
     uint64_t in_normal_image, uint64_t in_normal_view,
     uint64_t in_viewz_image, uint64_t in_viewz_view,
+    uint64_t in_shadow_image, uint64_t in_shadow_view,
+    uint64_t in_diff_conf_image, uint64_t in_diff_conf_view,
+    uint64_t in_spec_conf_image, uint64_t in_spec_conf_view,
+    uint64_t in_disocclusion_image, uint64_t in_disocclusion_view,
     uint64_t out_diff_image, uint64_t out_diff_view,
     uint64_t out_spec_image, uint64_t out_spec_view,
+    uint64_t out_shadow_image, uint64_t out_shadow_view,
     const float* view_to_clip, const float* view_to_clip_prev,
     const float* world_to_view, const float* world_to_view_prev,
     float jitter_x, float jitter_y, float jitter_x_prev, float jitter_y_prev,
+    float light_dir_x, float light_dir_y, float light_dir_z,
     uint32_t frame_index, int reset)
 {
     if (!ctx || !vk_command_buffer) return -1;
@@ -606,8 +605,21 @@ extern "C" int caustica_nrd_dispatch(
     setUserTex(c, nrd::ResourceType::IN_MV, (VkImage)in_mv_image, (VkImageView)in_mv_view);
     setUserTex(c, nrd::ResourceType::IN_NORMAL_ROUGHNESS, (VkImage)in_normal_image, (VkImageView)in_normal_view);
     setUserTex(c, nrd::ResourceType::IN_VIEWZ, (VkImage)in_viewz_image, (VkImageView)in_viewz_view);
+    setUserTex(c, nrd::ResourceType::IN_PENUMBRA, (VkImage)in_shadow_image, (VkImageView)in_shadow_view);
+    setUserTex(c, nrd::ResourceType::IN_DIFF_CONFIDENCE, (VkImage)in_diff_conf_image, (VkImageView)in_diff_conf_view);
+    setUserTex(c, nrd::ResourceType::IN_SPEC_CONFIDENCE, (VkImage)in_spec_conf_image, (VkImageView)in_spec_conf_view);
+    setUserTex(c, nrd::ResourceType::IN_DISOCCLUSION_THRESHOLD_MIX, (VkImage)in_disocclusion_image, (VkImageView)in_disocclusion_view);
     setUserTex(c, nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, (VkImage)out_diff_image, (VkImageView)out_diff_view);
     setUserTex(c, nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, (VkImage)out_spec_image, (VkImageView)out_spec_view);
+    setUserTex(c, nrd::ResourceType::OUT_SHADOW_TRANSLUCENCY, (VkImage)out_shadow_image, (VkImageView)out_shadow_view);
+
+    nrd::SigmaSettings sigma{};
+    sigma.lightDirection[0] = light_dir_x;
+    sigma.lightDirection[1] = light_dir_y;
+    sigma.lightDirection[2] = light_dir_z;
+    sigma.planeDistanceSensitivity = 0.02f;
+    sigma.maxStabilizedFrameNum = 5;
+    nrd::SetDenoiserSettings(*c->instance, nrd::Identifier(nrd::Denoiser::SIGMA_SHADOW), &sigma);
 
     nrd::CommonSettings cs{};
     std::memcpy(cs.viewToClipMatrix, view_to_clip, 16 * sizeof(float));
@@ -641,21 +653,23 @@ extern "C" int caustica_nrd_dispatch(
     cs.motionVectorScale[1] = 1.0f / float(c->height);
     cs.motionVectorScale[2] = 0.0f;
     cs.viewZScale = 1.0f;
-    // ULTRA-LOOSE disocclusion (v0.6.2): NEVER reject history unless absolutely forced.
-    // User feedback: still see grain with 0.055 threshold. New strategy: accept ANY history
-    // even if geometry completely changed. Only reject on hard resets (teleport/dimension change).
-    // This will cause ghosting but user explicitly prioritizes "zero visible noise" over correctness.
-    cs.disocclusionThreshold = 0.15f;           // ULTRA loose (was 0.055) - basically disabled
-    cs.disocclusionThresholdAlternate = 0.12f;  // also ultra-loose (was 0.045)
+    // Standard primary threshold plus an alternate selected by the application mix texture.
+    cs.disocclusionThreshold = 0.03f;
+    cs.disocclusionThresholdAlternate = 0.05f;
+    cs.isHistoryConfidenceAvailable = true;
+    cs.isDisocclusionThresholdMixAvailable = true;
     cs.isMotionVectorInWorldSpace = false;
     cs.enableValidation = false;
 
     if (nrd::SetCommonSettings(*c->instance, cs) != nrd::Result::SUCCESS) return -2;
 
-    nrd::Identifier id = nrd::Identifier(nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR);
+    nrd::Identifier ids[] = {
+        nrd::Identifier(nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR),
+        nrd::Identifier(nrd::Denoiser::SIGMA_SHADOW),
+    };
     const nrd::DispatchDesc* dispatches = nullptr;
     uint32_t nDisp = 0;
-    if (nrd::GetComputeDispatches(*c->instance, &id, 1, dispatches, nDisp) != nrd::Result::SUCCESS)
+    if (nrd::GetComputeDispatches(*c->instance, ids, 2, dispatches, nDisp) != nrd::Result::SUCCESS)
         return -3;
     for (uint32_t i = 0; i < nDisp; ++i) {
         dispatchOne(c, cmd, dispatches[i]);

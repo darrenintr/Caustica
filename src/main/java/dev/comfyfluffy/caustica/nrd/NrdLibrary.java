@@ -30,9 +30,14 @@ public final class NrdLibrary {
         this.resize = req(lookup, "caustica_nrd_resize",
                 FunctionDescriptor.of(ValueLayout.JAVA_INT,
                         ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
-        this.dispatch = req(lookup, "caustica_nrd_dispatch",
+        this.dispatch = req(lookup, "caustica_nrd_dispatch_v2",
                 FunctionDescriptor.of(ValueLayout.JAVA_INT,
                         ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
+                        ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                        ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                        ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                        ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                        ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
                         ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
                         ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
                         ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
@@ -43,6 +48,7 @@ public final class NrdLibrary {
                         ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                         ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
                         ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
+                        ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
                         ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
     }
 
@@ -94,19 +100,27 @@ public final class NrdLibrary {
                         long inMvImg, long inMvView,
                         long inNormImg, long inNormView,
                         long inVzImg, long inVzView,
+                        long inShadowImg, long inShadowView,
+                        long inDiffConfImg, long inDiffConfView,
+                        long inSpecConfImg, long inSpecConfView,
+                        long inDisocclusionImg, long inDisocclusionView,
                         long outDiffImg, long outDiffView,
                         long outSpecImg, long outSpecView,
+                        long outShadowImg, long outShadowView,
                         MemorySegment viewToClip, MemorySegment viewToClipPrev,
                         MemorySegment worldToView, MemorySegment worldToViewPrev,
                         float jx, float jy, float jxPrev, float jyPrev,
+                        float lightDirX, float lightDirY, float lightDirZ,
                         int frameIndex, int reset) {
         try {
             return (int) dispatch.invokeExact(ctx, cmd,
                     inDiffImg, inDiffView, inSpecImg, inSpecView,
                     inMvImg, inMvView, inNormImg, inNormView, inVzImg, inVzView,
-                    outDiffImg, outDiffView, outSpecImg, outSpecView,
+                    inShadowImg, inShadowView, inDiffConfImg, inDiffConfView,
+                    inSpecConfImg, inSpecConfView, inDisocclusionImg, inDisocclusionView,
+                    outDiffImg, outDiffView, outSpecImg, outSpecView, outShadowImg, outShadowView,
                     viewToClip, viewToClipPrev, worldToView, worldToViewPrev,
-                    jx, jy, jxPrev, jyPrev, frameIndex, reset);
+                    jx, jy, jxPrev, jyPrev, lightDirX, lightDirY, lightDirZ, frameIndex, reset);
         } catch (Throwable t) {
             throw new IllegalStateException(t);
         }

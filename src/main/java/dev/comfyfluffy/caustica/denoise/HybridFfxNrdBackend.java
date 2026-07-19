@@ -70,6 +70,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     private RtImage shadowHit;
     private RtImage diffuse;
     private RtImage reflection;
+    private RtImage unshadowedDirect;
     private RtImage diffAlbedo;
     private RtImage specAlbedo;
     private RtImage beautyRawCopy; // pre-FFX beauty (for G recovery)
@@ -81,9 +82,16 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     private RtImage materialFlags;
     private RtImage clearEmission;
     private RtImage transmission;
+    private RtImage confidenceDisocclusion;
     private RtImage nrdNormalRough; // NRD best-fit packed normal+rough
     private RtImage nrdOutDiff;
     private RtImage nrdOutSpec;
+    private RtImage sigmaPenumbra;
+    private RtImage diffConfidence;
+    private RtImage specConfidence;
+    private RtImage disocclusionMix;
+    private RtImage demodulationMask;
+    private RtImage nrdOutShadow;
     /**
      * Dummy RG16F shadow-clean target for NRD-only (prepare never reads it when useRawLayers=1).
      * Avoids binding R8 raw shadow into a rg16f descriptor slot.
@@ -101,6 +109,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     private final float[] worldToView = new float[16];
     private final float[] worldToViewPrev = new float[16];
     private float jitterX, jitterY, jitterXPrev, jitterYPrev;
+    private float lightDirX, lightDirY = 1.0f, lightDirZ;
     private int nrdFrameIndex;
     private boolean nrdHardReset = true;
     private boolean haveCamera;
@@ -152,6 +161,20 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         this.diffuse = diffuse;
         this.reflection = reflection;
         // ffx.setSplitBuffers(shadowHit, diffuse, reflection);  // v0.6: FFX disabled
+    }
+
+    public void setUnshadowedDirectGuide(RtImage unshadowedDirect) {
+        this.unshadowedDirect = unshadowedDirect;
+    }
+
+    public void setConfidenceDisocclusionGuide(RtImage confidenceDisocclusion) {
+        this.confidenceDisocclusion = confidenceDisocclusion;
+    }
+
+    public void setLightDirection(float x, float y, float z) {
+        this.lightDirX = x;
+        this.lightDirY = y;
+        this.lightDirZ = z;
     }
 
     public void setSpecMotion(RtImage specMotion) {
@@ -311,10 +334,14 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         nrdNormalRough = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid nrd normal");
         nrdOutDiff = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid nrd out diff");
         nrdOutSpec = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid nrd out spec");
-        if (nrdOnly) {
-            dummyShadowClean = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16_SFLOAT,
-                    "nrd-only dummy shadow clean");
-        }
+        nrdOutShadow = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "nrd sigma shadow");
+        sigmaPenumbra = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16_SFLOAT, "nrd sigma penumbra");
+        diffConfidence = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R8_UNORM, "nrd diffuse confidence");
+        specConfidence = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R8_UNORM, "nrd specular confidence");
+        disocclusionMix = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R8_UNORM, "nrd disocclusion mix");
+        demodulationMask = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R8G8_UNORM, "nrd demodulation mask");
+        dummyShadowClean = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16_SFLOAT,
+                "nrd dummy shadow clean");
         transparencyMask = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R8_UNORM, "transparency mask");
         transparentResult = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "transparent denoised");
         this.width = width;
@@ -386,11 +413,14 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                 && reflection != null && inDepth != null && shadowForNrd != null && specForNrd != null
                 && nrdDiffuse != null && nrdSpecular != null && viewZ != null && nrdNormalRough != null
                 && diffAlbedo != null && specAlbedo != null && inNormal != null && transparencyMask != null
-                && materialFlags != null) {
+                && materialFlags != null && confidenceDisocclusion != null && sigmaPenumbra != null
+                && diffConfidence != null && specConfidence != null && disocclusionMix != null
+                && demodulationMask != null) {
             try {
                 bindPrepare(ctx, beautyRawCopy, diffuse, shadowHit, shadowForNrd, reflection, specForNrd, inDepth,
                         nrdDiffuse, nrdSpecular, viewZ, diffAlbedo, specAlbedo, inNormal, nrdNormalRough,
-                        transparencyMask, materialFlags);
+                        transparencyMask, materialFlags, confidenceDisocclusion, sigmaPenumbra,
+                        diffConfidence, specConfidence, disocclusionMix, demodulationMask);
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd,
                         nrdOnly ? "nrd-only prepare inputs" : "hybrid prepare NRD inputs")) {
                     VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, prepPipe);
@@ -417,7 +447,9 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                 // the transparent denoiser (transparencyMask) or NRD REBLUR (the rest); batching lets the
                 // GPU scheduler see them as one dependency group.
                 barriers(stack, cmd, nrdDiffuse.image, nrdSpecular.image, viewZ.image,
-                        nrdNormalRough.image, transparencyMask.image);
+                        nrdNormalRough.image, transparencyMask.image, sigmaPenumbra.image,
+                        diffConfidence.image, specConfidence.image, disocclusionMix.image,
+                        demodulationMask.image);
                 lastPrepareOk = true;
             } catch (Throwable t) {
                 CausticaMod.LOGGER.warn("Hybrid prepare_nrd_inputs failed", t);
@@ -471,10 +503,16 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                             inMotion.image, inMotion.view,
                             normalForNrd.image, normalForNrd.view,
                             viewZForNrd.image, viewZForNrd.view,
+                            sigmaPenumbra.image, sigmaPenumbra.view,
+                            diffConfidence.image, diffConfidence.view,
+                            specConfidence.image, specConfidence.view,
+                            disocclusionMix.image, disocclusionMix.view,
                             nrdOutDiff.image, nrdOutDiff.view,
                             nrdOutSpec.image, nrdOutSpec.view,
+                            nrdOutShadow.image, nrdOutShadow.view,
                             viewToClip, viewToClipPrev, worldToView, worldToViewPrev,
                             jitterX, jitterY, jitterXPrev, jitterYPrev,
+                            lightDirX, lightDirY, lightDirZ,
                             effectiveFrameIndex, nrdHardReset);
                     if (rc != 0) {
                         throw new IllegalStateException("nrd dispatch rc=" + rc);
@@ -486,17 +524,20 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                 // now all three are gated by a single vkCmdPipelineBarrier2KHR call so the driver
                 // schedules them as one dependency.
                 if (transparentResult != null) {
-                    barriers(stack, cmd, nrdOutDiff.image, nrdOutSpec.image, transparentResult.image);
+                    barriers(stack, cmd, nrdOutDiff.image, nrdOutSpec.image, nrdOutShadow.image,
+                            transparentResult.image);
                 } else {
-                    barriers(stack, cmd, nrdOutDiff.image, nrdOutSpec.image);
+                    barriers(stack, cmd, nrdOutDiff.image, nrdOutSpec.image, nrdOutShadow.image);
                 }
                 // Radiance: clear radiance = path-traced plate (pre-FFX raw) for sky; surface = NRD
                 RtImage clear = beautyRawCopy != null ? beautyRawCopy : ffxPlate;
                 if (compPipe != 0L && diffAlbedo != null && specAlbedo != null && clear != null &&
                     transparencyMask != null && transparentResult != null && clearEmission != null
-                    && transmission != null) {
+                    && transmission != null && nrdOutShadow != null && unshadowedDirect != null
+                    && demodulationMask != null) {
                     bindCompose(ctx, nrdOutDiff, nrdOutSpec, diffAlbedo, specAlbedo, inNormal, clear,
-                            transparencyMask, transparentResult, outColor, clearEmission, transmission);
+                            transparencyMask, transparentResult, outColor, clearEmission, transmission,
+                            nrdOutShadow, unshadowedDirect, demodulationMask);
                     try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "hybrid NRD compose beauty")) {
                         VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, compPipe);
                         VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, compLayout, 0,
@@ -659,6 +700,12 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
             nrdOutSpec.destroy();
             nrdOutSpec = null;
         }
+        if (nrdOutShadow != null) { nrdOutShadow.destroy(); nrdOutShadow = null; }
+        if (sigmaPenumbra != null) { sigmaPenumbra.destroy(); sigmaPenumbra = null; }
+        if (diffConfidence != null) { diffConfidence.destroy(); diffConfidence = null; }
+        if (specConfidence != null) { specConfidence.destroy(); specConfidence = null; }
+        if (disocclusionMix != null) { disocclusionMix.destroy(); disocclusionMix = null; }
+        if (demodulationMask != null) { demodulationMask.destroy(); demodulationMask = null; }
         if (dummyShadowClean != null) {
             dummyShadowClean.destroy();
             dummyShadowClean = null;
@@ -675,7 +722,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
 
     private void createComposePipeline(RtContext ctx) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            final int BINDINGS = 11; // + transparent inputs + explicit emission/transmission
+            final int BINDINGS = 14; // + SIGMA shadow, unshadowed direct, demodulation mask
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(BINDINGS, stack);
             for (int i = 0; i < BINDINGS; i++) {
                 binds.get(i).binding(i).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
@@ -739,10 +786,11 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
 
     private void bindCompose(RtContext ctx, RtImage diff, RtImage spec, RtImage diffAlb, RtImage specAlb,
                              RtImage normal, RtImage ffx, RtImage transMask, RtImage transResult,
-                             RtImage out, RtImage clearEmission, RtImage transmission) {
+                             RtImage out, RtImage clearEmission, RtImage transmission,
+                             RtImage sigmaShadow, RtImage unshadowedDirect, RtImage demodulationMask) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             RtImage[] imgs = {diff, spec, diffAlb, specAlb, normal, ffx, transMask, transResult, out,
-                    clearEmission, transmission};
+                    clearEmission, transmission, sigmaShadow, unshadowedDirect, demodulationMask};
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(imgs.length, stack);
             for (int i = 0; i < imgs.length; i++) {
                 VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
@@ -756,7 +804,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
 
     private void createPreparePipeline(RtContext ctx) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            final int BINDINGS = 16; // + gNrdNormalRough + gTransparencyMask + gMaterialFlags
+            final int BINDINGS = 22; // standard NRD inputs + confidence/disocclusion/demodulation
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(BINDINGS, stack);
             for (int i = 0; i < BINDINGS; i++) {
                 binds.get(i).binding(i).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
@@ -831,10 +879,14 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                              RtImage shadowClean, RtImage specRaw, RtImage specClean, RtImage depth,
                              RtImage nrdDiff, RtImage nrdSpec, RtImage vz,
                              RtImage diffAlb, RtImage specAlb, RtImage normal, RtImage nrdNormal,
-                             RtImage transMask, RtImage materialFlags) {
+                             RtImage transMask, RtImage materialFlags, RtImage confidenceDisocclusion,
+                             RtImage sigmaPenumbra, RtImage diffConfidence, RtImage specConfidence,
+                             RtImage disocclusionMix, RtImage demodulationMask) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             RtImage[] imgs = {beauty, unshadowed, shadowRaw, shadowClean, specRaw, specClean, depth,
-                    nrdDiff, nrdSpec, vz, diffAlb, specAlb, normal, nrdNormal, transMask, materialFlags};
+                    nrdDiff, nrdSpec, vz, diffAlb, specAlb, normal, nrdNormal, transMask, materialFlags,
+                    confidenceDisocclusion, sigmaPenumbra, diffConfidence, specConfidence,
+                    disocclusionMix, demodulationMask};
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(imgs.length, stack);
             for (int i = 0; i < imgs.length; i++) {
                 VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);

@@ -120,12 +120,18 @@ public final class RtComposite {
     // RR guides (6) + split lighting + ReSTIR (3) + light field SSBO (1) + ReSTIR GI (4).
     // Slots 0..8 images, 9 SSBO lights, 10-11 reservoir images, 12 SSBO light field,
     // 13-16 GI reservoir images (currA, currB, prevA, prevB).
-    private static final int GUIDE_COUNT = 22; // bindings 3..24 (guides + standard RT outputs)
+    private static final int GUIDE_COUNT = 23; // bindings 3..25 (guides + standard RT outputs)
 
     // ReSTIR Direct Illumination feature flag
     private static final boolean ENABLE_RESTIR_DI = true;
-    private static final boolean ENABLE_RESTIR_GI = true;
-    private static final boolean ENABLE_LIGHTFIELD_GI = true;
+    private static final boolean ENABLE_RESTIR_GI = false;
+    private static final boolean ENABLE_LIGHTFIELD_GI = false;
+    // Stable profiling baseline: keep VRS and pseudo-async compute out of the frame until their
+    // individual cost and synchronization behavior are measured in isolation.
+    private static final boolean ENABLE_VRS = false;
+    private static final boolean ENABLE_ASYNC_COMPUTE = false;
+    private static final boolean ENABLE_DRS = false;
+    private static final boolean ENABLE_ADAPTIVE_SPP = false;
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
     // the composite frame counter has advanced this far past it (so no in-flight frame still reads it).
@@ -136,15 +142,15 @@ public final class RtComposite {
     }
 
     private static int spp() {
-        return CausticaConfig.Rt.Composite.SPP.value();
+        return 1;
     }
 
     private static int maxBounces() {
-        return CausticaConfig.Rt.Composite.MAX_BOUNCES.value();
+        return 2;
     }
 
     private static float maxRayDistance() {
-        return CausticaConfig.Rt.Composite.MAX_RAY_DISTANCE.value();
+        return Math.min(CausticaConfig.Rt.Composite.MAX_RAY_DISTANCE.value(), 128.0f);
     }
 
     private static boolean waterWaves() {
@@ -354,6 +360,8 @@ public final class RtComposite {
     private RtImage gShadowHit;
     /** Diffuse + emissive + non-specular path radiance (unshadowed direct where applicable). */
     private RtImage gDiffuse;
+    /** Unshadowed sun/moon NEE, composed exactly once with SIGMA's visibility output. */
+    private RtImage gUnshadowedDirect;
     /** Specular / reflection-path radiance only. */
     private RtImage gReflection;
     private RtImage gClearEmission;
@@ -698,7 +706,7 @@ public final class RtComposite {
         }
 
         // Async Compute - lazy init (needs ctx)
-        if (asyncCompute == null && RtDeviceBringup.asyncComputeAvailable()) {
+        if (ENABLE_ASYNC_COMPUTE && asyncCompute == null && RtDeviceBringup.asyncComputeAvailable()) {
             try {
                 asyncCompute = RtAsyncCompute.tryCreate(ctx);
                 if (asyncCompute != null) {
@@ -1059,6 +1067,7 @@ public final class RtComposite {
         worldPipeline.setExtraStorageImage(19, gViewZ.view);
         worldPipeline.setExtraStorageImage(20, gConfidenceDisocclusion.view);
         worldPipeline.setExtraStorageImage(21, gMaterialFlags.view);
+        worldPipeline.setExtraStorageImage(22, gUnshadowedDirect.view);
     }
 
     private void destroyGuideImages() {
@@ -1093,6 +1102,10 @@ public final class RtComposite {
         if (gDiffuse != null) {
             gDiffuse.destroy();
             gDiffuse = null;
+        }
+        if (gUnshadowedDirect != null) {
+            gUnshadowedDirect.destroy();
+            gUnshadowedDirect = null;
         }
         if (gReflection != null) {
             gReflection.destroy();
@@ -1158,7 +1171,7 @@ public final class RtComposite {
         displayH = height;
 
         // Initialize DRS if enabled and not yet created
-        if (drs == null && CausticaConfig.Drs.ENABLED.value()) {
+        if (ENABLE_DRS && drs == null && CausticaConfig.Drs.ENABLED.value()) {
             try {
                 drs = new RtDynamicResolution();
                 drs.setDisplayResolution(width, height);
@@ -1239,6 +1252,7 @@ public final class RtComposite {
         // Split lighting for official FFX Denoiser (P1): shadow hit + diffuse + reflection.
         gShadowHit = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R8_UNORM, "split shadow hit " + renderW + "x" + renderH);
         gDiffuse = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "split diffuse " + renderW + "x" + renderH);
+        gUnshadowedDirect = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "unshadowed direct " + renderW + "x" + renderH);
         gReflection = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "split reflection " + renderW + "x" + renderH);
         gClearEmission = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "clear emission " + renderW + "x" + renderH);
         gTransmission = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "transmission radiance " + renderW + "x" + renderH);
@@ -1403,7 +1417,7 @@ public final class RtComposite {
             }
             // bit 3 = adaptive SPP master switch (default 0 = on). world.rgen bumps SPP to 2 for
             // transparent / water / emissive-adjacent pixels and leaves sky at SPP 1.
-            if (CausticaConfig.Rt.Composite.ADAPTIVE_SPP.value()) {
+            if (ENABLE_ADAPTIVE_SPP && CausticaConfig.Rt.Composite.ADAPTIVE_SPP.value()) {
                 flags |= 0b1000;
             }
             push.putInt(192, flags);
@@ -1464,9 +1478,9 @@ public final class RtComposite {
                     worldPipeline.setExtraStorageImage(11, reservoirImages.previous().view);
                 }
                 push.putInt(restirOffset, blockLightBuffer.count());
-                push.putInt(restirOffset + 4, 12);       // restirCandidates
-                push.putFloat(restirOffset + 8, 24.0f);  // restirMaxMTemporal (static lights)
-                push.putFloat(restirOffset + 12, 64.0f); // restirMaxMSpatial
+                push.putInt(restirOffset + 4, 4);        // bounded ReSTIR DI candidates
+                push.putFloat(restirOffset + 8, 12.0f);  // bounded temporal reservoir weight
+                push.putFloat(restirOffset + 12, 24.0f); // bounded spatial reservoir weight
                 if (frameCounter % 60 == 0) {
                     CausticaMod.LOGGER.info("ReSTIR DI: {} lights ({} static + {} dynamic)",
                             blockLightBuffer.count(),
@@ -1563,7 +1577,7 @@ public final class RtComposite {
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
 
             // Initialize VRS on first use (lazy init)
-            if (vrs == null && RtDeviceBringup.vrsEnabled()) {
+            if (ENABLE_VRS && vrs == null && RtDeviceBringup.vrsEnabled()) {
                 try {
                     vrs = new RtVariableRateShading(ctx);
                     CausticaMod.LOGGER.info("Variable Rate Shading lazy initialized");
@@ -1662,6 +1676,7 @@ public final class RtComposite {
                                 }
                             } else if (backend instanceof dev.comfyfluffy.caustica.denoise.HybridFfxNrdBackend hybrid) {
                                 hybrid.setSplitBuffers(gShadowHit, gDiffuse, gReflection);
+                                hybrid.setUnshadowedDirectGuide(gUnshadowedDirect);
                                 if (gSpecMotion != null) {
                                     hybrid.setSpecMotion(gSpecMotion);
                                 }
@@ -1680,6 +1695,10 @@ public final class RtComposite {
                                 if (gTransmission != null) {
                                     hybrid.setTransmissionGuide(gTransmission);
                                 }
+                                if (gConfidenceDisocclusion != null) {
+                                    hybrid.setConfidenceDisocclusionGuide(gConfidenceDisocclusion);
+                                }
+                                hybrid.setLightDirection(push.getFloat(224), push.getFloat(228), push.getFloat(232));
                                 // NRD needs camera-relative worldToView + camDelta so walking
                                 // does not leave milky trails; jitter must be UV not pixels.
                                 hybrid.setCameraFrame(frameViewRotation, frameProjection,

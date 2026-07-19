@@ -100,11 +100,17 @@ public final class NrdRuntime {
                                      long inMvImg, long inMvView,
                                      long inNormImg, long inNormView,
                                      long inVzImg, long inVzView,
+                                     long inShadowImg, long inShadowView,
+                                     long inDiffConfImg, long inDiffConfView,
+                                     long inSpecConfImg, long inSpecConfView,
+                                     long inDisocclusionImg, long inDisocclusionView,
                                      long outDiffImg, long outDiffView,
                                      long outSpecImg, long outSpecView,
+                                     long outShadowImg, long outShadowView,
                                      float[] viewToClip, float[] viewToClipPrev,
                                      float[] worldToView, float[] worldToViewPrev,
                                      float jx, float jy, float jxPrev, float jyPrev,
+                                     float lightDirX, float lightDirY, float lightDirZ,
                                      int frameIndex, boolean reset) {
         if (ctx.equals(MemorySegment.NULL) || lib == null) {
             return -1;
@@ -117,9 +123,12 @@ public final class NrdRuntime {
             return lib.dispatch(ctx, cmd,
                     inDiffImg, inDiffView, inSpecImg, inSpecView,
                     inMvImg, inMvView, inNormImg, inNormView, inVzImg, inVzView,
-                    outDiffImg, outDiffView, outSpecImg, outSpecView,
+                    inShadowImg, inShadowView, inDiffConfImg, inDiffConfView,
+                    inSpecConfImg, inSpecConfView, inDisocclusionImg, inDisocclusionView,
+                    outDiffImg, outDiffView, outSpecImg, outSpecView, outShadowImg, outShadowView,
                     vtc, vtcp, wtv, wtvp,
-                    jx, jy, jxPrev, jyPrev, frameIndex, reset ? 1 : 0);
+                    jx, jy, jxPrev, jyPrev, lightDirX, lightDirY, lightDirZ,
+                    frameIndex, reset ? 1 : 0);
         } catch (Throwable t) {
             CausticaMod.LOGGER.warn("NRD dispatch failed", t);
             return -2;
