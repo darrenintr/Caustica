@@ -355,9 +355,11 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
             long dev = ctx.vk().address();
             long phys = ctx.vk().getPhysicalDevice().address();
             int graphicsFamily = ctx.device().graphicsQueue().queueFamilyIndex();
-            int computeFamily = RtDeviceBringup.asyncComputeAvailable()
-                    ? RtDeviceBringup.computeQueueFamilyIndex() : -1;
-            NrdRuntime.INSTANCE.ensureContext(dev, phys, graphicsFamily, computeFamily, width, height);
+            // NRD commands are recorded into the graphics command buffer and submitted on
+            // the graphics queue.  The async-compute queue is not used by this backend yet;
+            // advertising it here makes the native shim create concurrent-sharing resources
+            // even though no ownership transfer is performed, which breaks on AMD drivers.
+            NrdRuntime.INSTANCE.ensureContext(dev, phys, graphicsFamily, -1, width, height);
         } catch (Throwable t) {
             CausticaMod.LOGGER.warn("NRD ensureContext at resize failed", t);
         }
@@ -500,9 +502,10 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                 long dev = ctx.vk().address();
                 long phys = ctx.vk().getPhysicalDevice().address();
                 int graphicsFamily = ctx.device().graphicsQueue().queueFamilyIndex();
-                int computeFamily = RtDeviceBringup.asyncComputeAvailable()
-                        ? RtDeviceBringup.computeQueueFamilyIndex() : -1;
-                if (!NrdRuntime.INSTANCE.ensureContext(dev, phys, graphicsFamily, computeFamily, width, height)) {
+                // Keep NRD on the queue that actually submits this command buffer.  A
+                // dedicated compute family is detected globally, but is not wired into the
+                // NRD submission/ownership-transfer path.
+                if (!NrdRuntime.INSTANCE.ensureContext(dev, phys, graphicsFamily, -1, width, height)) {
                     throw new IllegalStateException("NRD context not ready");
                 }
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "hybrid NRD REBLUR")) {
