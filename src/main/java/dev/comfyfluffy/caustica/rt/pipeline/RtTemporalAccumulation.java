@@ -30,6 +30,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
+import java.util.Arrays;
 
 import static dev.comfyfluffy.caustica.rt.RtContext.check;
 
@@ -71,7 +72,7 @@ public final class RtTemporalAccumulation {
     private final RtContext ctx;
     private final long descriptorSetLayout;
     private final long descriptorPool;
-    private final long descriptorSet;
+    private final long[] descriptorSets;
     private final long pipelineLayout;
     private final long pipeline;
     private final long sampler;
@@ -82,21 +83,17 @@ public final class RtTemporalAccumulation {
     private long frameCounter;
     private boolean historyCleared;
 
-    // Cached view handles from the last bind; re-bind only when an input view (or the history slot)
-    // changes. Inputs are stable across frames (same images), history rotates with frameCounter.
-    private long boundInColor;
-    private long boundInNormal;
-    private long boundInDepth;
-    private long boundInMotion;
-    private long boundOutAccum;
-    private long boundHistoryIn;
-    private long boundHistoryOut;
+    // Each history-ring state owns a descriptor set. Once populated, a set is never rewritten
+    // while an older frame may still be using it on the GPU.
+    private final long[][] boundViews;
 
-    private RtTemporalAccumulation(RtContext ctx, long dsl, long pool, long set, long layout, long pipeline, long sampler) {
+    private RtTemporalAccumulation(RtContext ctx, long dsl, long pool, long[] sets,
+                                   long layout, long pipeline, long sampler) {
         this.ctx = ctx;
         this.descriptorSetLayout = dsl;
         this.descriptorPool = pool;
-        this.descriptorSet = set;
+        this.descriptorSets = sets;
+        this.boundViews = new long[sets.length][7];
         this.pipelineLayout = layout;
         this.pipeline = pipeline;
         this.sampler = sampler;
@@ -128,20 +125,24 @@ public final class RtTemporalAccumulation {
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, dsl, "temporal accum descriptor set layout");
 
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(2, stack);
-            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(6);
-            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1);
+            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(6 * HISTORY_RING);
+            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(HISTORY_RING);
             VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default()
-                    .maxSets(1).pPoolSizes(poolSizes);
+                    .maxSets(HISTORY_RING).pPoolSizes(poolSizes);
             check(VK10.vkCreateDescriptorPool(vk, dpci, null, p), "vkCreateDescriptorPool(temporal accum)");
             long pool = p.get(0);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_POOL, pool, "temporal accum descriptor pool");
 
             VkDescriptorSetAllocateInfo dsai = VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
-                    .descriptorPool(pool).pSetLayouts(stack.longs(dsl));
-            LongBuffer pSet = stack.mallocLong(1);
+                    .descriptorPool(pool).pSetLayouts(stack.longs(dsl, dsl, dsl, dsl));
+            LongBuffer pSet = stack.mallocLong(HISTORY_RING);
             check(VK10.vkAllocateDescriptorSets(vk, dsai, pSet), "vkAllocateDescriptorSets(temporal accum)");
-            long set = pSet.get(0);
-            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, set, "temporal accum descriptor set");
+            long[] sets = new long[HISTORY_RING];
+            for (int i = 0; i < HISTORY_RING; i++) {
+                sets[i] = pSet.get(i);
+                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, sets[i],
+                        "temporal accum descriptor set " + i);
+            }
 
             VkPushConstantRange.Buffer pcr = VkPushConstantRange.calloc(1, stack)
                     .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(PUSH_BYTES);
@@ -167,7 +168,7 @@ public final class RtTemporalAccumulation {
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_PIPELINE, pipeline, "temporal accum compute pipeline");
             VK10.vkDestroyShaderModule(vk, module, null);
 
-            return new RtTemporalAccumulation(ctx, dsl, pool, set, layout, pipeline, sampler);
+            return new RtTemporalAccumulation(ctx, dsl, pool, sets, layout, pipeline, sampler);
         }
     }
 
@@ -190,9 +191,10 @@ public final class RtTemporalAccumulation {
         this.height = h;
         this.frameCounter = 0;
         this.historyCleared = false;
-        // Views change after realloc so the cached bindings are stale.
-        boundInColor = boundInNormal = boundInDepth = boundInMotion = 0L;
-        boundOutAccum = boundHistoryIn = boundHistoryOut = 0L;
+        // Views change after realloc so every ring-local binding cache is stale.
+        for (long[] views : boundViews) {
+            Arrays.fill(views, 0L);
+        }
     }
 
     /**
@@ -216,13 +218,13 @@ public final class RtTemporalAccumulation {
         int writeSlot = (int) (frameCounter % HISTORY_RING);
         long historyInView = history[readSlot].view;
         long historyOutView = history[writeSlot].view;
-        bind(stack, inColor.view, inNormal.view, inDepth.view, inMotion.view,
+        bind(stack, writeSlot, inColor.view, inNormal.view, inDepth.view, inMotion.view,
                 historyInView, outAccum.view, historyOutView);
 
         try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "temporal accumulate")) {
             VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
             VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout,
-                    0, stack.longs(descriptorSet), null);
+                    0, stack.longs(descriptorSets[writeSlot]), null);
             ByteBuffer push = stack.malloc(PUSH_BYTES);
             push.putFloat(0, mvScaleX);
             push.putFloat(4, mvScaleY);
@@ -242,20 +244,15 @@ public final class RtTemporalAccumulation {
         frameCounter++;
     }
 
-    private void bind(MemoryStack stack, long inColorView, long inNormalView, long inDepthView,
+    private void bind(MemoryStack stack, int setIndex,
+                       long inColorView, long inNormalView, long inDepthView,
                        long inMotionView, long historyInView, long outAccumView, long historyOutView) {
-        if (boundInColor == inColorView && boundInNormal == inNormalView && boundInDepth == inDepthView
-                && boundInMotion == inMotionView && boundOutAccum == outAccumView
-                && boundHistoryIn == historyInView && boundHistoryOut == historyOutView) {
+        long[] views = {inColorView, inNormalView, inDepthView, inMotionView,
+                historyInView, outAccumView, historyOutView};
+        if (Arrays.equals(boundViews[setIndex], views)) {
             return;
         }
-        boundInColor = inColorView;
-        boundInNormal = inNormalView;
-        boundInDepth = inDepthView;
-        boundInMotion = inMotionView;
-        boundOutAccum = outAccumView;
-        boundHistoryIn = historyInView;
-        boundHistoryOut = historyOutView;
+        long descriptorSet = descriptorSets[setIndex];
 
         long[] storageViews = {inColorView, inNormalView, inDepthView, inMotionView, outAccumView, historyOutView};
         int[] storageBindings = {0, 1, 2, 3, 5, 6};
@@ -271,6 +268,7 @@ public final class RtTemporalAccumulation {
         writes.get(6).sType$Default().dstSet(descriptorSet).dstBinding(4).descriptorCount(1)
                 .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(samplerInfo);
         VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
+        System.arraycopy(views, 0, boundViews[setIndex], 0, views.length);
     }
 
     private void clearHistoryToZero(MemoryStack stack, VkCommandBuffer cmd) {
@@ -288,6 +286,21 @@ public final class RtTemporalAccumulation {
                 VK10.vkCmdClearColorImage(cmd, history[i].image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                         black.get(0), range);
             }
+            VkImageMemoryBarrier2.Buffer barriers = VkImageMemoryBarrier2.calloc(HISTORY_RING, stack);
+            for (int i = 0; i < HISTORY_RING; i++) {
+                barriers.get(i).sType$Default()
+                        .srcStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
+                        .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                        .dstStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                        .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                        .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                        .newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                        .image(history[i].image)
+                        .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                                .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
+            }
+            KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd,
+                    VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
         }
     }
 

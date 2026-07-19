@@ -20,6 +20,12 @@ ray-tracing algorithm. Replace those contracts incrementally, then profile the r
    to derive its reverse-Z scale, so zero collapses that scale. The caller now supplies a positive far sentinel.
 5. The FSR blackout guard performed the same 4x4 global probe in every output invocation. It now performs a
    two-load per-pixel fail-open, avoiding tens of millions of redundant image reads at 1080p.
+6. CAS recorded a sharpen dispatch, rewrote that dispatch's descriptor set, and then recorded a copy-back
+   dispatch. It now records one immutable binding tuple and performs an explicitly synchronized image copy.
+7. TAAU and the four-slot temporal accumulator rotated history images through one descriptor set. Each history
+   direction/state now owns a stable set, so a CPU frame cannot rewrite descriptors still used by RADV.
+8. Temporal-history initialization either omitted the clear entirely (TAAU) or omitted transfer-to-compute
+   visibility after the clear. Both histories are now zeroed and synchronized before their first shader use.
 
 ## What should be refactored
 
@@ -43,9 +49,19 @@ Suggested boundaries:
 
 ### P1: make descriptors frame-safe by construction
 
-The immediate FFX paths are fixed, but other backends still deserve an audit for descriptor updates after bind
-and updates while previous frames are in flight. Prefer immutable per-size descriptor sets or a small
+The immediate FFX, CAS, TAAU, temporal-accumulation, transparent-material, hybrid-NRD, and firefly paths have
+been audited. Multi-pass/history directions use distinct sets; stable single-pass bindings are cached rather
+than rewritten every frame. Apply the same rule to new passes: prefer immutable per-size descriptor sets or a
 frames-in-flight ring. Do not depend on a driver copying descriptors during command recording.
+
+### P1: replace fragment VRS with an RT sample-budget map
+
+`RtVariableRateShading` generates a `VK_KHR_fragment_shading_rate` attachment, but the compositor records a
+ray-tracing dispatch rather than fragment shading and never attaches the image to dynamic rendering. The path
+is currently disabled, and enabling it would add compute work without reducing traced rays. Keep it disabled.
+If profiling shows coherent low-detail regions, replace it with a storage-image ray-budget map consumed by
+`world.rgen` to select ray count or reconstruction rate. Such a scheme needs temporal stability, edge-safe
+reconstruction, and an unbiased reference mode; fragment-VRS rate encodings are not an RT optimization.
 
 ### P2: real async compute only after graph extraction
 

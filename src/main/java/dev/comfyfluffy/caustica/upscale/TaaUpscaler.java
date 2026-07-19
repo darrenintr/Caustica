@@ -414,6 +414,7 @@ public final class TaaUpscaler implements Upscaler {
 
     private void clearImage(long cmd, RtImage image) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkCommandBuffer cb = new VkCommandBuffer(cmd, vkDevice.vkDevice());
             VkImageMemoryBarrier2.Buffer bar = VkImageMemoryBarrier2.calloc(1, stack);
             bar.get(0).sType$Default()
                     .srcStageMask(VK10.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
@@ -426,7 +427,25 @@ public final class TaaUpscaler implements Upscaler {
                     .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
                             .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
             org.lwjgl.vulkan.KHRSynchronization2.vkCmdPipelineBarrier2KHR(
-                    new VkCommandBuffer(cmd, vkDevice.vkDevice()),
+                    cb,
+                    VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(bar));
+
+            VkClearColorValue clear = VkClearColorValue.calloc(stack);
+            clear.float32(0, 0.0f).float32(1, 0.0f).float32(2, 0.0f).float32(3, 0.0f);
+            VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, stack);
+            range.get(0).aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+            VK10.vkCmdClearColorImage(cb, image.image, VK10.VK_IMAGE_LAYOUT_GENERAL, clear, range);
+
+            bar.get(0)
+                    .srcStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
+                    .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .dstStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                    .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                    .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                    .newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+            org.lwjgl.vulkan.KHRSynchronization2.vkCmdPipelineBarrier2KHR(
+                    cb,
                     VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(bar));
         }
     }

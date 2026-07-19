@@ -26,6 +26,7 @@ import org.lwjgl.vulkan.VkWriteDescriptorSet;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
+import java.util.Arrays;
 
 import static dev.comfyfluffy.caustica.rt.RtContext.check;
 
@@ -50,11 +51,13 @@ public final class TransparentMaterialDenoiser {
     // Spatial bilateral pass
     private long spatialDsl, spatialPool, spatialSet, spatialLayout, spatialPipeline;
     private RtImage spatialTemp;
+    private final long[] spatialBindings = new long[5];
 
     // Temporal accumulation pass
     private long temporalDsl, temporalPool, temporalSet, temporalLayout, temporalPipeline;
     private RtImage historyColor;
     private RtImage historyDepth;
+    private final long[] temporalBindings = new long[7];
     private boolean firstFrame = true;
 
     public TransparentMaterialDenoiser() {
@@ -200,6 +203,8 @@ public final class TransparentMaterialDenoiser {
             historyDepth.destroy();
             historyDepth = null;
         }
+        Arrays.fill(spatialBindings, 0L);
+        Arrays.fill(temporalBindings, 0L);
     }
 
     private void createSpatialPipeline(RtContext ctx) {
@@ -342,6 +347,10 @@ public final class TransparentMaterialDenoiser {
 
     private void bindSpatial(RtContext ctx, RtImage inColor, RtImage inNormal, RtImage inDepth,
                              RtImage mask, RtImage outTemp) {
+        long[] views = {inColor.view, inNormal.view, inDepth.view, mask.view, outTemp.view};
+        if (Arrays.equals(spatialBindings, views)) {
+            return;
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             RtImage[] imgs = {inColor, inNormal, inDepth, mask, outTemp};
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(imgs.length, stack);
@@ -352,11 +361,17 @@ public final class TransparentMaterialDenoiser {
                         .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(info);
             }
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
+            System.arraycopy(views, 0, spatialBindings, 0, views.length);
         }
     }
 
     private void bindTemporal(RtContext ctx, RtImage spatialIn, RtImage depth, RtImage motion,
                               RtImage mask, RtImage historyColor, RtImage historyDepth, RtImage out) {
+        long[] views = {spatialIn.view, depth.view, motion.view, mask.view,
+                historyColor.view, historyDepth.view, out.view};
+        if (Arrays.equals(temporalBindings, views)) {
+            return;
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             RtImage[] imgs = {spatialIn, depth, motion, mask, historyColor, historyDepth, out};
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(imgs.length, stack);
@@ -367,6 +382,7 @@ public final class TransparentMaterialDenoiser {
                         .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(info);
             }
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
+            System.arraycopy(views, 0, temporalBindings, 0, views.length);
         }
     }
 

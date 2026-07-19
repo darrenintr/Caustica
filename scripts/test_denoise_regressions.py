@@ -891,6 +891,36 @@ def test_multi_dispatch_passes_do_not_mutate_one_descriptor_set() -> None:
         "TAAU history ping-pong directions must use distinct descriptor sets"
     )
     assert "boundViews" in taau, "TAAU must not update stable descriptor sets while in flight"
+    temporal = read("src/main/java/dev/comfyfluffy/caustica/rt/pipeline/RtTemporalAccumulation.java")
+    assert "long[] descriptorSets" in temporal and "descriptorSets[writeSlot]" in temporal, (
+        "temporal history-ring states must own distinct descriptor sets"
+    )
+    clear_body = method_body(temporal, "private void clearHistoryToZero")
+    assert "VK_ACCESS_TRANSFER_WRITE_BIT" in clear_body and "VK_ACCESS_SHADER_READ_BIT" in clear_body, (
+        "cleared temporal history must be visible before compute reads it"
+    )
+    taau_clear = method_body(taau, "private void clearImage")
+    assert "vkCmdClearColorImage" in taau_clear and "VK_ACCESS_SHADER_READ_BIT" in taau_clear, (
+        "TAAU history initialization must clear memory and synchronize it for compute"
+    )
+    transparent = read("src/main/java/dev/comfyfluffy/caustica/denoise/TransparentMaterialDenoiser.java")
+    assert "spatialBindings" in transparent and "temporalBindings" in transparent, (
+        "transparent denoise passes must not rewrite stable descriptor sets every frame"
+    )
+    hybrid = read("src/main/java/dev/comfyfluffy/caustica/denoise/HybridFfxNrdBackend.java")
+    assert "prepBindings" in hybrid and "compBindings" in hybrid, (
+        "hybrid NRD passes must cache stable descriptor bindings"
+    )
+
+
+def test_vrs_restores_storage_layout_before_each_compute_write() -> None:
+    src = read("src/main/java/dev/comfyfluffy/caustica/rt/RtVariableRateShading.java")
+    body = method_body(src, "public void generateShadingRate")
+    assert "VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR" in body
+    assert ".newLayout(VK_IMAGE_LAYOUT_GENERAL)" in body, (
+        "VRS must return its attachment image to GENERAL before the next compute write"
+    )
+    assert "rateImageInAttachmentLayout" in body
 
 
 if __name__ == "__main__":
@@ -900,6 +930,7 @@ if __name__ == "__main__":
         test_amd_fidelityfx_preset_skips_nrd_and_pairs_fsr,
         test_fsr2_declares_required_storage_format_feature_and_valid_depth_range,
         test_multi_dispatch_passes_do_not_mutate_one_descriptor_set,
+        test_vrs_restores_storage_layout_before_each_compute_write,
         test_denoise_mode_legacy_svgf_alias_maps_to_ffx,
         test_denoise_backends_export_interface,
         test_denoise_selector_resolves_via_vendor_for_auto,

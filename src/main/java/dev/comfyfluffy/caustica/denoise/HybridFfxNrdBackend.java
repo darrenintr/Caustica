@@ -32,6 +32,7 @@ import org.lwjgl.vulkan.VkWriteDescriptorSet;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
+import java.util.Arrays;
 
 import static dev.comfyfluffy.caustica.rt.RtContext.check;
 
@@ -121,6 +122,8 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
 
     private long prepDsl, prepPool, prepSet, prepLayout, prepPipe;
     private long compDsl, compPool, compSet, compLayout, compPipe;
+    private final long[] prepBindings = new long[22];
+    private final long[] compBindings = new long[14];
 
     public HybridFfxNrdBackend() {
         this(false);
@@ -692,6 +695,8 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     }
 
     private void destroyImages() {
+        Arrays.fill(prepBindings, 0L);
+        Arrays.fill(compBindings, 0L);
         if (beautyRawCopy != null) {
             beautyRawCopy.destroy();
             beautyRawCopy = null;
@@ -812,9 +817,13 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                              RtImage normal, RtImage ffx, RtImage transMask, RtImage transResult,
                              RtImage out, RtImage clearEmission, RtImage transmission,
                              RtImage sigmaShadow, RtImage unshadowedDirect, RtImage demodulationMask) {
+        RtImage[] imgs = {diff, spec, diffAlb, specAlb, normal, ffx, transMask, transResult, out,
+                clearEmission, transmission, sigmaShadow, unshadowedDirect, demodulationMask};
+        long[] views = Arrays.stream(imgs).mapToLong(image -> image.view).toArray();
+        if (Arrays.equals(compBindings, views)) {
+            return;
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            RtImage[] imgs = {diff, spec, diffAlb, specAlb, normal, ffx, transMask, transResult, out,
-                    clearEmission, transmission, sigmaShadow, unshadowedDirect, demodulationMask};
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(imgs.length, stack);
             for (int i = 0; i < imgs.length; i++) {
                 VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
@@ -823,6 +832,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                         .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(info);
             }
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
+            System.arraycopy(views, 0, compBindings, 0, views.length);
         }
     }
 
@@ -906,11 +916,15 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                              RtImage transMask, RtImage materialFlags, RtImage confidenceDisocclusion,
                              RtImage sigmaPenumbra, RtImage diffConfidence, RtImage specConfidence,
                              RtImage disocclusionMix, RtImage demodulationMask) {
+        RtImage[] imgs = {beauty, unshadowed, shadowRaw, shadowClean, specRaw, specClean, depth,
+                nrdDiff, nrdSpec, vz, diffAlb, specAlb, normal, nrdNormal, transMask, materialFlags,
+                confidenceDisocclusion, sigmaPenumbra, diffConfidence, specConfidence,
+                disocclusionMix, demodulationMask};
+        long[] views = Arrays.stream(imgs).mapToLong(image -> image.view).toArray();
+        if (Arrays.equals(prepBindings, views)) {
+            return;
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            RtImage[] imgs = {beauty, unshadowed, shadowRaw, shadowClean, specRaw, specClean, depth,
-                    nrdDiff, nrdSpec, vz, diffAlb, specAlb, normal, nrdNormal, transMask, materialFlags,
-                    confidenceDisocclusion, sigmaPenumbra, diffConfidence, specConfidence,
-                    disocclusionMix, demodulationMask};
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(imgs.length, stack);
             for (int i = 0; i < imgs.length; i++) {
                 VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
@@ -919,6 +933,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                         .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(info);
             }
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
+            System.arraycopy(views, 0, prepBindings, 0, views.length);
         }
     }
 
