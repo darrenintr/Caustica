@@ -1217,10 +1217,12 @@ public final class RtComposite {
         renderSizeRrEnabled = reducedRender;
         renderSizeRrQuality = upscalerQuality;
 
-        // RT traces into an HDR (R16G16B16A16_SFLOAT) target so radiance > 1 survives to the display
-        // mapping seam. displayImage stays R8G8B8A8 to match the main target it is copied into
+        // Pure RGB beauty plates: B10G11R11_UFLOAT (32bpp) — half the bandwidth of RGBA16F while
+        // still carrying HDR radiance to the display mapping seam. Alpha is unused on this path.
+        // Guide buffers / NRD YCoCg packs / TAA history (depth-in-alpha) stay RGBA16F.
+        // displayImage stays R8G8B8A8 to match the main target it is copied into
         // (vkCmdCopyImage requires texel-size-compatible formats).
-        output = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "trace color " + renderW + "x" + renderH);
+        output = ctx.createStorageImage(renderW, renderH, RtContext.HDR_RADIANCE_FORMAT, "trace color " + renderW + "x" + renderH);
         // Firefly-killed radiance: 3x3 median over `output` (the path-tracer result).
         // Both NRD and TAAU read from this instead of `output` so SPP=1 fireflies
         // never enter temporal history or the final composite.
@@ -1228,7 +1230,7 @@ public final class RtComposite {
             fireflyKilled.destroy();
             fireflyKilled = null;
         }
-        fireflyKilled = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+        fireflyKilled = ctx.createStorageImage(renderW, renderH, RtContext.HDR_RADIANCE_FORMAT,
                 "firefly-killed radiance " + renderW + "x" + renderH);
         fireflyKill.ensureSized(ctx, renderW, renderH, fireflyKilled);
         // Denoised color: same size + format as output, lives at render res. The active backend owns its
@@ -1236,16 +1238,16 @@ public final class RtComposite {
         if (denoisedColor != null) {
             denoisedColor.destroy();
         }
-        denoisedColor = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+        denoisedColor = ctx.createStorageImage(renderW, renderH, RtContext.HDR_RADIANCE_FORMAT,
                 "denoise color " + renderW + "x" + renderH);
         // Temporal-accumulation visible output: same size + format as the noisy trace so it can
         // drop straight into the denoise/upscaler input slot. Allocated unconditionally (the
         // temporal pass is gated per-frame by temporalAccumEnabled()); the history ring lives in
-        // RtTemporalAccumulation and is sized lazily on its ensureSized().
+        // RtTemporalAccumulation (still RGBA16F — alpha carries depth) and is sized lazily on its ensureSized().
         if (accumulatedColor != null) {
             accumulatedColor.destroy();
         }
-        accumulatedColor = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+        accumulatedColor = ctx.createStorageImage(renderW, renderH, RtContext.HDR_RADIANCE_FORMAT,
                 "temporal accum color " + renderW + "x" + renderH);
         if (temporalAccum != null) {
             temporalAccum.ensureSized(renderW, renderH);
@@ -1272,8 +1274,9 @@ public final class RtComposite {
         gViewZ = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT, "view z " + renderW + "x" + renderH);
         gConfidenceDisocclusion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "confidence disocclusion " + renderW + "x" + renderH);
         gMaterialFlags = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_UINT, "material flags " + renderW + "x" + renderH);
-        // Display-res RT image the display mapper reads. Always present (DLSS-RR target, or blit-upscale fallback).
-        rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
+        // Display-res beauty the display mapper / exposure histogram read. Same pure-RGB HDR format as the
+        // render-res beauty chain (B10G11R11). Always present (DLSS-RR target, or blit-upscale fallback).
+        rrOutput = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "DLSS-RR output " + width + "x" + height);
         exposure.ensureResources(ctx);
 
         // ReSTIR Direct Illumination: reservoir images + light buffer. Real emissive blocks are
@@ -2019,7 +2022,7 @@ public final class RtComposite {
             atmosphereTransmittance(moonX, moonY, moonZ, trans);
             float moonStrength = smoothstep(0.04f, 0.22f, -sunY);
             float litFraction = 1.0f - Math.abs(moonPhase - 4.0f) / 4.0f; // 0 new .. 1 full
-            float moonPeak = 0.30f * (0.15f + 0.85f * litFraction);
+            float moonPeak = 0.20f * (0.15f + 0.85f * litFraction);
             lx = moonX; ly = moonY; lz = moonZ;
             rr = 0.30f * moonPeak * moonStrength * trans[0];
             rg = 0.36f * moonPeak * moonStrength * trans[1];

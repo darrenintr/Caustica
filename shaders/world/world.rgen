@@ -50,9 +50,9 @@
 // denoiser's job. With RR disabled the output is the raw noisy path trace — a reference view, not a
 // converged image.
 layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
-// HDR trace target (R16G16B16A16_SFLOAT): we write linear radiance which may exceed 1. The
+// HDR trace target (B10G11R11_UFLOAT, 32bpp pure RGB): linear radiance may exceed 1. The
 // HDR -> LDR tonemap happens later, at the display.comp seam, not here.
-layout(binding = 1, set = 0, rgba16f) uniform image2D outImage;
+layout(binding = 1, set = 0, r11f_g11f_b10f) uniform image2D outImage;
 // Guide buffers — first-hit (primary-visibility) attributes consumed by the denoiser/DLSS-RR. Written
 // every frame regardless of accumulation. gNormal.w carries roughness; gDepth carries HW reversed-Z depth.
 layout(binding = 3, set = 0, rgba16f) uniform image2D gNormal; // xyz world normal, w roughness
@@ -213,7 +213,7 @@ const float INV_PI = 0.31830988618;
 // The analytic sky (gradient + sun/moon discs + stars) is computed in world.rmiss. On a miss, raygen reads
 // payload.albedo and accumulates that sky radiance. The directional NEE light is pushed separately as
 // pc.lightDir / pc.lightRadiance / pc.sunDir.
-const float EMISSIVE_STRENGTH = 3.0; // HDR radiance of a full (level-15) emitter, modulated by albedo
+const float EMISSIVE_STRENGTH = 5.0; // HDR radiance of a full (level-15) emitter, modulated by albedo
 
 // Hybrid light-field GI base (vanilla sky/block levels). Tuned for SPP=1 outdoor grass stability:
 // keep under RT direct so we don't double-count sun NEE / ReSTIR, but high enough to kill grain.
