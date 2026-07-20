@@ -1388,7 +1388,14 @@ public final class RtComposite {
             boolean playablePath = !vendorTemporal && debugView == 0;
             float jitterX = 0f;
             float jitterY = 0f;
-            if (vendorTemporal || spatialUpscale) {
+            // 2026-07-20: the playable path (FFX denoise + 1:1 blit) was excluded from jitter
+            // generation because it was assumed to be raw + post-TAA. But FFX's whole-radiance
+            // temporal accumulator (reproject + resolve + atrous) needs per-frame sub-pixel
+            // input variance to smooth SPP-2 noise — without jitter, every frame samples the
+            // same sub-pixel, history == current, and the output is just the raw radiance
+            // (static scene looks identical frame-to-frame). Adding playablePath to the
+            // jitter branch so FFX on a FSR=off path actually has variance to smooth.
+            if (vendorTemporal || spatialUpscale || playablePath) {
                 CausticaJitter.INSTANCE.prepare(renderW, renderH, displayW);
                 jitterX = CausticaJitter.INSTANCE.jitterPixelsX() * jitterSignX();
                 jitterY = CausticaJitter.INSTANCE.jitterPixelsY() * jitterSignY();
