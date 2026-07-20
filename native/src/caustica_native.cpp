@@ -28,6 +28,7 @@
 #include <jni.h>
 #include <cstdio>
 #include <cstring>
+#include <dlfcn.h>
 
 // Phase 2: AMD FidelityFX SDK header. The FFX_SDK_PRESENT macro is defined by
 // CMakeLists.txt based on whether third_party/FidelityFX-SDK exists. When the SDK is
@@ -96,6 +97,84 @@ Java_dev_comfyfluffy_caustica_nativebridge_NativeBridge_ffxDenoiserVersion(
     // know the SDK integration is gated until they populate third_party/FidelityFX-SDK.
     return env->NewStringUTF("unavailable (FFX_SDK headers not present at build)");
 #endif
+}
+
+// Phase 3 verify (2026-07-20): dlopen the AMD FFX 2.x modular loader .so at the
+// absolute path the Java side extracted, and dlsym the six entry points. The
+// function is a pure lookup — we DO NOT call any of the resolved symbols yet.
+// The point is to confirm the .so is reachable and the six function pointers
+// are present on this machine; no actual denoiser path is taken from this probe.
+//
+// The function signature is on a single jstring argument (the absolute path),
+// the return is a jstring summary. We catch every failure case explicitly so
+// the Java log gets a single readable line and nothing in this path can crash
+// the JVM or MC.
+static const char* kAmdFfxSyms[] = {
+    "ffxConfigure",
+    "ffxCreateContext",
+    "ffxDestroyContext",
+    "ffxDispatch",
+    "ffxGetLastError",
+    "ffxQuery"
+};
+static constexpr int kAmdFfxSymCount = sizeof(kAmdFfxSyms) / sizeof(kAmdFfxSyms[0]);
+
+JNIEXPORT jstring JNICALL
+Java_dev_comfyfluffy_caustica_nativebridge_NativeBridge_amdFfxLoaderCheck(
+        JNIEnv* env, jclass /*clazz*/, jstring jPath) {
+    if (jPath == nullptr) {
+        return env->NewStringUTF("error: null path");
+    }
+
+    // GetStringUTFChars returns a C-string. We MUST ReleaseStringUTFChars even on
+    // the early-return paths below, or we leak JVM-internal char-array memory.
+    const char* path = env->GetStringUTFChars(jPath, nullptr);
+    if (path == nullptr) {
+        return env->NewStringUTF("error: GetStringUTFChars failed");
+    }
+
+    char outBuf[256];
+    outBuf[0] = '\0';
+
+    // RTLD_NOW resolves all symbols at load time so any missing dependency fails
+    // dlopen, not deep in a dlsym later. RTLD_LOCAL keeps the loaded symbols local
+    // to our .so — AMD's loader is not something we want exposed to other
+    // dlopened libraries in the same process.
+    void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+        const char* err = dlerror();
+        std::snprintf(outBuf, sizeof(outBuf), "dlopen failed: %s",
+                      err ? err : "(no dlerror)");
+        env->ReleaseStringUTFChars(jPath, path);
+        return env->NewStringUTF(outBuf);
+    }
+
+    // Walk the six expected symbols and report which are present / missing.
+    int present = 0;
+    char missing[256];
+    missing[0] = '\0';
+    for (int i = 0; i < kAmdFfxSymCount; ++i) {
+        void* sym = dlsym(handle, kAmdFfxSyms[i]);
+        if (sym == nullptr) {
+            // Build a comma-separated "missing: a, b, c" string. Keep it short.
+            const char* suffix = (missing[0] == '\0') ? "" : ", ";
+            std::strncat(missing, suffix, sizeof(missing) - std::strlen(missing) - 1);
+            std::strncat(missing, kAmdFfxSyms[i], sizeof(missing) - std::strlen(missing) - 1);
+        } else {
+            ++present;
+        }
+    }
+
+    if (missing[0] == '\0') {
+        std::snprintf(outBuf, sizeof(outBuf), "ok (%d/%d)", present, kAmdFfxSymCount);
+    } else {
+        std::snprintf(outBuf, sizeof(outBuf), "partial (%d/%d, missing: %s)",
+                      present, kAmdFfxSymCount, missing);
+    }
+
+    dlclose(handle);
+    env->ReleaseStringUTFChars(jPath, path);
+    return env->NewStringUTF(outBuf);
 }
 
 } // extern "C"

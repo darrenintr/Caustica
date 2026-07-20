@@ -48,5 +48,15 @@ public final class CausticaMod implements ModInitializer {
 		if (ffxVer != null) {
 			LOGGER.info("[caustica_native] ffxDenoiserVersion={}", ffxVer);
 		}
+
+		// Phase 3 verify (2026-07-20). Extracts libamd_fidelityfx_loader.so from the
+		// caustica-fsr/natives/<platform>/ resource tree and asks the C++ side to
+		// dlopen + dlsym the six AMD FFX 2.x modular API entry points. This is a
+		// minimum-viable readback — we do not yet call any of those symbols; the
+		// goal is to confirm the .so is reachable and the function pointers are
+		// present on this machine before we attempt to use them. If anything is
+		// missing, the GLSL denoise path stays the default.
+		String amdFfxCheck = NativeBridge.tryCheckAmdFfxLoader(LOGGER);
+		LOGGER.info("[caustica_native] {}", amdFfxCheck);
 	}
 }
