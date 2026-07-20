@@ -174,17 +174,16 @@ public final class NativeBridge {
     // ---------------------------------------------------------------------
 
     private static Path locateOrExtract() throws IOException {
-        // 1) Already extracted at a previous boot?
+        // 1) Resolve where the lib should live on disk (same path NgxRuntime uses).
         Path gameDir = FabricLoader.getInstance().getGameDir();
         Path target = gameDir.resolve(GAME_DIR_RELATIVE);
-        if (Files.isRegularFile(target)) {
-            return target;
-        }
 
-        // 2) Extract from classpath. The JAR's resources tree carries it under
-        //    /caustica/natives/<platform>/lib<LIB_NAME>.so. If it isn't there (e.g. a build
-        //    that skipped the cmake step), we can't load — return null and let the
-        //    caller fall back to the GLSL path.
+        // 2) Extract the bundled lib from the JAR. We don't short-circuit on an
+        //    already-existing file: the .so shipped inside the JAR can change between
+        //    builds (Phase 1 had a 15648-byte ping-only stub, Phase 2 added the
+        //    ffxDenoiserVersion symbol at 15856 bytes). If we returned early on file-
+        //    existence we'd silently load the stale copy from a previous run. The
+        //    cost of always re-writing is one small (~15 KB) write per boot.
         try (InputStream in = NativeBridge.class.getResourceAsStream(RESOURCE_PATH)) {
             if (in == null) {
                 return null;
@@ -194,9 +193,6 @@ public final class NativeBridge {
             try (InputStream copy = in) {
                 bytes = copy.readAllBytes();
             }
-            // Always write — extractBundledNatives() in NgxRuntime deliberately re-writes
-            // every boot; same behaviour here keeps the .so coherent with whatever
-            // happens to be sitting in the JAR.
             Files.write(target, bytes);
             return target;
         }
