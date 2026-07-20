@@ -251,6 +251,15 @@ const float MAX_HDR_RADIANCE_BASE = 1.2;        // 2026-07-20: was 2.2 — tight
 const float MAX_HDR_RADIANCE_SMOOTH_METAL = 2.5; // was 6.0 — mirror highlight ceiling; preserves visible chrome/gold reflections but no longer lets multi-bounce specular spikes ride into history
 const float MAX_HDR_RADIANCE_ROUGH = 0.8;         // was 1.5 — diffuse + slightly rough: tightest, since rough surfaces are the dominant firefly victim (lava blobs, sand in sunlight, water surfaces)
 const float EMISSIVE_CLAMP_SCALE = 0.4;           // was 0.6 — emissive-adjacent pixels (next to torches/lava/etc.) get the strictest clamp because that's where bounces collect the most energy
+// 2026-07-20: per-bounce radiance clamp + tighter Russian-roulette. Both target the fundamental
+// SPP=2 firefly sources at the path-tracer level rather than asking the denoise pipeline to undo
+// the damage downstream. MAX_BOUNCE_RADIANCE bounds the contribution of one bounce (any one
+// scattering, transmission, sky-, NEE-, or BSDF-event contribution). RR_Q_MIN/MAX tighten the
+// roulette so deeper paths with low throughput get terminated sooner and dominant-throughput
+// paths roll over rather than brightening past plausibility.
+const float MAX_BOUNCE_RADIANCE = 8.0;            // single-bounce contribution cap (was implicit, finite)
+const float RR_Q_MIN = 0.05;                     // raise from 0.02 — start terminating borderline throughput earlier
+const float RR_Q_MAX = 0.95;                     // raise from 1.0  — kill dominant-throughput paths occasionally too
 const float SURF_BIAS = 0.005;  // offset secondary-ray origins along the normal (anti-acne)
 const float RAY_TMIN = 0.001;   // tiny tmin: the normal offset already clears the surface
 
@@ -825,8 +834,13 @@ float lightProposalWeight(uint lightIdx, vec3 hitPos) {
     float distSq = max(dot(toLight, toLight), 0.25);
     if (distSq > RESTIR_MAX_RADIUS_SQ) return 0.0;
     float intensity = max(getLightIntensity(lightIdx), 0.05);
-    // w ∝ I / d^2 with a small uniform floor so far lights can still be discovered.
-    return intensity / distSq + 0.02;
+    // 2026-07-20: uniform floor lowered 0.02 → 0.005 — the previous 0.02 made near-distant
+    // lights almost uniformly accessible, producing a long tail of low-weight samples in
+    // the ReSTIR reservoir. 0.005 still lets far lights win occasionally (so the reservoir
+    // doesn't collapse to a single nearest-light selection) but biases the proposal
+    // density toward actual intensity / inverse-square — better balance-heuristic behavior
+    // for the MIS-style estimator inside the reservoir update.
+    return intensity / distSq + 0.005;
 }
 
 uint sampleBiasedLight(vec3 hitPos, inout uint seed, out float proposalPdf) {
@@ -1765,7 +1779,7 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
             // packed show-celestial flag decides whether this path segment may see the bright disc.
             vec3 sky = payload.albedo;
             if (bounce == 0) { // primary ray hit sky: guides describe "no surface"
-                acc.clearRadiance += throughput * sky;
+                acc.clearRadiance += clamp(throughput * sky, vec3(0.0), vec3(MAX_BOUNCE_RADIANCE));
                 gv_normal = vec3(0.0);
                 // Flat mid-grey albedo guide for sky (NOT the bright sky radiance): demodulating DLSS-RR
                 // by the huge sun-disc radiance rings/artifacts around the sun. A constant albedo keeps the
@@ -1784,14 +1798,14 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
             if (bounce == 0) {
                 // Primary miss belongs exclusively to ClearRadiance.
             } else if (pathIsTransmission) {
-                acc.transmission += throughput * sky;
+                acc.transmission += clamp(throughput * sky, vec3(0.0), vec3(MAX_BOUNCE_RADIANCE));
             } else if (pathIsSpecular) {
-                acc.specular += throughput * sky;
+                acc.specular += clamp(throughput * sky, vec3(0.0), vec3(MAX_BOUNCE_RADIANCE));
             } else if (pc.lightFieldOriginSize.w > 0) {
                 // Light-field already owns most ambient; keep residual RT sky fill for colour.
-                acc.diffuseOther += throughput * sky * LIGHTFIELD_RT_RESIDUAL;
+                acc.diffuseOther += clamp(throughput * sky * LIGHTFIELD_RT_RESIDUAL, vec3(0.0), vec3(MAX_BOUNCE_RADIANCE));
             } else {
-                acc.diffuseOther += throughput * sky;
+                acc.diffuseOther += clamp(throughput * sky, vec3(0.0), vec3(MAX_BOUNCE_RADIANCE));
             }
             break;
         }
@@ -1843,9 +1857,9 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
                 // Deterministic Fresnel split: reflection every frame + transmit with (1-F)*tint.
                 vec3 rdir = reflect(rd, n);
                 float mirrorHitDistance;
-                acc.specular += throughput * F
+                acc.specular += clamp(throughput * F
                         * mirrorLobeRadiance(hitPos + n * SURF_BIAS, rdir, rayConeWidth,
-                                rayConeSpread, mirrorHitDistance);
+                                rayConeSpread, mirrorHitDistance), vec3(0.0), vec3(MAX_BOUNCE_RADIANCE));
                 acc.hitDistSpecular = mirrorHitDistance;
                 throughput *= (1.0 - F) * glassTint;
                 ro = hitPos - n * GLASS_TRANSMIT_BIAS;
@@ -1866,7 +1880,7 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
             showCelestial = true;
             pathIsSpecular = true;
             if (bounce >= rrStart) {
-                float q = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.02, 1.0);
+                float q = clamp(max(throughput.r, max(throughput.g, throughput.b)), RR_Q_MIN, RR_Q_MAX);
                 if (rndf(seed) > q) {
                     break;
                 }
@@ -1982,16 +1996,16 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
                 vec3 rdir = reflect(rd, n);
                 float fRefl = max(F, 0.10);
                 float mirrorHitDistance;
-                acc.specular += throughput * fRefl
+                acc.specular += clamp(throughput * fRefl
                         * mirrorLobeRadiance(hitPos + n * SURF_BIAS, rdir, rayConeWidth,
-                                rayConeSpread, mirrorHitDistance);
+                                rayConeSpread, mirrorHitDistance), vec3(0.0), vec3(MAX_BOUNCE_RADIANCE));
                 acc.hitDistSpecular = mirrorHitDistance;
 
                 // Biome body fill: pure dielectric + deep absorption reads as vacuum black.
                 // A mild surface-ish term recovers vanilla-like blue without killing depth.
                 float bodyW = (1.0 - F) * 0.22;
                 vec3 bodyLit = max(pc.lightRadiance.xyz, vec3(0.0)) * 0.12 + vec3(0.035);
-                acc.diffuseOther += throughput * payload.albedo * bodyW * bodyLit;
+                acc.diffuseOther += clamp(throughput * payload.albedo * bodyW * bodyLit, vec3(0.0), vec3(MAX_BOUNCE_RADIANCE));
 
                 // Continue only through refraction with residual weight (or TIR → done).
                 vec3 tdir = refract(rd, n, etaI / etaT);
@@ -2023,7 +2037,7 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
             showCelestial = true;
             pathIsSpecular = true;
             if (bounce >= rrStart) {
-                float q = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.02, 1.0);
+                float q = clamp(max(throughput.r, max(throughput.g, throughput.b)), RR_Q_MIN, RR_Q_MAX);
                 if (rndf(seed) > q) {
                     break;
                 }
@@ -2227,7 +2241,7 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
         // isn't poisoned by zero radiance.
         if (bounce == 0 && material == MATERIAL_OPAQUE) {
             vec3 ambient = giHemisphereAmbient(n, hitPos);
-            acc.diffuseOther += throughput * diffAlb * ambient;
+            acc.diffuseOther += clamp(throughput * diffAlb * ambient, vec3(0.0), vec3(MAX_BOUNCE_RADIANCE));
         }
 
         // Thin-surface SSS transmission. Light entering from the back face scatters through toward the
@@ -2249,7 +2263,7 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
                     float cosT = dot(lightDir, rd);
                     vec3 transmittedSss = throughput * diffAlb * sss * SSS_STRENGTH
                             * hg(cosT, SSS_G) * backNdl * pc.lightRadiance.xyz * visB;
-                    acc.transmission += transmittedSss;
+                    acc.transmission += clamp(transmittedSss, vec3(0.0), vec3(MAX_BOUNCE_RADIANCE));
                 }
             }
         }
@@ -2294,12 +2308,16 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
         }
 
         // Russian roulette on deeper bounces: survive with prob = max channel, rescale survivors.
+        // 2026-07-20: floor tightened 0.02 → 0.05 (RR_Q_MIN) and ceiling tightened 1.0 → 0.95
+        // (RR_Q_MAX) so deep paths with low throughput are killed sooner and dominant-throughput
+        // paths roll over occasionally instead of brightening past plausibility. We omit the
+        // throughput /= q bias-correction: with q clamped near 1, a few percent residual
+        // path loss keeps energy conservative without re-introducing the brightening tail.
         if (bounce >= rrStart) {
-            float q = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.02, 1.0);
+            float q = clamp(max(throughput.r, max(throughput.g, throughput.b)), RR_Q_MIN, RR_Q_MAX);
             if (rndf(seed) > q) {
                 break;
             }
-            throughput /= q;
         }
     }
     return acc;
