@@ -114,6 +114,23 @@ public final class NativeBridge {
     public static native String ping();
 
     /**
+     * Returns the AMD FidelityFX Denoiser SDK version this build was compiled against,
+     * as a human-readable string (e.g. {@code "1.2.0 (10200)"}). The C++ side reads
+     * the {@code FFX_DENOISER_VERSION} macro from {@code ffx_denoiser.h}, which encodes
+     * major*10000 + minor*100 + patch.
+     *
+     * <p>Phase 2 (2026-07-20) readback: the SDK runtime is NOT linked yet, so this
+     * method only proves the header is reachable + its compile-time version constant is
+     * visible to the .so. If the SDK headers were missing at build time (the
+     * FFX_SDK_PRESENT macro in CMakeLists.txt was 0), the C++ side returns a stub
+     * string explaining why.
+     *
+     * <p>Throws {@link UnsatisfiedLinkError} if {@link #tryLoad} has not run or
+     * failed. Callers should gate with {@link #isLoaded()} first.
+     */
+    public static native String ffxDenoiserVersion();
+
+    /**
      * Convenience: {@link #tryLoad(Logger)} then {@link #ping()}. Returns
      * {@code null} on any failure. Used from {@code CausticaMod.onInitialize()}.
      */
@@ -127,6 +144,26 @@ public final class NativeBridge {
         } catch (Throwable t) {
             if (logger != null) {
                 logger.warn("[caustica_native] ping() threw after a clean load — unexpected", t);
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Convenience: {@link #tryLoad(Logger)} then {@link #ffxDenoiserVersion()}.
+     * Returns the SDK version string from the C++ readback, or {@code null} if the
+     * native half is unavailable.
+     */
+    public static String tryLoadAndFfxVersion(Logger logger) {
+        tryLoad(logger);
+        if (!LOADED) {
+            return null;
+        }
+        try {
+            return ffxDenoiserVersion();
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.warn("[caustica_native] ffxDenoiserVersion() threw after a clean load", t);
             }
             return null;
         }

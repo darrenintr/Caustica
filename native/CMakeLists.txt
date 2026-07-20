@@ -38,9 +38,41 @@ find_path(JNI_PLATFORM_INCLUDE_DIR jni_md.h
     HINTS "${JAVA_HOME}/include/bsd"
     HINTS "${JAVA_HOME}/include/aix"
     REQUIRED)
+
+# Phase 2 (2026-07-20): wire the AMD FidelityFX SDK headers. We are NOT linking the SDK
+# runtime in Phase 2 — that needs prebuilt static libs (libffx_denoiser_x64.a,
+# libffx_backend_vk_x64.a) and SPIR-V shader blobs which aren't on this machine yet.
+# What we DO: add the header path so caustica_native.cpp can #include <ffx_denoiser.h>
+# and report the SDK's compile-time version constant. That single fact — that the
+# header compiles into the .so — proves the SDK is reachable. Actual dispatch stays
+# a Phase 3 problem (would require linking the SDK runtime, see
+# native/ffx_denoiser/CMakeLists.txt for the full link block).
+#
+# The SDK repo layout is third_party/FidelityFX-SDK/Kits/FidelityFX/{denoisers,api}.
+# ffx_denoiser.h transitively #includes "../../api/include/ffx_api.h" — a relative
+# path that resolves from denoisers/include/. We add BOTH directories so the
+# transitive include resolves whether the compiler's cwd-based include lookup
+# fires (relative) or the absolute path is used.
+set(FFX_DENOISER_INCLUDE "${CMAKE_SOURCE_DIR}/../third_party/FidelityFX-SDK/Kits/FidelityFX/denoisers/include")
+set(FFX_API_INCLUDE     "${CMAKE_SOURCE_DIR}/../third_party/FidelityFX-SDK/Kits/FidelityFX/api/include")
+# Optional: skip FFX header addition if the SDK isn't checked out. We still succeed
+# the build, and caustica_native.cpp guards its #include on a FFX_SDK_PRESENT macro.
+if(NOT EXISTS "${FFX_DENOISER_INCLUDE}/ffx_denoiser.h")
+    message(STATUS "caustica_native: FFX SDK headers not found at ${FFX_DENOISER_INCLUDE}; "
+                    "ffxDenoiserVersion() will be a stub. Full SDK dispatch is Phase 3.")
+    set(FFX_DENOISER_INCLUDE "")
+    set(FFX_API_INCLUDE "")
+    add_compile_definitions(FFX_SDK_PRESENT=0)
+else()
+    message(STATUS "caustica_native: FFX SDK headers present at ${FFX_DENOISER_INCLUDE}")
+    add_compile_definitions(FFX_SDK_PRESENT=1)
+endif()
+
 target_include_directories(caustica_native PRIVATE
     ${JNI_INCLUDE_DIR}
-    ${JNI_PLATFORM_INCLUDE_DIR})
+    ${JNI_PLATFORM_INCLUDE_DIR}
+    ${FFX_DENOISER_INCLUDE}
+    ${FFX_API_INCLUDE})
 
 # Linux: only export JNI_OnLoad and the bridge's JNIEXPORT functions. Hides internal
 # symbols and shrinks the .so. Future Phase 2+ (FFX/NRD/Vulkan) will add explicit

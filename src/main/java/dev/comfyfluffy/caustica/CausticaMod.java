@@ -36,5 +36,17 @@ public final class CausticaMod implements ModInitializer {
 		} else {
 			LOGGER.info("[caustica_native] native half unavailable; using GLSL fallback");
 		}
+
+		// Phase 2 SDK header integration readback (2026-07-20). Calls into the C++ side
+		// which #include <ffx_denoiser.h> and returns the FFX_DENOISER_VERSION macro
+		// (e.g. "1.2.0 (10200)"). Proves the AMD FFX SDK headers are reachable from the
+		// build. The SDK runtime is NOT linked yet — that needs prebuilt static libs
+		// (libffx_denoiser_x64.a, libffx_backend_vk_x64.a) and SPIR-V shader blobs, both
+		// of which are out of scope for this turn. If the SDK headers were missing at
+		// build time the C++ returns a "unavailable" stub.
+		String ffxVer = NativeBridge.tryLoadAndFfxVersion(LOGGER);
+		if (ffxVer != null) {
+			LOGGER.info("[caustica_native] ffxDenoiserVersion={}", ffxVer);
+		}
 	}
 }
