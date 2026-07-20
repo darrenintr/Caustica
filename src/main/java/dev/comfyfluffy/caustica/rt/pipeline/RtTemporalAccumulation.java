@@ -205,8 +205,24 @@ public final class RtTemporalAccumulation {
      * frame. {@code mvScaleX/Y} are typically {@code 1/w, 1/h}.
      */
     public void dispatch(MemoryStack stack, VkCommandBuffer cmd, RtImage inColor, RtImage inNormal,
-                          RtImage inDepth, RtImage inMotion, float mvScaleX, float mvScaleY,
-                          float alpha, float disocclusionThreshold, RtImage outAccum) {
+                           RtImage inDepth, RtImage inMotion, float mvScaleX, float mvScaleY,
+                           float alpha, float disocclusionThreshold, RtImage outAccum) {
+        dispatch(stack, cmd, inColor, inNormal, inDepth, inMotion, mvScaleX, mvScaleY,
+                alpha, disocclusionThreshold, outAccum, true);
+    }
+
+    /**
+     * @param antiGhostBypass enables the legacy luma-ratio anti-ghost bypass (v0.6.23 block-break
+     *                        fix) for mostly-converged inputs. Denoise backends fed RAW SPP-1
+     *                        radiance must pass {@code false}: the luma heuristics misfire on
+     *                        per-frame Monte Carlo variance, history then tracks the current
+     *                        frame every frame and the accumulator never converges. Depth/normal
+     *                        disocclusion stays active either way.
+     */
+    public void dispatch(MemoryStack stack, VkCommandBuffer cmd, RtImage inColor, RtImage inNormal,
+                           RtImage inDepth, RtImage inMotion, float mvScaleX, float mvScaleY,
+                           float alpha, float disocclusionThreshold, RtImage outAccum,
+                           boolean antiGhostBypass) {
         if (history == null || history[0] == null) {
             return; // not sized yet
         }
@@ -231,7 +247,7 @@ public final class RtTemporalAccumulation {
             push.putFloat(8, disocclusionThreshold);
             push.putFloat(12, alpha);
             push.putFloat(16, frameCounter > 0 ? 1.0f : 0.0f);
-            push.putFloat(20, 0.0f);
+            push.putFloat(20, antiGhostBypass ? 1.0f : 0.0f);
             push.putFloat(24, 0.0f);
             push.putFloat(28, 0.0f);
             VK10.vkCmdPushConstants(cmd, pipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);

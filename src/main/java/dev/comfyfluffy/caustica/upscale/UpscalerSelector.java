@@ -99,11 +99,15 @@ public final class UpscalerSelector {
         Mode requested = CausticaConfig.Rt.Upscaler.MODE.valueEnum();
         // AMD FidelityFX denoise preset = FFX + FSR2 stack. Force FSR2 unless the user
         // explicitly chose OFF (debug 1:1). AUTO/TAAU/legacy modes all snap to FSR2.
-        if (CausticaConfig.Rt.Denoise.MODE.value() == CausticaConfig.DenoiserKind.AMD_FIDELITYFX
-                && requested != Mode.OFF) {
+        var denoiseMode = CausticaConfig.Rt.Denoise.MODE.value();
+        // AUTO also needs FSR2 when the GPU is AMD (autoPick resolves to AmdFidelityFxDenoiseBackend
+        // which is a pure FFX+FSR2 stack with no NRD native).
+        boolean needsFsr2Partner = denoiseMode == CausticaConfig.DenoiserKind.AMD_FIDELITYFX
+                || (denoiseMode == CausticaConfig.DenoiserKind.AUTO && gpu.vendor == GpuVendor.Vendor.AMD);
+        if (needsFsr2Partner && requested != Mode.OFF) {
             if (requested != Mode.FSR_3 && requested != Mode.FSR_4) {
-                LOGGER.info("AMD FidelityFX denoise preset active → forcing upscaler partner to FSR2 (was {})",
-                        requested.key);
+                LOGGER.info("Denoise mode {} on {} → forcing upscaler partner to FSR2 (was {})",
+                        denoiseMode.key(), gpu.vendor, requested.key);
             }
             requested = Mode.FSR_3;
         }

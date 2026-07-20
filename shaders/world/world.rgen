@@ -247,10 +247,10 @@ const float LIGHTFIELD_BLOCK_WARM = 0.35;   // torch color warmth mix into block
 // Lowered from 4.0 to 3.0 to 2.2 for more aggressive firefly suppression (SPP=1 noise reduction).
 // Material-aware adaptive clamping (v0.5.4): smooth metals get higher threshold (6.0), rough diffuse
 // surfaces get stricter clamp (1.5), emissive-adjacent pixels get even tighter (×0.6).
-const float MAX_HDR_RADIANCE_BASE = 2.2;
-const float MAX_HDR_RADIANCE_SMOOTH_METAL = 6.0;  // smooth metal specular highlights (legitimate)
-const float MAX_HDR_RADIANCE_ROUGH = 1.5;         // rough surfaces (stricter firefly suppression)
-const float EMISSIVE_CLAMP_SCALE = 0.6;           // near emissive blocks (most firefly-prone)
+const float MAX_HDR_RADIANCE_BASE = 1.2;        // 2026-07-20: was 2.2 — tighten so SPP=2 single-bounce hot pixels (brdf·radiance at grazing reflection on white surfaces) are clipped before they become fireflies
+const float MAX_HDR_RADIANCE_SMOOTH_METAL = 2.5; // was 6.0 — mirror highlight ceiling; preserves visible chrome/gold reflections but no longer lets multi-bounce specular spikes ride into history
+const float MAX_HDR_RADIANCE_ROUGH = 0.8;         // was 1.5 — diffuse + slightly rough: tightest, since rough surfaces are the dominant firefly victim (lava blobs, sand in sunlight, water surfaces)
+const float EMISSIVE_CLAMP_SCALE = 0.4;           // was 0.6 — emissive-adjacent pixels (next to torches/lava/etc.) get the strictest clamp because that's where bounces collect the most energy
 const float SURF_BIAS = 0.005;  // offset secondary-ray origins along the normal (anti-acne)
 const float RAY_TMIN = 0.001;   // tiny tmin: the normal offset already clears the surface
 
@@ -2459,14 +2459,13 @@ void main() {
     imageStore(gSpecAlbedo, pix, vec4(gv_specAlb, clamp(gv_metalness, 0.0, 1.0)));
     imageStore(gViewZ, pix, vec4(frameViewZ, 0.0, 0.0, 0.0));
 
-    // Motion vector: reproject this guide point through the previous frame's view-projection.
-    // The current position is the UNJITTERED pixel centre — MVJittered=0 (DLSS-RR's
-    // FEATURE_FLAGS deliberately omits MV_JITTERED, FSR/XeSS use the same convention).
-    // Using `jndc` here would write `MV = -jitter_in_render_pixels` for every static
-    // surface, so FFX reproject / DLSS-RR / FSR / XeSS would sample history from a
-    // different screen position each frame and the temporal accumulator would never
-    // converge — visible as a moving-camera smear. `ndc` is the unjittered pixel
-    // centre in [-1,1] (computed at the top of main()).
+    // Motion vector: project the SAME guide point through the current and previous
+    // jitter-free view-projection matrices.  "MV not jittered" describes the matrices,
+    // not the integer pixel centre.  The ray hit was sampled at jndc; subtracting the
+    // unjittered pixel centre (`ndc`) from the previous projection therefore injects
+    // the current Halton offset into gMotion even for a static camera.  Projecting the
+    // actual hit with curViewProj makes a static point exactly zero while FSR receives
+    // the sample offset separately through jitterOffset.
     // For a dynamic surface, previous-frame position is the current point minus its world-space
     // displacement; subtracting gv_motionObjDisp de-cameras the MV.
     // gv_motionObjDisp is the chit's PER-VERTEX displacement barycentric-interpolated at the hit (exact
@@ -2474,7 +2473,7 @@ void main() {
     vec3 prevPosCamRel = gv_motionHitCamRel + pc.camDelta - gv_motionObjDisp;
     vec4 prevClip = pc.prevViewProj * vec4(prevPosCamRel, 1.0);
     vec2 prevNdc = prevClip.xy / max(prevClip.w, 1e-6);
-    vec2 curNdc = ndc; // unjittered pixel centre — MVJittered=0 contract (was `jndc`; ghosting fix v0.5.3)
+    vec2 curNdc = curClip.xy / max(curClip.w, 1e-6);
     // Water MV guide: track the one-refraction hit (the floor seen through the
     // surface), not the water surface, so refracted content stops ghosting. We treat that hit as its own
     // feature: its screen motion is its own reprojection delta (prev - current projection). This is
@@ -2497,7 +2496,7 @@ void main() {
         motionZ = 0.0;
     }
     imageStore(gMotion, pix, vec4(motion, motionZ, 0.0));
-    vec2 specMotion = specularReflectionMotion(gv_hitCamRel + pc.camOffset, dir, ndc, size, rayConeSpread);
+    vec2 specMotion = specularReflectionMotion(gv_hitCamRel + pc.camOffset, dir, curNdc, size, rayConeSpread);
     imageStore(gSpecMotion, pix, vec4(specMotion, 0.0, 0.0));
 
     uint materialFlags = 0u;

@@ -95,6 +95,14 @@ public abstract class VulkanBackendMixin {
 		Collection<String> requested = args.get(0);
 		var augmented = new ArrayList<>(requested);
 		for (String extension : CAUSTICA_WANTED_EXTENSIONS) {
+			// NVX import/image-view handles belong exclusively to NGX.  Treating their
+			// absence as a generic upscaler failure produced false warnings on AMD even
+			// while FidelityFX was running successfully, and coupled device bring-up to
+			// an NVIDIA-only ABI for no reason.
+			boolean ngxOnly = extension.startsWith("VK_NVX_");
+			if (ngxOnly && !"NVIDIA".equalsIgnoreCase(physicalDevice.vendorName())) {
+				continue;
+			}
 			if (augmented.contains(extension)) {
 				continue;
 			}
@@ -102,7 +110,7 @@ public abstract class VulkanBackendMixin {
 				augmented.add(extension);
 				CausticaMod.LOGGER.info("Enabling device extension {} for the Caustica runtime", extension);
 			} else {
-				CausticaMod.LOGGER.warn("Device extension {} not supported by {} — upscaling will be unavailable",
+				CausticaMod.LOGGER.warn("Optional Caustica device extension {} is not supported by {}",
 						extension, physicalDevice.deviceName());
 			}
 		}

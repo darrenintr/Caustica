@@ -61,8 +61,36 @@ JAVA_HOME=/usr/lib/jvm/zulu-25 bash gradlew jar
 
 ### Still open
 - Official Denoiser **FULL** `dispatchShadows` / `dispatchReflections` (still probe/SPIR-V path)
-- FSR2: validate in-game create/dispatch; tune MV scale / jitter / near-far
 - Vendor FSR2 build tree into `third_party/` for reproducible CI
+
+## Progress (2026-07-20) — FFX input-spec conformance + stack completion
+
+The AMD FidelityFX stack is **enabled and playable**: `amd-fidelityfx` denoise mode pairs
+with classic FSR2, and AUTO on AMD GPUs resolves to it (NRD-only baseline retired).
+
+Input-spec fixes landed:
+- `world.rgen` MV projects the same jittered-ray hit through jitter-free current/previous
+  view-projection matrices — a static camera now yields exactly zero MV (the integer pixel
+  centre used to inject the Halton offset into `gMotion`).
+- FFX reproject shaders sample history at `current + motion` (gMotion is prev−cur in
+  render pixels); sign matches `temporal_accumulate` and FSR2's `motionVectorScale=1` path.
+- FSR2 receives the real render jitter after denoise (denoise does not un-jitter the grid);
+  Vulkan ray offset `(x,y)` maps to FSR `jitterOffset=(x,−y)`.
+- Jitter phase count truncates `8·(display/render)²` exactly like `ffxFsr2GetJitterPhaseCount`
+  (`ceil` desynced the internal lock sequence: 19 vs 18 phases at 605→908).
+- `vkCmdClearColorImage`/`vkCmdCopyImage` in the FFX backend are now followed by real
+  transfer→compute barriers; the first denoise frame no longer samples stale history on RADV.
+- FSR2's SDK RCAS is no longer followed by a second display-res CAS pass.
+- Non-NVIDIA devices no longer request `VK_NVX_*` (NGX-only) extensions.
+
+Stack completion:
+- `AmdFidelityFxDenoiseBackend` = Official FFX (shadow + reflection) → residual bilateral →
+  **`RtTemporalAccumulation` radiance temporal** (frame-safe 4-slot ring, MV/depth disocclusion).
+  This is the GI-history stage FSR2 cannot provide (it is an upscaler, not an SPP-1 denoiser).
+- **Reflection composite (bit1) re-enabled** behind `caustica.rt.denoise.ffxReflectionComposite`
+  (default true). The uninitialised-history bug that used to zero the plate was the missing
+  transfer barrier; the composite's ±2.0 delta cap and 0.35·beauty floor stay as fail-open guards.
+- `DenoiseBackendSelector` AUTO on AMD → `AmdFidelityFxDenoiseBackend` (no NRD native needed).
 
 ## Success criteria
 

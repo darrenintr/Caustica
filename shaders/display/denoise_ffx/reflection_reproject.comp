@@ -63,7 +63,8 @@ void main() {
 
     vec2 motionPx = imageLoad(gMotion, pix).xy;
     float motionLen = length(motionPx);
-    vec2 prevUv = (vec2(pix) + 0.5 - motionPx) * vec2(pc.invW, pc.invH);
+    // gMotion is previous - current in render pixels, so history is at current + motion.
+    vec2 prevUv = (vec2(pix) + 0.5 + motionPx) * vec2(pc.invW, pc.invH);
     bool offscreen = any(lessThan(prevUv, vec2(0.0))) || any(greaterThanEqual(prevUv, vec2(1.0)));
 
     vec3 histSpec = curSpec;

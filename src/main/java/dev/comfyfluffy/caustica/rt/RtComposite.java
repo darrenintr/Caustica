@@ -1660,7 +1660,9 @@ public final class RtComposite {
             // the rest of the room (which depends on that contribution for GI propagation) went
             // dark. Disabled by default -- can be re-enabled via a future `firefly_kill.enabled`
             // config flag once the discrimination heuristic improves (likely needs a depth/normal
-            // guard around the median).
+            // guard around the median). Per-denoiser backends (e.g. AmdFidelityFxDenoiseBackend)
+            // can opt in to running firefly_kill as their pre-pass step inside dispatch().
+            //
             // (Kept the dispatch point + image allocation + pipeline alive in case the future
             // flag lands; just not invoked here.)
             //if (fireflyKilled != null && output != null && fireflyKill.isReady()) {
@@ -1832,21 +1834,24 @@ public final class RtComposite {
                 }
             } else if (spatialUpscale && activeUpscaler.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH,
                     upscalerQuality, 0)) {
-                // FSR2/XeSS: upscale the *denoised* plate (Radiance NRD→FSR).
-                // Critical: NRD already resolved temporal AA onto a stable grid. Feeding the
-                // same Halton jitter FSR expects for raw samples makes the whole frame swim
-                // (camera shake). Pass zero jitter for post-denoise plates; keep real jitter
-                // only when FSR sees raw SPP-1 (no NRD/FFX).
+                // FSR2/XeSS: upscale the *denoised* plate (Radiance denoise → temporal upscale).
+                // Denoising does not undo the primary-ray sample position: depth, motion and
+                // colour remain on this frame's jittered render grid. FSR must therefore receive
+                // non-zero jitter every frame, including after denoise, or its history locks
+                // never see sub-pixel coverage.
+                //
+                // DLSS-RR receives (-jitterX, -jitterY) as de-jitter (= camera jitter). FSR2/XeSS
+                // also expect camera jitter semantics: the offset applied to the projection matrix,
+                // where +X shifts the camera right → objects appear left.  Caustica applies jitter
+                // to the RAY direction instead: +X shifts the ray right → the sample at pixel (x)
+                // reads from (x + jitterX).  This is the OPPOSITE effect of camera jitter, so the
+                // camera-equivalent jitter for all temporal upscalers is (-jitterX, -jitterY).
+                // TAAU is the exception: its shader knows the raw ray offset in render pixels.
                 float fsrJx;
                 float fsrJy;
                 if (activeUpscaler.mode() == UpscalerSelector.Mode.TAAU) {
-                    // TAAU receives the signed offset applied to primary rays, in render pixels;
-                    // its shader performs the inverse lookup explicitly.
                     fsrJx = jitterX;
                     fsrJy = jitterY;
-                } else if (lastDenoiseOn) {
-                    fsrJx = 0f;
-                    fsrJy = 0f;
                 } else {
                     fsrJx = -jitterX;
                     fsrJy = -jitterY;
@@ -1888,12 +1893,15 @@ public final class RtComposite {
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // rrOutput visible to exposure histogram
 
-            // Optional CAS polish after upscale. FSR2 already runs RCAS — keep this mild and fail-open.
-            // Skip when upscaler didn't produce a plate (avoid sharpening garbage).
+            // Optional CAS polish after upscale. Classic FSR2 already runs SDK RCAS at the
+            // configured strength; applying this second CAS pass amplified residual Monte Carlo
+            // grain (0.8 RCAS followed by 0.4 CAS in the reported log) and wasted a display-res
+            // compute dispatch. Keep the external pass for non-FSR implementations only.
             if (playablePath && debugView == 0
                     && CausticaConfig.Rt.Upscaler.SHARPEN.value()
                     && rrOutput != null
-                    && lastUpscalerPath) {
+                    && lastUpscalerPath
+                    && !(activeUpscaler instanceof dev.comfyfluffy.caustica.fsr.Fsr2ClassicUpscaler)) {
                 try {
                     casSharpen.ensureSized(displayW, displayH);
                     float sharpness = Math.min(0.45f, CausticaConfig.Rt.Upscaler.SHARPNESS.value() * 0.5f);

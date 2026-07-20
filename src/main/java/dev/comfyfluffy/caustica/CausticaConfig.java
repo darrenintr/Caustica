@@ -884,9 +884,23 @@ public final class CausticaConfig {
             // AABB clamp (not |curr-history| — that zeroed history on SPP-1).
             // 0.5 = responsive (more grain), 0.95 = smooth static but pan-ghost risk.
             // Range 0.0..1.0 inclusive; clamped at the binding.
+            // FFX-only tuning. Higher = more temporal smoothing on trusted static pixels.
+            // Default 0.82: enough for SPP-1 static convergence without the 0.95 "ghost trails
+            // while panning" regression (2026-07-14). Resolve still weights from variance +
+            // AABB clamp (not |curr-history| — that zeroed history on SPP-1).
+            // 0.5 = responsive (more grain), 0.95 = smooth static but pan-ghost risk.
+            // Range 0.0..1.0 inclusive; clamped at the binding.
             public static final FloatSetting FFX_TEMPORAL_WEIGHT_MAX =
                     clampedFloat("caustica.rt.denoise.ffxTemporalWeightMax", "denoise.ffx-temporal-weight-max",
                             0.82f, 0.0f, 1.0f);
+            // FFX reflection delta composite. The reflection reproject/spatial chain always keeps
+            // its history warm; this flag controls whether the cleaned reflection delta is applied
+            // to the beauty plate (denoise_composite bit1). It was disabled while uninitialised
+            // history could zero the frame — the transfer-barrier fix removed that root cause, and
+            // the composite keeps its ±2.0 delta cap + 0.35*beauty floor as fail-open guards.
+            // Disable to fall back to shadow-only FFX if a driver still misbehaves.
+            public static final BooleanSetting FFX_REFLECTION_COMPOSITE =
+                    bool("caustica.rt.denoise.ffxReflectionComposite", "denoise.ffx-reflection-composite", true);
 
             private Denoise() {
             }

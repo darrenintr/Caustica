@@ -1,5 +1,6 @@
 package dev.comfyfluffy.caustica.denoise;
 
+import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.ffx.denoiser.FfxDenoiserRuntime;
 import dev.comfyfluffy.caustica.rt.RtContext;
@@ -315,11 +316,14 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
             }
         }
 
-        // Reflection path still updates history for future use, but do NOT apply reflection delta
-        // until that path is proven not to zero the plate (same class of bug as shadow history).
+        // Reflection path updates history every frame so the delta is stable the first frame it is
+        // applied. The composite bit is config-gated: the uninitialised-history bug that used to
+        // zero the plate was the missing transfer→compute barrier after the history clear (fixed);
+        // the composite's ±2.0 delta cap and 0.35*beauty floor remain as fail-open guards.
         RtImage cleanRefl = rfSpatA;
         RtImage reflMv = (specMotion != null) ? specMotion : inMotion;
         boolean reflReset = hardReset || !reflHistoryValid;
+        boolean reflectionComposite = CausticaConfig.Rt.Denoise.FFX_REFLECTION_COMPOSITE.value();
         if (rfReproPipe != 0L && rfSpatPipe != 0L && historyRefl != null
                 && reflection != null && inNormal != null && inDepth != null && reflMv != null
                 && depthMip1 != null && depthPyrPipe != 0L) {
@@ -339,7 +343,9 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
                 reflHistoryValid = true;
                 barrier(stack, cmd, historyRefl.image);
                 lastCleanReflection = cleanRefl;
-                // intentionally not: flags |= 2;
+                if (reflectionComposite) {
+                    flags |= 2;
+                }
             } catch (Throwable t) {
                 CausticaMod.LOGGER.warn("OfficialFfx reflection path failed; ignored (shadow-only composite)", t);
             }
@@ -412,12 +418,13 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
                 VK10.vkCmdClearColorImage(cmd, rfSpatB.image, VK10.VK_IMAGE_LAYOUT_GENERAL, black, range);
             }
         }
-        if (historyShadow != null) {
-            barrier(stack, cmd, historyShadow.image);
-        }
-        if (shSpatA != null) {
-            barrier(stack, cmd, shSpatA.image);
-        }
+        // vkCmdClearColorImage is a TRANSFER write. A compute→compute barrier does
+        // not make those clears visible on RADV and left stale/random history in
+        // exactly the buffers sampled by the first denoise frame.
+        barrierTransferToCompute(stack, cmd,
+                historyShadow.image, shReproBuf.image, shSpatA.image, shSpatB.image,
+                shadowDense.image, historyRefl.image, rfReproBuf.image,
+                rfSpatA.image, rfSpatB.image);
     }
 
     private void downsampleDepth(MemoryStack stack, VkCommandBuffer cmd, RtContext ctx, long set,
@@ -778,8 +785,50 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
         KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, dep);
     }
 
+    private static void barrierTransferToCompute(MemoryStack stack, VkCommandBuffer cmd, long... images) {
+        VkImageMemoryBarrier2.Buffer barriers = VkImageMemoryBarrier2.calloc(images.length, stack);
+        for (int i = 0; i < images.length; i++) {
+            barriers.get(i).sType$Default()
+                    .srcStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
+                    .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .dstStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                    .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                    .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                    .newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                    .image(images[i])
+                    .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                            .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
+        }
+        KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd,
+                VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
+    }
+
     private static void copyImage(MemoryStack stack, VkCommandBuffer cmd, RtImage src, RtImage dst) {
-        barrier(stack, cmd, src.image);
+        // The source was written by compute and history dst was read by compute.
+        // Synchronize both hazards before the transfer copy; the old helper used a
+        // compute→compute barrier, which does not cover vkCmdCopyImage at all.
+        VkImageMemoryBarrier2.Buffer before = VkImageMemoryBarrier2.calloc(2, stack);
+        before.get(0).sType$Default()
+                .srcStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                .srcAccessMask(VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                .dstStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
+                .dstAccessMask(VK10.VK_ACCESS_TRANSFER_READ_BIT)
+                .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                .image(src.image)
+                .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
+        before.get(1).sType$Default()
+                .srcStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                .srcAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                .dstStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
+                .dstAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                .image(dst.image)
+                .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
+        KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd,
+                VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(before));
+
         VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
         region.get(0)
                 .srcSubresource(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0)
@@ -789,6 +838,6 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
                 .extent(it -> it.width(src.width).height(src.height).depth(1));
         VK10.vkCmdCopyImage(cmd, src.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                 dst.image, VK10.VK_IMAGE_LAYOUT_GENERAL, region);
-        barrier(stack, cmd, dst.image);
+        barrierTransferToCompute(stack, cmd, dst.image);
     }
 }

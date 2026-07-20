@@ -37,12 +37,14 @@ public final class CausticaJitter {
 
 	/**
 	 * Phase length for Halton(2,3). Matches FSR2's {@code ffxFsr2GetJitterPhaseCount}:
-	 * {@code 8 * (display/render)^2} (no artificial floor). Using a different length than FSR2
+	 * {@code int(8 * (display/render)^2)} (no artificial floor). The classic SDK truncates
+	 * the float to {@code int32_t}; using {@code ceil} makes 605→908 cycle over 19 phases
+	 * while FSR's internal lock sequence cycles over 18. Using a different length than FSR2
 	 * while reporting jitter to FSR2 caused static-camera swim / shake.
 	 */
 	private static int jitterPhaseCount(int renderWidth, int displayWidth) {
 		float ratio = (float) displayWidth / Math.max(1, renderWidth);
-		return Math.max(1, (int) Math.ceil(8.0f * ratio * ratio));
+		return Math.max(1, (int) (8.0f * ratio * ratio));
 	}
 
 	private static float halton(int index, int base) {

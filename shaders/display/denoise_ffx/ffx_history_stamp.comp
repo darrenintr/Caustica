@@ -1,0 +1,45 @@
+#version 460
+//
+// FFX-style history stamper (whole-radiance): packs the final atrous radiance
+// plate into the history ring buffer's RGBA16F slot, putting the current
+// device depth in .a so the next frame's ffx_reproject can run its
+// disocclusion test.
+//
+// Why a dedicated shader (2026-07-20):
+//   The Caustica beauty plate is B10G11R11_UFLOAT (no alpha). vkCmdCopyImage
+//   from that to RGBA16F leaves .a undefined — on RADV in practice it is 0.
+//   ffx_reproject then reads texture(samplerPrev, ...).a as prevDepth = 0,
+//   which fires `historyEmpty = true` (prevDepth <= 1e-6) → variance = 1.0 →
+//   trust dies → wHistory = 0 every single frame. The full official AMD FFX
+//   pipeline runs, but the temporal stage effectively sees no history, so
+//   SPP-whatever raw radiance leaks through. This shader writes .a directly
+//   from inDepth, eliminating the copy-image alpha hole.
+//
+// Input/output:
+//   b0 inColor    — final atrous radiance plate (B10G11R11).
+//   b1 inDepth    — current device depth (r32f). Sky is 0 (handled by reproject
+//                  early-return so this pixel never reads history).
+//   b2 outHistory — history slot for next frame (RGBA16F, .a = device depth).
+//
+// One dispatch, no push constant (no parameters needed).
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, r11f_g11f_b10f) readonly  uniform image2D inColor;
+layout(set = 0, binding = 1, r32f)         readonly  uniform image2D inDepth;
+layout(set = 0, binding = 2, rgba16f)       writeonly uniform image2D outHistory;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inColor);
+    if (pos.x >= size.x || pos.y >= size.y) {
+        return;
+    }
+
+    vec3 col = imageLoad(inColor, pos).rgb;
+    float d = imageLoad(inDepth, pos).r;
+
+    // Clamp negatives from HDR radiance over-quantisation; keep depth as-is so
+    // ffx_reproject's prevDepth test still produces the right sign (reversed-Z
+    // is in [0, 1] for terrain, 0 for sky).
+    imageStore(outHistory, pos, vec4(max(col, vec3(0.0)), d));
+}

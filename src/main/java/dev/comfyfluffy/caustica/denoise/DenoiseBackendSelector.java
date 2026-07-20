@@ -52,7 +52,6 @@ public final class DenoiseBackendSelector {
     private static synchronized CausticaDenoiseBackend resolve(com.mojang.blaze3d.vulkan.VulkanDevice device) {
         CausticaConfig.DenoiserKind mode = CausticaConfig.Rt.Denoise.MODE.value();
         CausticaDenoiseBackend backend = pick(mode, GpuVendor.detect());
-        backend.init(0L, 0L);
         active = backend;
         resolvedOnce = true;
         resolvedDevice = device;
@@ -79,18 +78,18 @@ public final class DenoiseBackendSelector {
         if (mode == CausticaConfig.DenoiserKind.NRD) {
             return tryCreate(new HybridFfxNrdBackend(true), gpu, false);
         }
-        // FFX-only: shadow+reflection + mild residual GI polish (no NRD).
+        // FFX-only: shadow+reflection + spatial/temporal radiance cleanup (no NRD).
         // Pure OfficialFfx leaves secondary/GI grain and can wash contact shadows;
         // AmdFidelityFx wraps the same FFX path with a residual bilateral for leftover noise.
         if (mode == CausticaConfig.DenoiserKind.FFX) {
-            CausticaMod.LOGGER.info("  → FFX shadow+reflection + residual GI polish (no NRD)");
+            CausticaMod.LOGGER.info("  → FFX shadow/reflection + temporal radiance cleanup (no NRD)");
             return tryCreate(new AmdFidelityFxDenoiseBackend(), gpu, true);
         }
-        // AMD FidelityFX preset: FFX shadow+reflection + residual GI polish. No NRD.
+        // AMD FidelityFX preset: FFX shadow/reflection + temporal radiance cleanup. No NRD.
         // UpscalerSelector forces FSR2 as the partner (unless user set upscaler OFF).
         if (mode == CausticaConfig.DenoiserKind.AMD_FIDELITYFX) {
             CausticaMod.LOGGER.info(
-                    "  → AMD FidelityFX stack (FFX shadow/refl + residual GI; forces FSR2 upscaler; no NRD)");
+                    "  → AMD FidelityFX stack (FFX split signals + temporal radiance; forces FSR2; no NRD)");
             return tryCreate(new AmdFidelityFxDenoiseBackend(), gpu, true);
         }
         CausticaMod.LOGGER.warn("Denoise mode={} unavailable; using Noop (raw RT)", mode.key());
@@ -99,7 +98,7 @@ public final class DenoiseBackendSelector {
 
     /**
      * Cross-vendor optimized denoiser selection for AUTO mode (Windows-optimized):
-     * - AMD: NRD-only while the FFX path is disabled/unreliable
+     * - AMD: AMD FidelityFX stack (FFX shadow/reflection + temporal radiance; pairs with FSR2)
      * - NVIDIA: Hybrid FFX+NRD (leverages NRD's quality on Tensor cores)
      * - Intel: NRD-only (XMX acceleration for REBLUR on Arc)
      * - Unknown: FFX with Bilateral fallback (Windows-friendly default)
@@ -108,9 +107,10 @@ public final class DenoiseBackendSelector {
         CausticaMod.LOGGER.info("AUTO mode: selecting optimal denoiser for GPU vendor {} (Windows-optimized)", gpu.vendor);
         return switch (gpu.vendor) {
             case AMD -> {
-                // Stable cross-vendor baseline until the disabled FFX path is proven again.
-                CausticaMod.LOGGER.info("  → NRD-only (AMD AUTO baseline; FFX bypassed)");
-                yield tryCreateNrdAuto(new HybridFfxNrdBackend(true), gpu);
+                // Pure FidelityFX stack on AMD: no NRD native dependency, FSR2 is the paired
+                // upscaler. The FFX path is enabled again (history/transfer barriers fixed).
+                CausticaMod.LOGGER.info("  → AMD FidelityFX stack (AMD AUTO; FFX + FSR2, no NRD)");
+                yield tryCreate(new AmdFidelityFxDenoiseBackend(), gpu, true);
             }
             case NVIDIA -> {
                 // Hybrid: FFX shadow/reflection + NRD REBLUR = best quality on RTX

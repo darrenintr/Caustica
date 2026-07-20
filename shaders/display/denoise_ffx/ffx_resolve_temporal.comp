@@ -115,6 +115,19 @@ void main() {
     }
     vec3 nMean = nSum / nCount;
 
+    // Soft firefly reduction on current before mix — tightened (2026-07-20): the previous
+    // 2.0x neighbour-max + 0.1 luma floor leaked too many single-pixel SPP=2 spikes
+    // into history. Drop the multiplier to 1.4 and the luma floor to 0.06 so a pixel
+    // needs to beat the neighbourhood max by only ~40% to be flagged. Mix ratio
+    // bumped from 0.80 to 0.92 so the squashed value is close enough to nMean that the
+    // AABB clamp downstream doesn't see it as a clampAmt spike and kill trust.
+    float currL = ffxLuma(currRadiance);
+    float nMeanL = ffxLuma(nMean);
+    float maxN = ffxLuma(nMax);
+    if (currL > maxN * 1.4 + 0.06) {
+        currRadiance = mix(currRadiance, nMean, 0.92);
+    }
+
     // Balanced AABB: wide enough for SPP-1 noise (so history can converge on
     // static faces) but tight enough that a mis-reprojected ghost gets clamped
     // hard and trust collapses via clampAmt.
@@ -133,14 +146,6 @@ void main() {
     // Large clamp → almost certainly a ghost. Kill trust hard.
     float clampAmt = clamp(length(historyRaw - history)
             / max(ffxLuma(historyRaw) + localL * 0.2, 0.05), 0.0, 1.0);
-
-    // Soft firefly reduction on current before mix.
-    float currL = ffxLuma(currRadiance);
-    float meanL = ffxLuma(nMean);
-    float maxN = ffxLuma(nMax);
-    if (currL > maxN * 2.0 + 0.1) {
-        currRadiance = mix(currRadiance, nMean, 0.80);
-    }
 
     // History weight from variance (depth + motion from reproject) + clamp.
     // variance 0.05 static → trust high
