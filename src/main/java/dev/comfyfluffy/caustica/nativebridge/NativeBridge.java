@@ -161,13 +161,13 @@ public final class NativeBridge {
      * or {@code "dlopen failed: <err>"} or {@code "lib not found in jar resources"}.
      */
     public static String tryCheckAmdFfxLoader(Logger logger) {
-        // Extract the AMD loader from the JAR's caustica-fsr resource tree. We use
-        // the same gameDir + always-rewrite approach as our own shim extraction:
-        // the file is small (~360K), rewriting is cheap, and skipping means a
-        // stale Phase 2 .so would mask Phase 3's signal.
+        // Extract the AMD loader from the JAR's caustica/natives/<platform>/ resource
+        // tree (NOT caustica-fsr — that's the post-extraction on-disk target used by
+        // FSR2, not the source path in the JAR). The .so is unconditional re-write so a
+        // stale Phase 2 .so doesn't mask Phase 3's signal.
         Path gameDir = FabricLoader.getInstance().getGameDir();
-        String amdRes = "/caustica-fsr/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
-        String amdRel = "caustica-fsr/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
+        String amdRes = "/caustica/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
+        String amdRel = "caustica/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
         Path amdTarget = gameDir.resolve(amdRel);
         try {
             try (InputStream in = NativeBridge.class.getResourceAsStream(amdRes)) {
