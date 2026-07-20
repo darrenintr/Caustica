@@ -316,6 +316,140 @@ sourceSets.main.resources.srcDir(files(ngxNativeGenRoot).builtBy(bundleNgxNative
 // (bundleFsrNatives, bundleXessNatives) and the -PfsrPlatforms / -PxessPlatforms flags are
 // dead config now. To re-enable, reintroduce the task block here alongside the Java backends.
 
+// libcaustica_native JNI scaffold (Phase 1, 2026-07-20). The native half is a single
+// `ping()` round-trip to prove cmake → ninja → jar → System.load → JNI call works
+// end-to-end; the C++ source intentionally does not touch any AMD FFX / NRD / Vulkan
+// SDK (header files aren't present on the build host yet).
+//
+// This task is OPTIONAL: if cmake / ninja are missing, or the configure / build
+// subprocess returns non-zero, the task logs a warning and produces no output. The jar
+// task always succeeds (the resources srcDir is empty in that case), and the Java
+// NativeBridge falls back to the existing GLSL path when the .so is absent.
+def buildNativeOutDir = layout.buildDirectory.dir("generated/native")
+def buildNative = tasks.register("buildNative") {
+	group = "build"
+	description = "Builds the libcaustica_native JNI scaffold via cmake+ninja and copies it into resources/caustica/natives/<platform>/. Skips with a warning if the toolchain is unavailable — never fails the main build."
+
+	inputs.dir file("native/src")
+	inputs.file file("native/CMakeLists.txt")
+	outputs.dir buildNativeOutDir
+
+	doLast {
+		try {
+			// Resolve the toolchain. cmake/ninja must be on PATH; JAVA_HOME / java.home
+			// must point at a JDK with jni.h + jni_md.h.
+			def javaHome = System.getProperty("java.home") ?: System.getenv("JAVA_HOME")
+			if (javaHome == null || javaHome.isEmpty()) {
+				logger.warn("buildNative: JAVA_HOME not set; skipping native build")
+				return
+			}
+
+			def cmake = ["cmake", "cmake3"].find { isExeOnPath(it) }
+			if (cmake == null) {
+				logger.warn("buildNative: cmake not on PATH; skipping native build")
+				return
+			}
+			def ninja = ["ninja", "ninja-build"].find { isExeOnPath(it) }
+			if (ninja == null) {
+				logger.warn("buildNative: ninja not on PATH; skipping native build")
+				return
+			}
+
+			// Platform routing — same naming as the AMD/Intel/NVIDIA natives.
+			def os = org.gradle.internal.os.OperatingSystem.current()
+			def arch = System.getProperty("os.arch", "").toLowerCase()
+			boolean x64 = arch == "x86_64" || arch == "amd64"
+			boolean aarch64 = arch == "aarch64" || arch == "arm64"
+			String platformDir
+			if (os.linux && x64) {
+				platformDir = "linux-x64"
+			} else if (os.linux && aarch64) {
+				platformDir = "linux-arm64"
+			} else if (os.windows && x64) {
+				platformDir = "windows-x64"
+			} else if (os.windows && aarch64) {
+				platformDir = "windows-arm64"
+			} else if (os.macOs && aarch64) {
+				platformDir = "macos-arm64"
+			} else if (os.macOs && x64) {
+				platformDir = "macos-x64"
+			} else {
+				logger.warn("buildNative: unsupported platform ${os}/${arch}; skipping")
+				return
+			}
+
+			// Configure + build. We do a clean configure every run so changing
+			// the platform or the cmake list isn't a cache-invalidation puzzle.
+			// NB: ProcessBuilder must receive String[]. A bare Groovy list literal is
+			// `List<Object>` (because `cmake` is a `def`); passing it to the typed-String
+			// constructor triggers `ArrayStoreException: element type mismatch` on JDK 25.
+			// `command(String...)` does the right conversion.
+			def buildDir = layout.buildDirectory.dir("native/build").get().asFile
+			if (buildDir.exists()) {
+				delete(buildDir)
+			}
+			def configureProc = new ProcessBuilder()
+					.command(cmake, "-S", "native", "-B", buildDir.absolutePath,
+							"-G", "Ninja", "-DJAVA_HOME=${javaHome}",
+							"-DCMAKE_BUILD_TYPE=Release")
+					.redirectErrorStream(true)
+					.start()
+			def configureOut = configureProc.inputStream.text
+			configureProc.waitFor()
+			if (configureProc.exitValue() != 0) {
+				logger.warn("buildNative: cmake configure failed (exit {}); skipping\n{}", configureProc.exitValue(), configureOut)
+				return
+			}
+
+			def buildProc = new ProcessBuilder()
+					.command(ninja, "-C", buildDir.absolutePath)
+					.redirectErrorStream(true)
+					.start()
+			def buildOut = buildProc.inputStream.text
+			buildProc.waitFor()
+			if (buildProc.exitValue() != 0) {
+				logger.warn("buildNative: ninja build failed (exit {}); skipping\n{}", buildProc.exitValue(), buildOut)
+				return
+			}
+
+			// Copy the .so into the resources tree that NativeBridge will extract
+			// from at runtime. The runtime expects /caustica/natives/<platform>/lib*.so.
+			def sharedLib = new File(buildDir, "libcaustica_native" + (os.windows ? ".dll" : ".so"))
+			if (!sharedLib.exists()) {
+				logger.warn("buildNative: expected ${sharedLib} not found; skipping")
+				return
+			}
+			def targetDir = new File(buildNativeOutDir.get().asFile, "caustica/natives/${platformDir}")
+			targetDir.mkdirs()
+			def target = new File(targetDir, sharedLib.name)
+			java.nio.file.Files.copy(sharedLib.toPath(), target.toPath(),
+					java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+			logger.lifecycle("buildNative: built ${target} (${sharedLib.length()} bytes)")
+		} catch (Throwable t) {
+			// Never fail the main build — the user constraint is "no failure".
+			logger.warn("buildNative: unexpected failure; continuing without native", t)
+		}
+	}
+}
+
+sourceSets.main.resources.srcDir(files(buildNativeOutDir).builtBy(buildNative))
+
+// Local helper: is `name` an executable on PATH?
+def isExeOnPath(String name) {
+	def path = System.getenv("PATH")
+	if (path == null) {
+		return false
+	}
+	for (String dir : path.split(File.pathSeparator)) {
+		if (dir == null || dir.isEmpty()) continue
+		def exe = new File(dir, name)
+		if (exe.isFile() && exe.canExecute()) {
+			return true
+		}
+	}
+	return false
+}
+
 tasks.withType(JavaCompile).configureEach {
 	it.options.release = 25
 }
