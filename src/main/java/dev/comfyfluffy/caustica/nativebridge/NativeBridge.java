@@ -168,6 +168,57 @@ public final class NativeBridge {
     public static native String amdFfxDenoiserQuery(String absolutePath);
 
     /**
+     * Convenience entry point for the denoiser-version verify: extract the AMD
+     * loader (same path as {@link #tryCheckAmdFfxLoader}), call the JNI, log the
+     * result. Catches every failure case so the verify cannot crash mod init.
+     */
+    public static String tryCheckAmdFfxDenoiser(Logger logger) {
+        Path gameDir = FabricLoader.getInstance().getGameDir();
+        String amdRes = "/caustica/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
+        String amdRel = "caustica/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
+        Path amdTarget = gameDir.resolve(amdRel);
+        // Same unconditional re-extract as the loader check: the file is small, and
+        // skipping means a stale .so would mask a real Phase 3 signal.
+        try {
+            try (InputStream in = NativeBridge.class.getResourceAsStream(amdRes)) {
+                if (in == null) {
+                    return "denoiser-query: not bundled in jar (resource missing: " + amdRes + ")";
+                }
+                Files.createDirectories(amdTarget.getParent());
+                byte[] bytes;
+                try (InputStream copy = in) {
+                    bytes = copy.readAllBytes();
+                }
+                Files.write(amdTarget, bytes);
+            }
+        } catch (IOException | SecurityException e) {
+            String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+            if (logger != null) {
+                logger.warn("[caustica_native] failed to extract AMD FFX loader for denoiser query: {}", msg);
+            }
+            return "denoiser-query: extract failed: " + msg;
+        }
+        try {
+            String result = amdFfxDenoiserQuery(amdTarget.toAbsolutePath().toString());
+            if (logger != null) {
+                logger.info("[caustica_native] amdFfxDenoiserQuery: {}", result);
+            }
+            return result;
+        } catch (UnsatisfiedLinkError ule) {
+            if (logger != null) {
+                logger.warn("[caustica_native] amdFfxDenoiserQuery threw — was caustica_native.so loaded?");
+            }
+            return "denoiser-query: caustica_native.so not loaded";
+        } catch (Throwable t) {
+            String msg = t.getMessage() != null ? t.getMessage() : t.toString();
+            if (logger != null) {
+                logger.warn("[caustica_native] amdFfxDenoiserQuery threw unexpected: {}", msg);
+            }
+            return "denoiser-query: jni call failed: " + msg;
+        }
+    }
+
+    /**
      * Phase 3 verify entry point: extract the AMD FFX 2.x modular loader
      * ({@code libamd_fidelityfx_loader.so}) from {@code caustica-fsr/natives/<platform>/},
      * pass the absolute path to the C++ side, and have the C++ side {@code dlopen} +
