@@ -58,5 +58,12 @@ public final class CausticaMod implements ModInitializer {
 		// missing, the GLSL denoise path stays the default.
 		String amdFfxCheck = NativeBridge.tryCheckAmdFfxLoader(LOGGER);
 		LOGGER.info("[caustica_native] {}", amdFfxCheck);
+
+		// Phase 3 follow-up: minimum real call into the AMD FFX 2.x modular API.
+		// dlopen the loader, ffxQuery for the denoiser effect (FFX_API_EFFECT_ID_DENOISER).
+		// Tells us whether the loader actually exposes a usable denoiser effect, not
+		// just six symbols. Still no Vulkan handles, no context, no dispatch.
+		String amdFfxDenoiser = NativeBridge.tryCheckAmdFfxDenoiser(LOGGER);
+		LOGGER.info("[caustica_native] {}", amdFfxDenoiser);
 	}
 }

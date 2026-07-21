@@ -147,6 +147,27 @@ public final class NativeBridge {
     public static native String amdFfxLoaderCheck(String absolutePath);
 
     /**
+     * Phase 3 follow-up (2026-07-20): minimum real call into the AMD FFX 2.x
+     * modular API. Opens the loader, calls {@code ffxQuery} with
+     * {@code FFX_API_QUERY_DESC_TYPE_GET_VERSIONS} for the denoiser effect ID
+     * (0x00050000u). Confirms the loader actually exposes the denoiser effect
+     * through the modular API — i.e. that there's a real denoiser to call, not
+     * just six symbols that may or may not back a real effect.
+     *
+     * <p>Does NOT create a context, does NOT dispatch, does NOT touch Vulkan
+     * resources. The worst case on failure is a non-zero return code in the log.
+     *
+     * <p>Returns one of:
+     * <ul>
+     *   <li>{@code "denoiser: ok (N versions)"} — N >= 1, real effect available</li>
+     *   <li>{@code "denoiser: rc=N (message)"} — query returned non-zero</li>
+     *   <li>{@code "denoiser: ffxQuery sym missing"} — symbol not in .so</li>
+     *   <li>{@code "denoiser: <dlopen-error>"} — same dlopen failure as amdFfxLoaderCheck</li>
+     * </ul>
+     */
+    public static native String amdFfxDenoiserQuery(String absolutePath);
+
+    /**
      * Phase 3 verify entry point: extract the AMD FFX 2.x modular loader
      * ({@code libamd_fidelityfx_loader.so}) from {@code caustica-fsr/natives/<platform>/},
      * pass the absolute path to the C++ side, and have the C++ side {@code dlopen} +

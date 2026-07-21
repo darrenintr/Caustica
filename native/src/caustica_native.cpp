@@ -177,4 +177,139 @@ Java_dev_comfyfluffy_caustica_nativebridge_NativeBridge_amdFfxLoaderCheck(
     return env->NewStringUTF(outBuf);
 }
 
+// Phase 3 follow-up (2026-07-20): "minimum real" call into the AMD FFX 2.x
+// modular API. We dlopen the loader, then call ffxQuery with
+// FFX_API_QUERY_DESC_TYPE_GET_VERSIONS for FFX_API_EFFECT_ID_DENOISER. This
+// confirms the loader actually exposes the denoiser effect through the modular
+// API (vs. just shipping the symbols with no actual effect). It is a real API
+// call (uses the resolved ffxQuery symbol), but it does NOT create a context,
+// dispatch work, or touch any Vulkan resource — so the worst case on failure
+// is a non-zero return code in the log, not a black screen.
+//
+// HEADER STRATEGY: this file already includes <ffx_denoiser.h> (the 1.x API,
+// for the FFX_DENOISER_VERSION readback). ffx_denoiser.h defines its own
+// ffxReturnCode_t and ffxApiHeader with different field layouts than the 2.x
+// modular API in <ffx_api.h>. Including both would be a type/layout collision.
+// We do NOT include <ffx_api.h> here; instead we reproduce the minimal layout
+// we need for the GET_VERSIONS desc, using void* and uint32_t for the opaque
+// types. The struct layouts below are checked against ffx_api.h lines 53-105
+// of the AMD SDK we cloned into third_party/FidelityFX-SDK/.
+static const char* kFfxQueryStr = "ffxQuery";
+static const char* kFfxGetLastErrorStr = "ffxGetLastError";
+
+// Effect ID we want to query: FFX_API_EFFECT_ID_DENOISER (0x00050000u) —
+// see ffx_api.h line 175. The 2.x modular API exposes Denoiser as one of
+// the shipped effect types. We don't include sub-version bytes — ffxQuery
+// with the bare ID is enough to learn "is this effect present?".
+static const uint64_t kDenoiserEffectId = 0x00050000u;
+
+// Forward-declared struct layouts that MUST match ffx_api.h. Verified by hand
+// against the AMD SDK we audited.
+//
+//   struct ffxApiHeader {
+//       ffxStructType_t type;   // uint64_t
+//       ffxApiHeader*    pNext;  // opaque *
+//   };
+//   struct ffxQueryDescGetVersions {
+//       ffxApiHeader header;
+//       uint64_t       createDescType;
+//       void*          device;
+//       uint64_t*      outputCount;
+//       uint64_t*      versionIds;
+//       const char**  versionNames;
+//   };
+//
+// On 64-bit Linux, the natural alignment of these fields leaves no padding
+// between them, so the size of ffxQueryDescGetVersions is 48 bytes. We lay them
+// out with an explicit packed-equivalent struct below. If AMD ever inserts
+// padding (e.g. a future field) this will silently misread and the query will
+// fail — but that only happens at SDK upgrade time and we can re-audit.
+struct FfxQueryHeader {
+    uint64_t type;
+    void*    pNext;
+};
+struct FfxQueryDescGetVersionsLayout {
+    FfxQueryHeader header;
+    uint64_t       createDescType;
+    void*          device;
+    uint64_t*      outputCount;
+    uint64_t*      versionIds;
+    const char**  versionNames;
+};
+
+// 2.x modular ffxQuery signature (from ffx_api.h line 160-161): takes a
+// context (may be null for global-state queries) and a desc header, returns
+// a 32-bit status code.
+typedef uint32_t (*PfnFfxQuery2x)(void* context, FfxQueryHeader* desc);
+// ffxGetLastError returns a const char* owned by the loader — do NOT free.
+typedef const char* (*PfnFfxGetLastError2x)(void);
+
+JNIEXPORT jstring JNICALL
+Java_dev_comfyfluffy_caustica_nativebridge_NativeBridge_amdFfxDenoiserQuery(
+        JNIEnv* env, jclass /*clazz*/, jstring jPath) {
+    if (jPath == nullptr) {
+        return env->NewStringUTF("denoiser: error: null path");
+    }
+    const char* path = env->GetStringUTFChars(jPath, nullptr);
+    if (path == nullptr) {
+        return env->NewStringUTF("denoiser: error: GetStringUTFChars failed");
+    }
+
+    char outBuf[256];
+    outBuf[0] = '\0';
+
+    // We open + close the .so around the call. ffxQuery with a null context
+    // hits the global state (per the API contract: "If context is null, query
+    // operates on any global state") which is the safest option when we don't
+    // yet have a context.
+    void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+        const char* err = dlerror();
+        std::snprintf(outBuf, sizeof(outBuf), "denoiser: dlopen failed: %s",
+                      err ? err : "(no dlerror)");
+        env->ReleaseStringUTFChars(jPath, path);
+        return env->NewStringUTF(outBuf);
+    }
+
+    // We need both ffxQuery and ffxGetLastError. ffxGetLastError returns a
+    // human-readable string pointer that is owned by the loader — we do NOT
+    // free it. Just print it.
+    auto queryFn = reinterpret_cast<PfnFfxQuery2x>(dlsym(handle, kFfxQueryStr));
+    if (queryFn == nullptr) {
+        dlclose(handle);
+        env->ReleaseStringUTFChars(jPath, path);
+        return env->NewStringUTF("denoiser: ffxQuery sym missing");
+    }
+    auto getErrFn = reinterpret_cast<PfnFfxGetLastError2x>(
+            dlsym(handle, kFfxGetLastErrorStr));
+
+    // Build the GET_VERSIONS desc. The loader tells us how many version entries
+    // exist for the denoiser effect. We only ask for the count (outputCount
+    // passed in by pointer; library writes the count back) — no name/id arrays
+    // needed for a "is this effect present?" check.
+    uint64_t count = 0;
+    FfxQueryDescGetVersionsLayout queryDesc{};
+    queryDesc.header.type        = 0x00000004u;  // FFX_API_QUERY_DESC_TYPE_GET_VERSIONS = 4u
+    queryDesc.header.pNext       = nullptr;
+    queryDesc.createDescType     = kDenoiserEffectId;
+    queryDesc.device             = nullptr;  // no device; query operates on global state
+    queryDesc.outputCount        = &count;
+    queryDesc.versionIds         = nullptr;
+    queryDesc.versionNames      = nullptr;
+
+    uint32_t rc = queryFn(nullptr, &queryDesc.header);
+    if (rc != 0) {
+        const char* err = (getErrFn != nullptr) ? getErrFn() : "(no ffxGetLastError)";
+        std::snprintf(outBuf, sizeof(outBuf), "denoiser: rc=%u (%s)",
+                      static_cast<unsigned>(rc), err ? err : "(null err)");
+    } else {
+        std::snprintf(outBuf, sizeof(outBuf), "denoiser: ok (%llu versions)",
+                      static_cast<unsigned long long>(count));
+    }
+
+    dlclose(handle);
+    env->ReleaseStringUTFChars(jPath, path);
+    return env->NewStringUTF(outBuf);
+}
+
 } // extern "C"
