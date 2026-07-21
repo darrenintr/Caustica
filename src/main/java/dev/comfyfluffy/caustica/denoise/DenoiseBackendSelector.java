@@ -60,9 +60,6 @@ public final class DenoiseBackendSelector {
     }
 
     private static CausticaDenoiseBackend pick(CausticaConfig.DenoiserKind mode, GpuVendor gpu) {
-        // WINDOWS-OPTIMIZED: Use FFX denoiser (native Windows/AMD support, better than NRD)
-        CausticaMod.LOGGER.info("Windows-optimized mode - using FFX denoiser for best performance");
-
         if (mode == CausticaConfig.DenoiserKind.OFF) {
             return NoopDenoiseBackend.INSTANCE;
         }
@@ -85,32 +82,28 @@ public final class DenoiseBackendSelector {
             CausticaMod.LOGGER.info("  → FFX shadow/reflection + temporal radiance cleanup (no NRD)");
             return tryCreate(new AmdFidelityFxDenoiseBackend(), gpu, true);
         }
-        // AMD FidelityFX preset: FFX shadow/reflection + temporal radiance cleanup. No NRD.
-        // UpscalerSelector forces FSR2 as the partner (unless user set upscaler OFF).
-        if (mode == CausticaConfig.DenoiserKind.AMD_FIDELITYFX) {
-            CausticaMod.LOGGER.info(
-                    "  → AMD FidelityFX stack (FFX split signals + temporal radiance; forces FSR2; no NRD)");
-            return tryCreate(new AmdFidelityFxDenoiseBackend(), gpu, true);
-        }
         CausticaMod.LOGGER.warn("Denoise mode={} unavailable; using Noop (raw RT)", mode.key());
         return NoopDenoiseBackend.INSTANCE;
     }
 
     /**
-     * Cross-vendor optimized denoiser selection for AUTO mode (Windows-optimized):
-     * - AMD: AMD FidelityFX stack (FFX shadow/reflection + temporal radiance; pairs with FSR2)
+     * Cross-vendor optimized denoiser selection for AUTO mode:
+     * - AMD: NRD-only (FFX 2.x modular API has no denoiser provider on this loader; NRD
+     *   is the only AMD path that actually runs on this build).
      * - NVIDIA: Hybrid FFX+NRD (leverages NRD's quality on Tensor cores)
      * - Intel: NRD-only (XMX acceleration for REBLUR on Arc)
-     * - Unknown: FFX with Bilateral fallback (Windows-friendly default)
+     * - Unknown: NRD with Bilateral fallback (we no longer recommend FFX as a default
+     *   since the 2.x modular API ships no denoiser provider on this loader).
      */
     private static CausticaDenoiseBackend autoPick(GpuVendor gpu) {
-        CausticaMod.LOGGER.info("AUTO mode: selecting optimal denoiser for GPU vendor {} (Windows-optimized)", gpu.vendor);
+        CausticaMod.LOGGER.info("AUTO mode: selecting optimal denoiser for GPU vendor {}", gpu.vendor);
         return switch (gpu.vendor) {
             case AMD -> {
-                // Pure FidelityFX stack on AMD: no NRD native dependency, FSR2 is the paired
-                // upscaler. The FFX path is enabled again (history/transfer barriers fixed).
-                CausticaMod.LOGGER.info("  → AMD FidelityFX stack (AMD AUTO; FFX + FSR2, no NRD)");
-                yield tryCreate(new AmdFidelityFxDenoiseBackend(), gpu, true);
+                // AMD path: NRD-only (HybridFfxNrdBackend(true) skips the FFX prepass).
+                // The 2.x modular loader we bundle does not ship a denoiser effect provider,
+                // so the legacy FFX/AMD_FIDELITYFX path is gone; NRD is what runs.
+                CausticaMod.LOGGER.info("  → NRD-only (AMD; FFX 2.x modular has no denoiser provider on this build)");
+                yield tryCreateNrdAuto(new HybridFfxNrdBackend(true), gpu);
             }
             case NVIDIA -> {
                 // Hybrid: FFX shadow/reflection + NRD REBLUR = best quality on RTX
@@ -123,9 +116,10 @@ public final class DenoiseBackendSelector {
                 yield tryCreateNrdAuto(new HybridFfxNrdBackend(true), gpu);
             }
             default -> {
-                // Unknown GPU: FFX with Bilateral fallback for Windows compatibility
-                CausticaMod.LOGGER.info("  → FFX-only (unknown GPU, Windows-friendly default)");
-                yield tryCreate(new OfficialFfxDenoiseBackend(), gpu, true);
+                // Unknown GPU: NRD with Bilateral fallback (FFX no longer recommended
+                // as a default since the 2.x modular API has no denoiser provider).
+                CausticaMod.LOGGER.info("  → NRD-only (unknown GPU)");
+                yield tryCreateNrdAuto(new HybridFfxNrdBackend(true), gpu);
             }
         };
     }

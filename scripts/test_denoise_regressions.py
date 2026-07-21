@@ -41,10 +41,14 @@ def test_denoise_mode_enum_exposes_auto_ffx_nrd_off() -> None:
     src = read("src/main/java/dev/comfyfluffy/caustica/CausticaConfig.java")
     assert "enum DenoiserKind" in src, "CausticaConfig must declare a DenoiserKind enum"
     body = method_body(src, "public enum DenoiserKind")
-    for name in ("AUTO", "FFX", "NRD", "OFF", "AMD_FIDELITYFX"):
+    for name in ("AUTO", "FFX", "NRD", "OFF", "HYBRID"):
         assert name in body, f"DenoiserKind must contain {name}"
-    assert '"amd-fidelityfx"' in body, (
-        "AMD_FIDELITYFX must publish the config key 'amd-fidelityfx'"
+    # AMD_FIDELITYFX was removed (commit 1, 2026-07-20) — the 2.x modular loader has no
+    # denoiser provider on this build, so the FFX-only AMD path is dead. AMD AUTO
+    # routes to NRD via DenoiseBackendSelector.autoPick. Legacy config key
+    # 'amd-fidelityfx' is now a fallback → AUTO rather than its own enum value.
+    assert "AMD_FIDELITYFX" not in body, (
+        "AMD_FIDELITYFX must be removed from DenoiserKind (use AUTO on AMD instead)"
     )
     assert 'EnumSetting<DenoiserKind> MODE = enumSetting(' in src, (
         "Rt.Denoise.MODE must be an EnumSetting<DenoiserKind> (not the legacy StringSetting)"
@@ -97,59 +101,48 @@ def test_ffx_p0_official_alignment_assets() -> None:
 
 
 def test_amd_fidelityfx_preset_skips_nrd_and_pairs_fsr() -> None:
-    """AMD FidelityFX Phase A = FFX + residual (no NRD) + FSR2 + CAS; no beauty TAA stack."""
+    """REPLACED 2026-07-20 (commit 1): the AMD FidelityFX FFX-only path is dead
+    (the 2.x modular loader we bundle has no denoiser effect provider, see
+    DenoiseBackendSelector.autoPick log). What we validate now is:
+      - the AMD_FIDELITYFX enum value is GONE from CausticaConfig.DenoiserKind
+      - the legacy 'amd-fidelityfx' key still falls through to AUTO in fromKey
+      - the DenoiseBackendSelector never references the removed enum
+      - UpscalerSelector no longer forces FSR2 for AMD AUTO (the AMD path is
+        NRD now, not FFX+FSR2)
+      - the pause-menu denoise-mode switch no longer offers 'amd-fidelityfx'
+    FFX file/class deletion and the FFX pause-menu switch removal happen in
+    commit 2. This commit just confirms AMD no longer routes through FFX.
+    """
+    src = read("src/main/java/dev/comfyfluffy/caustica/CausticaConfig.java")
+    body = method_body(src, "public enum DenoiserKind")
+    assert "AMD_FIDELITYFX" not in body, (
+        "AMD_FIDELITYFX must be removed from DenoiserKind (AMD AUTO routes to NRD)"
+    )
+    from_key = method_body(src, "public static DenoiserKind fromKey")
+    assert 'amd-fidelityfx' in from_key, (
+        "fromKey must still accept the 'amd-fidelityfx' legacy alias and route it to AUTO"
+    )
     selector = read("src/main/java/dev/comfyfluffy/caustica/denoise/DenoiseBackendSelector.java")
-    assert "AMD_FIDELITYFX" in selector and "AmdFidelityFxDenoiseBackend" in selector, (
-        "DenoiseBackendSelector must route AMD_FIDELITYFX to AmdFidelityFxDenoiseBackend"
+    pick_body = method_body(selector, "private static CausticaDenoiseBackend pick")
+    assert "AMD_FIDELITYFX" not in pick_body, (
+        "DenoiseBackendSelector.pick must not handle AMD_FIDELITYFX (removed enum value)"
     )
-    # FFX-only now also uses residual polish (SPP-1 GI grain without NRD is unusable).
-    ffx_body = method_body(selector, "private static CausticaDenoiseBackend pick")
-    assert "DenoiserKind.FFX" in ffx_body and "AmdFidelityFxDenoiseBackend" in ffx_body, (
-        "DenoiseBackendSelector must route FFX mode to AmdFidelityFxDenoiseBackend (residual GI polish)"
+    auto_body = method_body(selector, "private static CausticaDenoiseBackend autoPick")
+    assert "AmdFidelityFxDenoiseBackend" not in auto_body, (
+        "autoPick must NOT route AMD vendor to AmdFidelityFxDenoiseBackend (FFX dead)"
     )
-    assert "HybridFfxNrdBackend" in selector  # NRD path still exists for other modes
-    backend = read("src/main/java/dev/comfyfluffy/caustica/denoise/AmdFidelityFxDenoiseBackend.java")
-    assert "OfficialFfxDenoiseBackend" in backend and "BilateralDenoiseBackend" in backend, (
-        "AmdFidelityFxDenoiseBackend must compose Official FFX + residual polish"
-    )
-    assert "NrdRuntime" not in backend and "HybridFfxNrdBackend" not in backend, (
-        "AMD FidelityFX preset must not pull NRD"
+    video = read("src/main/java/dev/comfyfluffy/caustica/client/RtVideoOptions.java")
+    values_list = method_body(video, "private static OptionInstance<String> denoiseMode")
+    assert '"amd-fidelityfx"' not in values_list, (
+        "the pause-menu denoise-mode switch must no longer offer 'amd-fidelityfx'"
     )
     upsel = read("src/main/java/dev/comfyfluffy/caustica/upscale/UpscalerSelector.java")
-    assert "AMD_FIDELITYFX" in upsel and "Fsr2ClassicUpscaler" in upsel, (
-        "UpscalerSelector must force/prefer FSR2 when denoise preset is AMD_FIDELITYFX"
+    assert "AMD_FIDELITYFX" not in upsel, (
+        "UpscalerSelector must no longer reference the removed AMD_FIDELITYFX enum"
     )
-    assert "forcing upscaler partner to FSR2" in upsel, (
-        "AMD FidelityFX must force FSR2 partner (not only when AUTO)"
+    assert "forcing upscaler partner to FSR2" not in upsel, (
+        "UpscalerSelector must no longer force FSR2 (AMD AUTO now uses NRD, not FFX+FSR2)"
     )
-    fsr = read("src/main/java/dev/comfyfluffy/caustica/fsr/Fsr2ClassicUpscaler.java")
-    assert "fsr_blackout_guard" in fsr or "GUARD_SPV" in fsr, (
-        "FSR2 must ship a blackout fail-open guard"
-    )
-    assert (ROOT / "shaders/display/fsr_blackout_guard.comp").is_file(), (
-        "missing shaders/display/fsr_blackout_guard.comp"
-    )
-    assert "consumeBlackoutFailOpen" in read(
-        "src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java"
-    ), "RtComposite must fail-open blit when FSR2 blackout is latched"
-    cfg = read("src/main/java/dev/comfyfluffy/caustica/CausticaConfig.java")
-    assert 'FSR2("fsr2")' in cfg or 'FSR2("fsr2")' in method_body(cfg, "public enum UpscalerMode"), (
-        "UpscalerMode must expose FSR2 so the preset can request classic FSR"
-    )
-    composite = read("src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java")
-    body = method_body(composite, "private static boolean caustica$denoiseEnabled()")
-    assert "AMD_FIDELITYFX" in body, (
-        "caustica$denoiseEnabled must treat AMD_FIDELITYFX as an active forced denoise mode"
-    )
-    taa_body = method_body(composite, "private static boolean temporalAccumEnabled")
-    assert "AMD_FIDELITYFX" in taa_body and "return false" in taa_body, (
-        "temporalAccumEnabled must hard-disable beauty TAA for the AMD FidelityFX preset"
-    )
-    assert "CasSharpenPass" in composite and "casSharpen" in composite, (
-        "RtComposite must run CAS after upscale for the FidelityFX stack"
-    )
-    assert (ROOT / "shaders/display/cas.comp").is_file(), "CAS compute shader must exist"
-    assert (ROOT / "src/main/java/dev/comfyfluffy/caustica/display/CasSharpenPass.java").is_file()
 
 
 def test_denoise_mode_legacy_svgf_alias_maps_to_ffx() -> None:
@@ -840,14 +833,19 @@ def test_amd_fidelityfx_temporal_disables_luma_bypass() -> None:
 
 
 def test_auto_mode_amd_uses_fidelityfx_stack() -> None:
-    """AUTO on AMD resolves to the FidelityFX stack again (NRD baseline retired)."""
+    """AUTO on AMD resolves to NRD (commit 1, 2026-07-20). The 2.x modular
+    loader does not ship a denoiser effect provider, so the legacy FFX-only
+    AMD FidelityFX stack is gone. AMD now uses the same NRD path as Intel/Unknown.
+    """
     src = read("src/main/java/dev/comfyfluffy/caustica/denoise/DenoiseBackendSelector.java")
     auto = method_body(src, "private static CausticaDenoiseBackend autoPick")
     amd_branch = auto.split("case AMD ->")[1].split("case ")[0]
-    assert "AmdFidelityFxDenoiseBackend" in amd_branch, (
-        "AUTO on AMD must yield the AmdFidelityFx stack (FFX + FSR2), not the NRD-only baseline"
+    assert "AmdFidelityFxDenoiseBackend" not in amd_branch, (
+        "AUTO on AMD must NOT route to AmdFidelityFxDenoiseBackend (FFX 2.x modular has no denoiser provider)"
     )
-    assert "FFX bypassed" not in amd_branch and "NRD-only" not in amd_branch
+    assert "HybridFfxNrdBackend(true)" in amd_branch or "NRD" in amd_branch, (
+        "AUTO on AMD must route to NRD (HybridFfxNrdBackend with no FFX prepass, or NRD-only)"
+    )
 
 
 def test_ffx_reproject_encodes_motion_into_variance() -> None:

@@ -97,20 +97,11 @@ public final class UpscalerSelector {
 
     private static Upscaler resolve0(GpuVendor gpu) {
         Mode requested = CausticaConfig.Rt.Upscaler.MODE.valueEnum();
-        // AMD FidelityFX denoise preset = FFX + FSR2 stack. Force FSR2 unless the user
-        // explicitly chose OFF (debug 1:1). AUTO/TAAU/legacy modes all snap to FSR2.
-        var denoiseMode = CausticaConfig.Rt.Denoise.MODE.value();
-        // AUTO also needs FSR2 when the GPU is AMD (autoPick resolves to AmdFidelityFxDenoiseBackend
-        // which is a pure FFX+FSR2 stack with no NRD native).
-        boolean needsFsr2Partner = denoiseMode == CausticaConfig.DenoiserKind.AMD_FIDELITYFX
-                || (denoiseMode == CausticaConfig.DenoiserKind.AUTO && gpu.vendor == GpuVendor.Vendor.AMD);
-        if (needsFsr2Partner && requested != Mode.OFF) {
-            if (requested != Mode.FSR_3 && requested != Mode.FSR_4) {
-                LOGGER.info("Denoise mode {} on {} → forcing upscaler partner to FSR2 (was {})",
-                        denoiseMode.key(), gpu.vendor, requested.key);
-            }
-            requested = Mode.FSR_3;
-        }
+        // The legacy legacy FFX-only AMD preset denoise preset (FFX + FSR2) was removed in commit 1
+        // (2026-07-20): the 2.x modular loader we bundle has no denoiser effect
+        // provider, so AMD AUTO now routes to NRD via DenoiseBackendSelector.
+        // There is no FSR2-forcing behavior to keep — NRD doesn't need a specific
+        // upscaler partner. AMD vendors are free to pair NRD with any upscaler.
         Upscaler candidate = null;
         String requestedReason = requested.key;
         switch (requested) {

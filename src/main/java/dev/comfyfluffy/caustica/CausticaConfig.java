@@ -865,14 +865,20 @@ public final class CausticaConfig {
          * Image-domain denoise backend.
          * <ul>
          *   <li>{@code AUTO}/{@code HYBRID} — FFX shadow+reflection prepass, then NRD REBLUR</li>
-         *   <li>{@code NRD} — NRD REBLUR only (raw layers, no FFX; Radiance-style)</li>
-         *   <li>{@code FFX} — Official FFX shadow+reflection only</li>
-         *   <li>{@code AMD_FIDELITYFX} — FidelityFX preset: FFX only (no NRD); pair with FSR2</li>
+         *   <li>{@code NRD} — NRD REBLUR only (raw layers, no FFX; Radiance-style). Stable path; the
+         *   AMD vendor on AUTO also resolves here because the 2.x modular loader we
+         *   bundle has no denoiser effect provider, so the legacy AMD_FIDELITY
+         *   FFX-only path is gone. NRD is currently the only stable AMD denoiser.</li>
+         *   <li>{@code FFX} — Official FFX shadow+reflection only (uses Caustica's
+         *   from-scratch GLSL pipeline — the "ffx" prefix is legacy naming, not the
+         *   AMD FFX library). Kept for users who want the FFX-style result without
+         *   the NRD runtime dependency.</li>
+
          *   <li>{@code OFF} — raw path-traced color</li>
          * </ul>
          *
-         * <p>Aliases: {@code "on"}/{@code "ffx-official"} → FFX;
-         * {@code "amd-fidelityfx"}/{@code "fidelityfx"}/{@code "ffx-fsr"} → AMD_FIDELITYFX.
+         * <p>Aliases: {@code "on"}/{@code "ffx-official"} → FFX.
+         * Legacy "amd-fidelityfx"/"fidelityfx"/"ffx-fsr" → fall through to AUTO (NRD on AMD).
          */
         public static final class Denoise {
             public static final EnumSetting<DenoiserKind> MODE = enumSetting(
@@ -901,6 +907,14 @@ public final class CausticaConfig {
             // Disable to fall back to shadow-only FFX if a driver still misbehaves.
             public static final BooleanSetting FFX_REFLECTION_COMPOSITE =
                     bool("caustica.rt.denoise.ffxReflectionComposite", "denoise.ffx-reflection-composite", true);
+            // 2026-07-20: AMD preset has a 3-pass bilateral residual after the official FFX pass.
+            // Per the user-visible comparison 2026-07-20 the residual may be re-injecting noise
+            // the FFX pass just dampened (suspect #3 in the diagnostic protocol). Disable to
+            // verify whether the residual is the source, by running pure FFX output for
+            // comparison. Default true (preserves the verified architecture).
+            public static final BooleanSetting AMD_FIDELITY_FX_RESIDUAL =
+                    bool("caustica.rt.denoise.amdFidelityFxResidual",
+                            "denoise.amd-fidelity-fx-residual", true);
 
             private Denoise() {
             }
@@ -1165,7 +1179,10 @@ public final class CausticaConfig {
         TAAU("taau"),
         /**
          * Classic FSR 2.2 Vulkan ({@code libffx_fsr2_caustica.so}). Preferred partner for the
-         * {@link DenoiserKind#AMD_FIDELITYFX} preset.
+         * {@code AMD_FIDELITY_FX_RESIDUAL} (deprecated — AMD preset removed in
+         * commit 1, 2026-07-20). The setting is kept in the .toml schema for
+         * backward compatibility (older configs don't fail to load) but the
+         * AMD path no longer reads it.</li>
          */
         FSR2("fsr2");
 
@@ -1199,11 +1216,6 @@ public final class CausticaConfig {
         AUTO("auto"),
         /** Official FFX shadow+reflection composite only. */
         FFX("ffx"),
-        /**
-         * AMD FidelityFX preset: official FFX shadow+reflection only (no NRD). Intended to pair with
-         * FSR2 upscaling for a lighter AMD-friendly stack.
-         */
-        AMD_FIDELITYFX("amd-fidelityfx"),
         /** NRD REBLUR only — no FFX prepass (Radiance-style). */
         NRD("nrd"),
         /** Explicit hybrid cascade (same as AUTO). */
@@ -1220,9 +1232,15 @@ public final class CausticaConfig {
                 if (k.key.equals(t) || k.name().equalsIgnoreCase(s)) return k;
             }
             if (t.equals("on") || t.equals("ffx-official") || t.equals("svgf")) return FFX;
-            if (t.equals("amd_fidelityfx") || t.equals("fidelityfx") || t.equals("ffx-fsr")
+            // Legacy "amd-fidelityfx" / "fidelityfx" / "ffx-fsr" / "amd-ffx" aliases fall
+            // through to AUTO. The DenoiserKind.AMD_FIDELITY enum was removed in
+            // commit 1 (2026-07-20) — the 2.x modular loader we bundle has no
+            // denoiser effect provider, so the FFX-only AMD path is gone. AMD AUTO
+            // now routes to NRD via DenoiseBackendSelector.autoPick.
+            if (t.equals("amd-fidelityfx") || t.equals("amd-fidelityfx")
+                    || t.equals("fidelityfx") || t.equals("ffx-fsr")
                     || t.equals("amd-ffx")) {
-                return AMD_FIDELITYFX;
+                return AUTO;
             }
             if (t.equals("ffx-nrd") || t.equals("hybrid-ffx-nrd")) return HYBRID;
             return AUTO;

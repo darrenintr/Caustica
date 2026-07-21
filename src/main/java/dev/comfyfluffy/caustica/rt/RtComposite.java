@@ -190,10 +190,9 @@ public final class RtComposite {
         if (debugView() != 0) {
             return false;
         }
-        // AMD FidelityFX preset owns temporal via FFX history + FSR2; never stack beauty TAA.
-        if (CausticaConfig.Rt.Denoise.MODE.value() == CausticaConfig.DenoiserKind.AMD_FIDELITYFX) {
-            return false;
-        }
+        // AMD_FIDELITYFX preset was removed in commit 1 (2026-07-20): AMD AUTO now routes
+        // to NRD, so there is no FFX-history-double-up case to suppress here. NRD already
+        // owns temporal; we let beauty TAA on top if the user enabled it.
         if (!CausticaConfig.Rt.Composite.TEMPORAL_ACCUM.value()) {
             return false;
         }
@@ -977,8 +976,8 @@ public final class RtComposite {
             return false;
         }
         if (mode != dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.AUTO) {
+            // AMD_FIDELITYFX removed in commit 1 (2026-07-20) — AMD AUTO routes to NRD now.
             return mode == dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.FFX
-                    || mode == dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.AMD_FIDELITYFX
                     || mode == dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.NRD
                     || mode == dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.HYBRID;
         }
