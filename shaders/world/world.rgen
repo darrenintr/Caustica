@@ -91,6 +91,12 @@ layout(binding = 22, set = 0, r32f) uniform image2D gViewZ;
 layout(binding = 23, set = 0, rgba16f) uniform image2D gConfidenceDisocclusion;
 layout(binding = 25, set = 0, rgba16f) uniform image2D gUnshadowedDirect;
 layout(binding = 24, set = 0, r32ui) uniform uimage2D gMaterialFlags;
+// Tile-jitter guide for post-process reprojection correction (v0.6.8+).
+// R8G8_UNORM, encoded as tileJitter + 0.5 so the [-0.5, +0.5] render-pixel range
+// maps to [0, 1]. NRD's pre-warp pass reads this and re-samples the current frame's
+// NRD input by -tileJitter/size so NRD's internal reprojection lines up with the
+// actual per-tile-quantized sampling pattern used here.
+layout(binding = 26, set = 0, rg8) uniform image2D gJitterGuide;
 
 // Per-frame push data lives in a host-visible BDA buffer; only its 8-byte address is pushed. The std430
 // layout must match RtComposite. Raygen loads it once into the `pc` global at the top of main().
@@ -2361,6 +2367,11 @@ void main() {
     //
     // Cost: RR sees a 1/64th-of-pixel aliasing pattern this frame that the temporal stack resolves
     // in ~8 frames; the trade is huge first-bounce coherence for cheap.
+    //
+    // v0.6.8: the per-tile offset is now applied to the primary ray AND written to gJitterGuide
+    // so NRD's pre-warp pass can undo it (nrd_prewarp.comp). Without the guide, NRD reprojects
+    // using only the global jitter and the per-tile component causes residual ghosting under
+    // camera motion. See TILE_JITTER_GUIDE_DESIGN.md for the math.
     ivec2 tilePix = pix >> 3;          // 8x8 tiles
     ivec2 inTile  = pix & ivec2(7);
     vec2 tileJitter = vec2(
@@ -2370,9 +2381,11 @@ void main() {
     // Mix per-pixel RR-required jitter with the tile-quantized bucket so adjacent tiles still sample
     // a different sub-pixel position every frame (RR keeps converging); the in-tile quantization
     // only coalesces rays inside a single warp.
-    // Temporal APIs receive one frame-global jitter value. A hidden per-tile component cannot be
-    // reported to TAAU/NRD and therefore cannot be correctly undone during reprojection.
-    vec2 effectiveJitter = pc.jitter;
+    // Write the per-tile offset to the guide buffer for NRD's pre-warp pass to read next.
+    // Encoded as [0, 1] = [-0.5, +0.5] render pixels (full range reserved even though current
+    // 1/8-step scheme only uses ±~0.055 px — gives headroom for finer schemes).
+    vec2 effectiveJitter = pc.jitter + tileJitter;
+    imageStore(gJitterGuide, pix, vec4(tileJitter + 0.5, 0.0, 0.0));
 
     // Offset the primary ray within the pixel by the tile-coalesced sub-pixel jitter. The guide buffers
     // below come from this jittered first hit (they must match the jittered colour); only the motion

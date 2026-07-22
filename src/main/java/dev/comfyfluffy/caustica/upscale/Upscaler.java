@@ -88,4 +88,19 @@ public interface Upscaler {
      */
     default void requestResetHistory() {
     }
+
+    /**
+     * v0.6.8+: bind the per-tile jitter guide (R8G8_UNORM, render res) written by
+     * world.rgen. The upscaler reads this and adds the per-tile offset to its
+     * reproject UV so the temporal accumulation lines up with the path tracer's
+     * actual sub-pixel sampling pattern.
+     *
+     * <p>Default no-op is safe: upscalers that don't use the guide (DLSS-RR, FSR,
+     * XeSS — they handle jitter via their SDK's internal math, not the user-
+     * supplied guide) just ignore it. Only TAAU / FFX's user-space reproject
+     * need this. The caller (RtComposite) passes {@code null} if the rgen is from
+     * an older shader set that doesn't write the guide.
+     */
+    default void setJitterGuide(RtImage jitterGuide) {
+    }
 }

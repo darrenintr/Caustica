@@ -117,10 +117,12 @@ public final class RtComposite {
     // the BDA struct since it's cold or only read once per ray-gen invocation.
     // layout: worldPushAddr(@0, 8B) + tableAddr(@8, 8B) + entityTableAddr(@16, 8B) + frameIndex(@24, 4B)
     private static final int WORLD_PUSH_CONST_SIZE = 32;
-    // RR guides (6) + split lighting + ReSTIR (3) + light field SSBO (1) + ReSTIR GI (4).
+    // RR guides (6) + split lighting + ReSTIR (3) + light field SSBO (1) + ReSTIR GI (4)
+    // + tile-jitter guide (1) for NRD pre-warp (v0.6.8+).
     // Slots 0..8 images, 9 SSBO lights, 10-11 reservoir images, 12 SSBO light field,
-    // 13-16 GI reservoir images (currA, currB, prevA, prevB).
-    private static final int GUIDE_COUNT = 23; // bindings 3..25 (guides + standard RT outputs)
+    // 13-16 GI reservoir images (currA, currB, prevA, prevB), 17-22 misc guides,
+    // 23 tile-jitter guide (R8G8).
+    private static final int GUIDE_COUNT = 24; // bindings 3..26 (guides + standard RT outputs)
 
     // ReSTIR Direct Illumination feature flag
     // ReSTIR DI currently loses the AMD device after the live light set grows while NRD is
@@ -388,6 +390,15 @@ public final class RtComposite {
     private RtImage gViewZ;
     private RtImage gConfidenceDisocclusion;
     private RtImage gMaterialFlags;
+    /**
+     * Per-tile sub-pixel jitter offset written by world.rgen at render res (R8G8_UNORM, encoded
+     * as {@code (offset + 0.5)} so the full [-0.5, +0.5] render-pixel range maps to [0, 1]). The
+     * NRD pre-warp pass (nrd_prewarp.comp) reads this and re-samples the current frame's NRD
+     * input by {@code -tileJitter/size} so NRD's internal reproject math (which is told the
+     * unjittered pixel position via {@code cameraJitter}) lines up with the per-tile-quantized
+     * primary-ray sampling pattern used by the path tracer. See TILE_JITTER_GUIDE_DESIGN.md.
+     */
+    private RtImage gJitterGuide;
     // Display-res RT image the display mapper reads: DLSS-RR writes it (render -> display denoise+upscale), or a
     // linear blit of `output` fills it when RR is off/unavailable (the no-RR reference / fallback).
     private RtImage rrOutput;
@@ -1088,6 +1099,9 @@ public final class RtComposite {
         worldPipeline.setExtraStorageImage(20, gConfidenceDisocclusion.view);
         worldPipeline.setExtraStorageImage(21, gMaterialFlags.view);
         worldPipeline.setExtraStorageImage(22, gUnshadowedDirect.view);
+        if (gJitterGuide != null) {
+            worldPipeline.setExtraStorageImage(23, gJitterGuide.view);
+        }
     }
 
     private void destroyGuideImages() {
@@ -1136,6 +1150,7 @@ public final class RtComposite {
         if (gViewZ != null) { gViewZ.destroy(); gViewZ = null; }
         if (gConfidenceDisocclusion != null) { gConfidenceDisocclusion.destroy(); gConfidenceDisocclusion = null; }
         if (gMaterialFlags != null) { gMaterialFlags.destroy(); gMaterialFlags = null; }
+        if (gJitterGuide != null) { gJitterGuide.destroy(); gJitterGuide = null; }
         if (rrOutput != null) {
             rrOutput.destroy();
             rrOutput = null;
@@ -1281,6 +1296,10 @@ public final class RtComposite {
         gViewZ = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT, "view z " + renderW + "x" + renderH);
         gConfidenceDisocclusion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "confidence disocclusion " + renderW + "x" + renderH);
         gMaterialFlags = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_UINT, "material flags " + renderW + "x" + renderH);
+        // Tile-jitter guide (v0.6.8+): per-tile sub-pixel offset written by world.rgen, read by
+        // nrd_prewarp.comp. R8G8_UNORM is the minimum precision that fits the ±0.5 render-pixel
+        // range with 1/256 quantisation (current 1/8 step uses ~0.055 px, so 1/256 is ample).
+        gJitterGuide = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R8G8_UNORM, "tile jitter guide " + renderW + "x" + renderH);
         // Display-res beauty the display mapper / exposure histogram read. Same pure-RGB HDR format as the
         // render-res beauty chain (B10G11R11). Always present (DLSS-RR target, or blit-upscale fallback).
         rrOutput = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "DLSS-RR output " + width + "x" + height);
@@ -1745,6 +1764,19 @@ public final class RtComposite {
                                 }
                                 if (gConfidenceDisocclusion != null) {
                                     hybrid.setConfidenceDisocclusionGuide(gConfidenceDisocclusion);
+                                }
+                                // Tile-jitter guide for NRD pre-warp (v0.6.8+). Without this,
+                                // NRD's reproject samples previous history at the wrong sub-pixel
+                                // offset (NRD sees only the global jitter, not the per-tile one).
+                                if (gJitterGuide != null) {
+                                    hybrid.setJitterGuide(gJitterGuide);
+                                }
+                                // Same guide for the TAAU upscaler (if active). TAAU's reproject
+                                // reads this and adds the per-tile offset to prevUV so the temporal
+                                // blend lines up with the path tracer's actual sampling. Default
+                                // no-op on upscalers that don't use the guide (DLSS-RR, FSR, XeSS).
+                                if (activeUpscaler != null && gJitterGuide != null) {
+                                    activeUpscaler.setJitterGuide(gJitterGuide);
                                 }
                                 hybrid.setLightDirection(push.getFloat(224), push.getFloat(228), push.getFloat(232));
                                 // NRD needs camera-relative worldToView + camDelta so walking

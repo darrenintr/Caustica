@@ -35,6 +35,14 @@ layout(set = 0, binding = 5, rgba16f)         writeonly uniform image2D outRepro
 layout(set = 0, binding = 6, r32f)            writeonly uniform image2D outVariance;
 layout(set = 0, binding = 7)                  uniform sampler2D samplerPrev;
 
+// v0.6.8+ per-tile jitter guide. Same encoding as the TAAU/FFX versions: R8G8_UNORM
+// with (offset + 0.5) mapping the [-0.5, +0.5] render-pixel range to [0, 1]. World.rgen
+// writes the per-tile offset used by the path tracer; this shader reads it and adds the
+// current frame's per-tile offset to the reproject UV so the history is sampled at the
+// previous-frame position that matches the current sample's sub-pixel. See
+// docs/TILE_JITTER_GUIDE_DESIGN.md.
+layout(set = 0, binding = 8)                  uniform sampler2D jitterGuide;
+
 layout(push_constant) uniform Q2ReprojectParams {
     vec2  motionVectorScale;
     float disocclusionThreshold;
@@ -69,8 +77,15 @@ float q2NormalDisagreement(vec3 a, vec3 b) {
 // uv + mv is the Q2RTX "previous-frame UV" — current pixel's location in the
 // previous frame given the per-pixel motion vector. (Per FfxDenoiseBackend's
 // MvScale, this is exactly pc.motionVectorScale = 1 / renderSize.)
+//
+// v0.6.8+: add the current frame's per-tile offset (read from jitterGuide, decoded
+// from R8G8 by -0.5 then × motionVectorScale = 1/renderSize to land in UV units) so
+// the history is sampled at the previous-frame position that matches the current
+// sample's actual sub-pixel position. The per-tile offset is constant within an 8x8
+// tile so the per-pixel read is cheap (one sampler tap).
 vec4 q2TrilinearHistory(vec2 uv, vec2 mvPx) {
-    vec2 prevUV = uv + mvPx * pc.motionVectorScale;
+    vec2 tileOffsetGuide = texture(jitterGuide, uv).rg - 0.5; // [-0.5, +0.5] render px
+    vec2 prevUV = uv + mvPx * pc.motionVectorScale + tileOffsetGuide * pc.motionVectorScale;
     vec2 fr = fract(prevUV);
     ivec2 base = ivec2(floor(prevUV));
     ivec2 size = textureSize(samplerPrev, 0);

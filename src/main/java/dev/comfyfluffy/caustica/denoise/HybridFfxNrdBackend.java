@@ -26,6 +26,7 @@ import org.lwjgl.vulkan.VkImageMemoryBarrier2;
 import org.lwjgl.vulkan.VkPipelineLayoutCreateInfo;
 import org.lwjgl.vulkan.VkPipelineShaderStageCreateInfo;
 import org.lwjgl.vulkan.VkPushConstantRange;
+import org.lwjgl.vulkan.VkSamplerCreateInfo;
 import org.lwjgl.vulkan.VkShaderModuleCreateInfo;
 import org.lwjgl.vulkan.VkWriteDescriptorSet;
 
@@ -56,6 +57,14 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     // private final OfficialFfxDenoiseBackend ffx = new OfficialFfxDenoiseBackend();
     /** When true, skip FFX prepass and feed raw S/R into prepare (config denoise=NRD). */
     private final boolean nrdOnly;
+    /**
+     * When true, dispatch NRD RELAX_DIFFUSE_SPECULAR instead of REBLUR_DIFFUSE_SPECULAR.
+     * RELAX is NRD 4.x's newer attention-based denoiser — better quality on fine geometry
+     * and material boundaries, ~10-15% more cost on AMD where there's no tensor-core accel.
+     * Requires the bundled {@code libnrd_caustica.so} to be built with RELAX support
+     * (caustica_nrd_create_relax_v2 / caustica_nrd_dispatch_relax_v2 symbols present).
+     */
+    private final boolean useRelax;
     private boolean ready;
     private int width;
     private int height;
@@ -90,6 +99,16 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     private RtImage nrdOutSpec;
     private RtImage sigmaPenumbra;
     private RtImage diffConfidence;
+    /** Tile-jitter guide written by world.rgen (R8G8_UNORM, render res). Read by nrd_prewarp.comp. */
+    private RtImage jitterGuide;
+    /**
+     * Pre-warped copies of {@link #nrdDiffuse} and {@link #nrdSpecular} — the per-tile jitter applied
+     * by world.rgen is undone by re-sampling at {@code -tileJitter/size} so NRD's internal reproject
+     * (which uses frame-global jitter only) lines up with the actual sampling pattern. Fed to the
+     * NRD dispatch as IN_DIFF_RADIANCE_HITDIST / IN_SPEC_RADIANCE_HITDIST. See TILE_JITTER_GUIDE_DESIGN.md.
+     */
+    private RtImage nrdDiffuseWarped;
+    private RtImage nrdSpecularWarped;
     private RtImage specConfidence;
     private RtImage disocclusionMix;
     private RtImage demodulationMask;
@@ -121,12 +140,15 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     private static final int WARMUP_DURATION = 8;
 
     private long prepDsl, prepPool, prepSet, prepLayout, prepPipe;
+    private long prewarpDsl, prewarpPool, prewarpSet, prewarpLayout, prewarpPipe;
     private long compDsl, compPool, compSet, compLayout, compPipe;
     private final long[] prepBindings = new long[22];
+    /** 5 slots: jitterGuide sampler, inDiff sampler, inSpec sampler, outDiff storage, outSpec storage. */
+    private final long[] prewarpBindings = new long[5];
     private final long[] compBindings = new long[14];
 
     public HybridFfxNrdBackend() {
-        this(false);
+        this(false, false);
     }
 
     /**
@@ -134,15 +156,31 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
      *                A/B against hybrid and for day scenes where FFX+NRD+TAA can over-blur.
      */
     public HybridFfxNrdBackend(boolean nrdOnly) {
+        this(nrdOnly, false);
+    }
+
+    /**
+     * @param nrdOnly skip Official FFX entirely
+     * @param useRelax dispatch RELAX instead of REBLUR (NRD 4.x attention-based denoiser)
+     */
+    public HybridFfxNrdBackend(boolean nrdOnly, boolean useRelax) {
         this.nrdOnly = nrdOnly;
+        this.useRelax = useRelax;
     }
 
     public boolean isNrdOnly() {
         return nrdOnly;
     }
 
+    public boolean isUseRelax() {
+        return useRelax;
+    }
+
     @Override
     public String name() {
+        if (useRelax) {
+            return nrdOnly ? "nrd-relax" : "hybrid-relax-nrd";
+        }
         return nrdOnly ? "nrd-only" : "hybrid-ffx-nrd";
     }
 
@@ -173,6 +211,17 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
 
     public void setConfidenceDisocclusionGuide(RtImage confidenceDisocclusion) {
         this.confidenceDisocclusion = confidenceDisocclusion;
+    }
+
+    /**
+     * Set the per-tile jitter guide written by world.rgen (R8G8_UNORM, render res). The pre-warp
+     * pass ({@code nrd_prewarp.comp}) reads this and re-samples the NRD input to undo the
+     * per-tile sub-pixel offset, so NRD's internal reproject math lines up.
+     * <p>Without this set, the NRD pre-warp is skipped (legacy behaviour — NRD sees the
+     * un-corrected input and gets a 1/{@code tileSize}-pixel reproject error per frame).
+     */
+    public void setJitterGuide(RtImage jitterGuide) {
+        this.jitterGuide = jitterGuide;
     }
 
     public void setLightDirection(float x, float y, float z) {
@@ -318,6 +367,13 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                 CausticaMod.LOGGER.warn("Hybrid prepare_nrd_inputs pipeline failed; FFX-only hybrid", t);
             }
         }
+        if (prewarpPipe == 0L) {
+            try {
+                createPrewarpPipeline(ctx);
+            } catch (Throwable t) {
+                CausticaMod.LOGGER.warn("Hybrid nrd_prewarp pipeline failed; NRD will see uncorrected input", t);
+            }
+        }
         if (compPipe == 0L) {
             try {
                 createComposePipeline(ctx);
@@ -336,6 +392,11 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         ffxPlate = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "hybrid ffx plate");
         nrdDiffuse = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid nrd diffuse");
         nrdSpecular = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid nrd specular");
+        // Pre-warp targets (v0.6.8+, option b for per-tile jitter): same format as nrdDiffuse/nrdSpecular,
+        // output of nrd_prewarp.comp, fed to NRD as IN_DIFF/IN_SPEC. Kept separate so the "raw" NRD
+        // input is still available for debug overlays and for A/B testing.
+        nrdDiffuseWarped = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid nrd diffuse prewarped");
+        nrdSpecularWarped = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid nrd specular prewarped");
         viewZ = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R32_SFLOAT, "hybrid nrd viewZ");
         nrdNormalRough = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid nrd normal");
         nrdOutDiff = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid nrd out diff");
@@ -497,11 +558,55 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
             }
         }
 
+        // --- Stage 3.5: NRD pre-warp (v0.6.8+, option b) ---
+        // world.rgen applies per-tile sub-pixel jitter; NRD's reproject uses only the global
+        // jitter, so the per-tile component would otherwise leave a 1/tileSize sub-pixel
+        // reprojection error per frame (visible as ghosting under camera motion). We re-sample
+        // the current frame's NRD input at -tileJitter/size so NRD sees the unjittered pixel
+        // position and its internal reproject math lines up.
+        //
+        // Skipped silently when the guide isn't bound (jitterGuide==null) — that means the
+        // rgen pipeline is from an older shader set. The legacy path runs NRD on the
+        // uncorrected input, which still works but with the 1/tileSize residual error.
+        if (lastPrepareOk && prewarpPipe != 0L && prewarpSet != 0L
+                && jitterGuide != null && nrdDiffuse != null && nrdSpecular != null
+                && nrdDiffuseWarped != null && nrdSpecularWarped != null) {
+            try {
+                bindPrewarp(ctx, jitterGuide, nrdDiffuse, nrdSpecular, nrdDiffuseWarped, nrdSpecularWarped);
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "hybrid NRD pre-warp (tile jitter)")) {
+                    VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, prewarpPipe);
+                    VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, prewarpLayout, 0,
+                            stack.longs(prewarpSet), null);
+                    // 16-byte push: vec2 size + 2 floats pad. Matches nrd_prewarp.comp.
+                    ByteBuffer prewarpPush = stack.malloc(16);
+                    prewarpPush.putFloat(0, (float) width);
+                    prewarpPush.putFloat(4, (float) height);
+                    prewarpPush.putFloat(8, 0.0f);
+                    prewarpPush.putFloat(12, 0.0f);
+                    VK10.vkCmdPushConstants(cmd, prewarpLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, prewarpPush);
+                    VK10.vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+                }
+                // Make the warped outputs visible to NRD's reproject pass.
+                barrier(stack, cmd, nrdDiffuseWarped.image);
+                barrier(stack, cmd, nrdSpecularWarped.image);
+            } catch (Throwable t) {
+                CausticaMod.LOGGER.warn("Hybrid nrd_prewarp failed; NRD will see uncorrected input", t);
+            }
+        }
+
         // --- Stage 4: NRD REBLUR_DIFFUSE_SPECULAR (opaque surfaces only) ---
         boolean nrdOk = false;
         RtImage normalForNrd = nrdNormalRough != null ? nrdNormalRough : inNormal;
         RtImage viewZForNrd = tracedViewZ != null ? tracedViewZ : viewZ;
-        if (lastPrepareOk && NrdRuntime.INSTANCE.isAvailable() && haveCamera && nrdDiffuse != null && nrdSpecular != null
+        // v0.6.8+: when the pre-warp pass produced valid output, feed it to NRD instead of the
+        // raw prepare_nrd_inputs result. Falls back to the raw input when the guide wasn't bound
+        // (older shader set) or the pre-warp pipeline isn't available.
+        // Note: these are pre-warp outputs (diffForNrdNrd / specForNrdNrd), distinct from the
+        // earlier local vars `diffForNrd` is not used; `specForNrd` (line 487) is the prepare-
+        // phase shadow/spec selector for the prep pipeline.
+        RtImage diffForNrdNrd = (jitterGuide != null && nrdDiffuseWarped != null) ? nrdDiffuseWarped : nrdDiffuse;
+        RtImage specForNrdNrd = (jitterGuide != null && nrdSpecularWarped != null) ? nrdSpecularWarped : nrdSpecular;
+        if (lastPrepareOk && NrdRuntime.INSTANCE.isAvailable() && haveCamera && diffForNrdNrd != null && specForNrdNrd != null
                 && viewZForNrd != null && nrdOutDiff != null && nrdOutSpec != null && normalForNrd != null && inMotion != null) {
             try {
                 long dev = ctx.vk().address();
@@ -510,10 +615,14 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                 // Keep NRD on the queue that actually submits this command buffer.  A
                 // dedicated compute family is detected globally, but is not wired into the
                 // NRD submission/ownership-transfer path.
-                if (!NrdRuntime.INSTANCE.ensureContext(dev, phys, graphicsFamily, -1, width, height)) {
-                    throw new IllegalStateException("NRD context not ready");
+                boolean ctxReady = useRelax
+                        ? NrdRuntime.INSTANCE.ensureContextRelax(dev, phys, graphicsFamily, -1, width, height)
+                        : NrdRuntime.INSTANCE.ensureContext(dev, phys, graphicsFamily, -1, width, height);
+                if (!ctxReady) {
+                    throw new IllegalStateException(useRelax ? "NRD RELAX context not ready" : "NRD context not ready");
                 }
-                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "hybrid NRD REBLUR")) {
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd,
+                        useRelax ? "hybrid NRD RELAX" : "hybrid NRD REBLUR")) {
                     // Temporal warmup: gradually blend history over first WARMUP_DURATION frames
                     // to eliminate startup/teleport flicker. We manipulate frameIndex to reduce
                     // NRD's temporal weight during warmup (lower frameIndex = less history trust).
@@ -524,23 +633,41 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                         warmupFramesRemaining--;
                     }
 
-                    int rc = NrdRuntime.INSTANCE.dispatch(cmd.address(),
-                            nrdDiffuse.image, nrdDiffuse.view,
-                            nrdSpecular.image, nrdSpecular.view,
-                            inMotion.image, inMotion.view,
-                            normalForNrd.image, normalForNrd.view,
-                            viewZForNrd.image, viewZForNrd.view,
-                            sigmaPenumbra.image, sigmaPenumbra.view,
-                            diffConfidence.image, diffConfidence.view,
-                            specConfidence.image, specConfidence.view,
-                            disocclusionMix.image, disocclusionMix.view,
-                            nrdOutDiff.image, nrdOutDiff.view,
-                            nrdOutSpec.image, nrdOutSpec.view,
-                            nrdOutShadow.image, nrdOutShadow.view,
-                            viewToClip, viewToClipPrev, worldToView, worldToViewPrev,
-                            jitterX, jitterY, jitterXPrev, jitterYPrev,
-                            lightDirX, lightDirY, lightDirZ,
-                            effectiveFrameIndex, nrdHardReset);
+                    int rc = useRelax
+                            ? NrdRuntime.INSTANCE.dispatchRelax(cmd.address(),
+                                    diffForNrdNrd.image, diffForNrdNrd.view,
+                                    specForNrdNrd.image, specForNrdNrd.view,
+                                    inMotion.image, inMotion.view,
+                                    normalForNrd.image, normalForNrd.view,
+                                    viewZForNrd.image, viewZForNrd.view,
+                                    sigmaPenumbra.image, sigmaPenumbra.view,
+                                    diffConfidence.image, diffConfidence.view,
+                                    specConfidence.image, specConfidence.view,
+                                    disocclusionMix.image, disocclusionMix.view,
+                                    nrdOutDiff.image, nrdOutDiff.view,
+                                    nrdOutSpec.image, nrdOutSpec.view,
+                                    nrdOutShadow.image, nrdOutShadow.view,
+                                    viewToClip, viewToClipPrev, worldToView, worldToViewPrev,
+                                    jitterX, jitterY, jitterXPrev, jitterYPrev,
+                                    lightDirX, lightDirY, lightDirZ,
+                                    effectiveFrameIndex, nrdHardReset)
+                            : NrdRuntime.INSTANCE.dispatch(cmd.address(),
+                                    diffForNrdNrd.image, diffForNrdNrd.view,
+                                    specForNrdNrd.image, specForNrdNrd.view,
+                                    inMotion.image, inMotion.view,
+                                    normalForNrd.image, normalForNrd.view,
+                                    viewZForNrd.image, viewZForNrd.view,
+                                    sigmaPenumbra.image, sigmaPenumbra.view,
+                                    diffConfidence.image, diffConfidence.view,
+                                    specConfidence.image, specConfidence.view,
+                                    disocclusionMix.image, disocclusionMix.view,
+                                    nrdOutDiff.image, nrdOutDiff.view,
+                                    nrdOutSpec.image, nrdOutSpec.view,
+                                    nrdOutShadow.image, nrdOutShadow.view,
+                                    viewToClip, viewToClipPrev, worldToView, worldToViewPrev,
+                                    jitterX, jitterY, jitterXPrev, jitterYPrev,
+                                    lightDirX, lightDirY, lightDirZ,
+                                    effectiveFrameIndex, nrdHardReset);
                     if (rc != 0) {
                         throw new IllegalStateException("nrd dispatch rc=" + rc);
                     }
@@ -593,12 +720,13 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                 lastPathLabel = nrdOnly ? "nrd" : "ffx→nrd";
                 if (!nrdRanLogged) {
                     nrdRanLogged = true;
+                    String label = useRelax ? "RELAX" : "REBLUR";
                     if (nrdOnly) {
                         CausticaMod.LOGGER.info(
-                                "Denoise: NRD REBLUR HQ (no FFX prepass; no beauty TAA)");
+                                "Denoise: NRD " + label + " HQ (no FFX prepass; no beauty TAA)");
                     } else {
                         CausticaMod.LOGGER.info(
-                                "Hybrid denoise: FFX prepass + NRD REBLUR HQ");
+                                "Hybrid denoise: FFX prepass + NRD " + label + " HQ");
                     }
                 }
             } catch (Throwable t) {
@@ -654,6 +782,17 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                 VK10.vkDestroyDescriptorPool(ctx.vk(), prepPool, null);
                 VK10.vkDestroyDescriptorSetLayout(ctx.vk(), prepDsl, null);
                 prepPipe = prepLayout = prepPool = prepDsl = prepSet = 0L;
+            }
+            if (prewarpPipe != 0L) {
+                VK10.vkDestroyPipeline(ctx.vk(), prewarpPipe, null);
+                VK10.vkDestroyPipelineLayout(ctx.vk(), prewarpLayout, null);
+                VK10.vkDestroyDescriptorPool(ctx.vk(), prewarpPool, null);
+                VK10.vkDestroyDescriptorSetLayout(ctx.vk(), prewarpDsl, null);
+                prewarpPipe = prewarpLayout = prewarpPool = prewarpDsl = prewarpSet = 0L;
+            }
+            if (prewarpLinearClampSampler != 0L) {
+                VK10.vkDestroySampler(ctx.vk(), prewarpLinearClampSampler, null);
+                prewarpLinearClampSampler = 0L;
             }
             if (compPipe != 0L) {
                 VK10.vkDestroyPipeline(ctx.vk(), compPipe, null);
@@ -712,6 +851,14 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         if (nrdSpecular != null) {
             nrdSpecular.destroy();
             nrdSpecular = null;
+        }
+        if (nrdDiffuseWarped != null) {
+            nrdDiffuseWarped.destroy();
+            nrdDiffuseWarped = null;
+        }
+        if (nrdSpecularWarped != null) {
+            nrdSpecularWarped.destroy();
+            nrdSpecularWarped = null;
         }
         if (viewZ != null) {
             viewZ.destroy();
@@ -934,6 +1081,143 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
             }
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
             System.arraycopy(views, 0, prepBindings, 0, views.length);
+        }
+    }
+
+    /** Bilinear clamp sampler shared by the 3 combined-image-sampler bindings in the prewarp set. */
+    private long prewarpLinearClampSampler;
+
+    private void createPrewarpPipeline(RtContext ctx) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            // Sampler used for bilinear clamp sampling of the 3 input textures (jitterGuide,
+            // nrdDiff, nrdSpec). Created once and reused for every binding of the prewarp set.
+            VkSamplerCreateInfo samplerInfo = VkSamplerCreateInfo.calloc(stack).sType$Default()
+                    .magFilter(VK10.VK_FILTER_LINEAR)
+                    .minFilter(VK10.VK_FILTER_LINEAR)
+                    .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .addressModeV(VK10.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .addressModeW(VK10.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+            LongBuffer pSampler = stack.mallocLong(1);
+            check(VK10.vkCreateSampler(ctx.vk(), samplerInfo, null, pSampler), "vkCreateSampler(prewarp)");
+            prewarpLinearClampSampler = pSampler.get(0);
+
+            // Layout matches nrd_prewarp.comp:
+            //   binding 0 = sampler2D jitterGuide (combined image sampler)
+            //   binding 1 = sampler2D inDiff      (combined image sampler)
+            //   binding 2 = sampler2D inSpec      (combined image sampler)
+            //   binding 3 = image2D outDiff       (storage image)
+            //   binding 4 = image2D outSpec       (storage image)
+            final int BINDINGS = 5;
+            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(BINDINGS, stack);
+            for (int i = 0; i < 3; i++) {
+                binds.get(i).binding(i)
+                        .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                        .descriptorCount(1)
+                        .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT)
+                        .pImmutableSamplers(stack.longs(prewarpLinearClampSampler));
+            }
+            for (int i = 3; i < 5; i++) {
+                binds.get(i).binding(i)
+                        .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                        .descriptorCount(1)
+                        .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+            }
+            LongBuffer pDsl = stack.mallocLong(1);
+            check(VK10.vkCreateDescriptorSetLayout(ctx.vk(),
+                    VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds), null, pDsl),
+                    "vkCreateDescriptorSetLayout(hybrid-prewarp)");
+            prewarpDsl = pDsl.get(0);
+
+            VkDescriptorPoolSize.Buffer sizes = VkDescriptorPoolSize.calloc(2, stack);
+            sizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(3);
+            sizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(2);
+            LongBuffer pPool = stack.mallocLong(1);
+            check(VK10.vkCreateDescriptorPool(ctx.vk(),
+                    VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(1).pPoolSizes(sizes), null, pPool),
+                    "vkCreateDescriptorPool(hybrid-prewarp)");
+            prewarpPool = pPool.get(0);
+
+            LongBuffer pSet = stack.mallocLong(1);
+            check(VK10.vkAllocateDescriptorSets(ctx.vk(),
+                    VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
+                            .descriptorPool(prewarpPool).pSetLayouts(stack.longs(prewarpDsl)), pSet),
+                    "vkAllocateDescriptorSets(hybrid-prewarp)");
+            prewarpSet = pSet.get(0);
+
+            VkPushConstantRange.Buffer pcr = VkPushConstantRange.calloc(1, stack);
+            // 16 bytes: vec2 size + 2 floats pad. Matches nrd_prewarp.comp.
+            pcr.get(0).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(16);
+            LongBuffer pLayout = stack.mallocLong(1);
+            check(VK10.vkCreatePipelineLayout(ctx.vk(),
+                    VkPipelineLayoutCreateInfo.calloc(stack).sType$Default()
+                            .pSetLayouts(stack.longs(prewarpDsl)).pPushConstantRanges(pcr), null, pLayout),
+                    "vkCreatePipelineLayout(hybrid-prewarp)");
+            prewarpLayout = pLayout.get(0);
+
+            byte[] spv;
+            try (InputStream in = HybridFfxNrdBackend.class.getResourceAsStream(
+                    "/caustica/rt/nrd_prewarp.comp.spv")) {
+                if (in == null) {
+                    throw new IllegalStateException("missing nrd_prewarp.comp.spv");
+                }
+                spv = in.readAllBytes();
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+            ByteBuffer code = MemoryUtil.memAlloc(spv.length);
+            code.put(spv).flip();
+            LongBuffer pMod = stack.mallocLong(1);
+            check(VK10.vkCreateShaderModule(ctx.vk(),
+                    VkShaderModuleCreateInfo.calloc(stack).sType$Default().pCode(code), null, pMod),
+                    "vkCreateShaderModule(hybrid-prewarp)");
+            long mod = pMod.get(0);
+            MemoryUtil.memFree(code);
+
+            VkPipelineShaderStageCreateInfo stage = VkPipelineShaderStageCreateInfo.calloc(stack)
+                    .sType$Default()
+                    .stage(VK10.VK_SHADER_STAGE_COMPUTE_BIT)
+                    .module(mod)
+                    .pName(stack.UTF8("main"));
+            LongBuffer pPipe = stack.mallocLong(1);
+            check(VK10.vkCreateComputePipelines(ctx.vk(), 0,
+                    VkComputePipelineCreateInfo.calloc(1, stack).sType$Default()
+                            .stage(stage).layout(prewarpLayout), null, pPipe),
+                    "vkCreateComputePipelines(hybrid-prewarp)");
+            prewarpPipe = pPipe.get(0);
+            VK10.vkDestroyShaderModule(ctx.vk(), mod, null);
+        }
+    }
+
+    private void bindPrewarp(RtContext ctx, RtImage guide, RtImage inDiff, RtImage inSpec,
+                             RtImage outDiff, RtImage outSpec) {
+        RtImage[] imgs = {guide, inDiff, inSpec, outDiff, outSpec};
+        long[] views = Arrays.stream(imgs).mapToLong(image -> image.view).toArray();
+        if (Arrays.equals(prewarpBindings, views)) {
+            return;
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(imgs.length, stack);
+            // Project convention: all images stay in GENERAL layout (see FfxDenoiseBackend line 601).
+            // The descriptor info's imageLayout is a performance hint, the actual layout is set
+            // by barriers in barriers()/barrier(). The 3 sampler bindings share a single bilinear
+            // clamp sampler created in createPrewarpPipeline.
+            for (int i = 0; i < 3; i++) {
+                VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
+                info.get(0).imageView(imgs[i].view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                        .sampler(prewarpLinearClampSampler);
+                writes.get(i).sType$Default().dstSet(prewarpSet).dstBinding(i)
+                        .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                        .pImageInfo(info);
+            }
+            for (int i = 3; i < 5; i++) {
+                VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
+                info.get(0).imageView(imgs[i].view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+                writes.get(i).sType$Default().dstSet(prewarpSet).dstBinding(i)
+                        .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                        .pImageInfo(info);
+            }
+            VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
+            System.arraycopy(views, 0, prewarpBindings, 0, views.length);
         }
     }
 

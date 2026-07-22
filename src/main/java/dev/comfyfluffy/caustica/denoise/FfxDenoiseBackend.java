@@ -106,6 +106,8 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
     private RtImage reprojectColorBuf;
     private RtImage reprojectVarianceBuf;
     private RtImage resolveDenoisedBuf;
+    /** v0.6.8+: per-tile jitter guide (R8G8_UNORM, render res). Optional — see bindReproject. */
+    private RtImage jitterGuide;
 
     @Override
     public String name() {
@@ -303,6 +305,17 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
         frameCounter = 0;
     }
 
+    /**
+     * v0.6.8+: bind the per-tile jitter guide (R8G8_UNORM, render res). The reproject
+     * pass ({@code ffx_reproject.comp}) reads this and adds the per-tile offset to
+     * {@code prevUV} so the history is sampled at the previous-frame position that
+     * matches the current sample's sub-pixel. Optional — when null, a placeholder view
+     * is bound and the sampler returns 0.5 = offset 0 (legacy behaviour).
+     */
+    public void setJitterGuide(RtImage jitterGuide) {
+        this.jitterGuide = jitterGuide;
+    }
+
     @Override
     public void destroy() {
         if (!ready) {
@@ -363,7 +376,12 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
 
     private void createReprojectPipeline(RtContext ctx) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(8, stack);
+            // v0.6.8+: 9 bindings (0..8). Binding 8 is the per-tile jitter guide sampler
+            // (R8G8_UNORM, render res) — see nrd_prewarp.comp / taau.comp / ffx_reproject.comp
+            // and docs/TILE_JITTER_GUIDE_DESIGN.md. The reproject reads it and adds the
+            // per-tile offset to prevUV so the history is sampled at the previous-frame
+            // position that matches the current sample's sub-pixel.
+            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(9, stack);
             for (int i = 0; i < 5; i++) {
                 binds.get(i).binding(i).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1)
                         .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
@@ -374,14 +392,17 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
                     .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
             binds.get(7).binding(7).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                     .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+            binds.get(8).binding(8).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
             VkDescriptorSetLayoutCreateInfo dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds);
             LongBuffer p = stack.mallocLong(1);
             check(VK10.vkCreateDescriptorSetLayout(ctx.vk(), dslci, null, p), "vkCreateDescriptorSetLayout(ffx reproject)");
             reprojectDsl = p.get(0);
 
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(2, stack);
-            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(8);
-            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1);
+            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(7);
+            // 2 combined samplers (history @7 + jitterGuide @8).
+            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(2);
             VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(1).pPoolSizes(poolSizes);
             check(VK10.vkCreateDescriptorPool(ctx.vk(), dpci, null, p), "vkCreateDescriptorPool(ffx reproject)");
             reprojectPool = p.get(0);
@@ -590,7 +611,11 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
                                RtImage inMotion, RtImage colorOut, RtImage varianceOut, long historyView) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             RtImage[] images = {inColor, inNormal, inDepth, inMotion, inColor, colorOut, varianceOut};
-            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(8, stack);
+            // v0.6.8+: 9 writes (8 = jitterGuide sampler, optional). When jitterGuide is
+            // null, fall back to a placeholder view (any image view) so the descriptor
+            // update is well-formed; the sampler reads 0.5 = offset 0 = legacy behaviour.
+            long jitterView = (jitterGuide != null) ? jitterGuide.view : inColor.view;
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(9, stack);
             for (int i = 0; i < 7; i++) {
                 VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
                 info.get(0).imageView(images[i].view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
@@ -601,6 +626,11 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
             samplerInfo.get(0).imageView(historyView).sampler(sampler).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
             writes.get(7).sType$Default().dstSet(reprojectSet).dstBinding(7).descriptorCount(1)
                     .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(samplerInfo);
+            // 8: jitter guide sampler. Same `sampler` as history @7 (linear clamp).
+            VkDescriptorImageInfo.Buffer jitterInfo = VkDescriptorImageInfo.calloc(1, stack);
+            jitterInfo.get(0).imageView(jitterView).sampler(sampler).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+            writes.get(8).sType$Default().dstSet(reprojectSet).dstBinding(8).descriptorCount(1)
+                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(jitterInfo);
 
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
         }
