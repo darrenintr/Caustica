@@ -17,7 +17,7 @@ layout(push_constant) uniform Push {
 
 // Tonemap seam: map HDR RT radiance to displayable LDR before copying back to the main target.
 // The path tracer emits true HDR radiance, so exposure is applied from the compositor-owned 1x1 image
-// before the AgX view transform. DLSS-RR still consumes HDR pre-tonemap.
+// before the AgX view transform. Temporal denoisers/upscalers consume HDR pre-tonemap.
 
 const mat3 AGX_INSET = mat3(
     0.842479062253094, 0.042328242261012, 0.042375654905705,

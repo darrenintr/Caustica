@@ -143,7 +143,7 @@ public final class RtEntities {
     // dropped items become table-entry + instance writes only.
 
     // Max per-axis residual (blocks) for a capture to count as a rigid transform of the reference mesh.
-    // Well below a texel (1/16 block) and DLSS-RR jitter; float pose math noise is ~1e-5.
+    // Well below a texel (1/16 block) and temporal jitter; float pose math noise is ~1e-5.
     private static final float RIGID_FIT_EPS = 2.0e-3f;
 
     // Per-entity ring depth: a slot is reused every REFIT_RING frames, so it must be off all queues by

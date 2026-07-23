@@ -29,7 +29,6 @@ import org.lwjgl.vulkan.VkImageMemoryBarrier;
 import org.lwjgl.vulkan.VkImageViewCreateInfo;
 import org.lwjgl.vulkan.VkPhysicalDevice;
 import org.lwjgl.vulkan.VkPhysicalDeviceAccelerationStructurePropertiesKHR;
-import org.lwjgl.vulkan.VkPhysicalDeviceDescriptorIndexingProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingPipelinePropertiesKHR;
 import org.lwjgl.vulkan.VkSubmitInfo;
@@ -61,11 +60,13 @@ public final class RtContext {
     private final int shaderGroupHandleAlignment;
     private final int maxShaderGroupStride;
     private final int accelerationStructureScratchAlignment;
-    private final long updateAfterBindCombinedImageSamplerLimit;
+    private final long perStageCombinedImageSamplerLimit;
+    private final long descriptorSetCombinedImageSamplerLimit;
     private long commandPool;
 
     private RtContext(VulkanDevice device, long vma, int handleSize, int baseAlign, int handleAlign,
-                      int maxSbtStride, int scratchAlign, long updateAfterBindCombinedImageSamplerLimit) {
+                      int maxSbtStride, int scratchAlign, long perStageCombinedImageSamplerLimit,
+                      long descriptorSetCombinedImageSamplerLimit) {
         this.device = device;
         this.vk = device.vkDevice();
         this.vma = vma;
@@ -75,7 +76,8 @@ public final class RtContext {
         this.shaderGroupHandleAlignment = handleAlign;
         this.maxShaderGroupStride = maxSbtStride;
         this.accelerationStructureScratchAlignment = scratchAlign;
-        this.updateAfterBindCombinedImageSamplerLimit = updateAfterBindCombinedImageSamplerLimit;
+        this.perStageCombinedImageSamplerLimit = perStageCombinedImageSamplerLimit;
+        this.descriptorSetCombinedImageSamplerLimit = descriptorSetCombinedImageSamplerLimit;
     }
 
     /** The RT context for the current Vulkan device, or null if RT/Vulkan isn't available. */
@@ -117,40 +119,35 @@ public final class RtContext {
             PointerBuffer pVma = stack.mallocPointer(1);
             check(Vma.vmaCreateAllocator(aci, pVma), "vmaCreateAllocator(RT)");
 
-            // RT pipeline limits for SBT layout + AS scratch alignment + bindless descriptor ceilings.
+            // RT pipeline limits for SBT layout + AS scratch alignment + ordinary descriptor ceilings.
             VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps = VkPhysicalDeviceRayTracingPipelinePropertiesKHR
                     .calloc(stack).sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR);
             VkPhysicalDeviceAccelerationStructurePropertiesKHR asProps =
                     VkPhysicalDeviceAccelerationStructurePropertiesKHR.calloc(stack).sType$Default();
-            VkPhysicalDeviceDescriptorIndexingProperties descriptorProps =
-                    VkPhysicalDeviceDescriptorIndexingProperties.calloc(stack).sType$Default();
             rtProps.pNext(asProps.address());
-            asProps.pNext(descriptorProps.address());
             VkPhysicalDeviceProperties2 props2 = VkPhysicalDeviceProperties2.calloc(stack).sType$Default().pNext(rtProps.address());
             VK12.vkGetPhysicalDeviceProperties2(phys, props2);
 
             var limits = props2.properties().limits();
-            long combinedImageSamplerLimit = minUnsigned(
+            long perStageCombinedImageSamplerLimit = minUnsigned(
                     limits.maxPerStageDescriptorSamplers(),
-                    limits.maxPerStageDescriptorSampledImages(),
+                    limits.maxPerStageDescriptorSampledImages());
+            long descriptorSetCombinedImageSamplerLimit = minUnsigned(
                     limits.maxDescriptorSetSamplers(),
-                    limits.maxDescriptorSetSampledImages(),
-                    descriptorProps.maxPerStageDescriptorUpdateAfterBindSamplers(),
-                    descriptorProps.maxPerStageDescriptorUpdateAfterBindSampledImages(),
-                    descriptorProps.maxDescriptorSetUpdateAfterBindSamplers(),
-                    descriptorProps.maxDescriptorSetUpdateAfterBindSampledImages(),
-                    descriptorProps.maxUpdateAfterBindDescriptorsInAllPools());
+                    limits.maxDescriptorSetSampledImages());
 
             CausticaMod.LOGGER.info(
                     "RT portability limits: SBT handleAlignment={}, baseAlignment={}, maxStride={}; "
-                            + "AS scratchAlignment={}; update-after-bind combined-sampler limit={}",
+                            + "AS scratchAlignment={}; combined-sampler limits per-stage={}, descriptor-set={}",
                     rtProps.shaderGroupHandleAlignment(), rtProps.shaderGroupBaseAlignment(),
                     Integer.toUnsignedLong(rtProps.maxShaderGroupStride()),
-                    asProps.minAccelerationStructureScratchOffsetAlignment(), combinedImageSamplerLimit);
+                    asProps.minAccelerationStructureScratchOffsetAlignment(), perStageCombinedImageSamplerLimit,
+                    descriptorSetCombinedImageSamplerLimit);
 
             return new RtContext(device, pVma.get(0), rtProps.shaderGroupHandleSize(), rtProps.shaderGroupBaseAlignment(),
                     rtProps.shaderGroupHandleAlignment(), rtProps.maxShaderGroupStride(),
-                    asProps.minAccelerationStructureScratchOffsetAlignment(), combinedImageSamplerLimit);
+                    asProps.minAccelerationStructureScratchOffsetAlignment(), perStageCombinedImageSamplerLimit,
+                    descriptorSetCombinedImageSamplerLimit);
         }
     }
 
@@ -190,9 +187,14 @@ public final class RtContext {
         return maxShaderGroupStride;
     }
 
-    /** Conservative combined-image-sampler limit for a descriptor set using update-after-bind. */
-    public long updateAfterBindCombinedImageSamplerLimit() {
-        return updateAfterBindCombinedImageSamplerLimit;
+    /** Ordinary-descriptor combined-image-sampler ceiling for any one shader stage. */
+    public long perStageCombinedImageSamplerLimit() {
+        return perStageCombinedImageSamplerLimit;
+    }
+
+    /** Ordinary-descriptor combined-image-sampler ceiling across the whole pipeline layout. */
+    public long descriptorSetCombinedImageSamplerLimit() {
+        return descriptorSetCombinedImageSamplerLimit;
     }
 
     public int accelerationStructureScratchAlignment() {
@@ -295,7 +297,7 @@ public final class RtContext {
             VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default()
                     .imageType(VK10.VK_IMAGE_TYPE_2D).format(format)
                     .mipLevels(1).arrayLayers(1).samples(VK10.VK_SAMPLE_COUNT_1_BIT).tiling(VK10.VK_IMAGE_TILING_OPTIMAL)
-                    // SAMPLED so DLSS-RR can read these as input textures (color + guide buffers);
+                    // SAMPLED so denoise/upscaler providers can read color and guide buffers;
                     // STORAGE for raygen/compute writes; TRANSFER for the world-target copies.
                     .usage(usage)
                     .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED);

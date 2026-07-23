@@ -22,7 +22,7 @@ public final class RtMaterials {
     private static final float SMOOTH_ROUGH = 0.4f;
     private static final float SAND_ROUGH = 0.98f;
 
-    /** Water roughness; near-smooth so DLSS-RR resolves stable reflections. */
+    /** Water roughness; near-smooth so temporal reconstruction resolves stable reflections. */
     public static final float WATER_ROUGH = 0.08f;
     /** Lava: opaque emitter, moderately rough. */
     public static final float LAVA_ROUGH = 0.7f;

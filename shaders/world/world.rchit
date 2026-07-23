@@ -3,7 +3,14 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_nonuniform_qualifier : require
-#extension GL_EXT_ray_tracing_position_fetch : require // gl_HitTriangleVertexPositionsEXT for TBN
+#ifndef CAUSTICA_POSITION_FETCH_NONE
+#extension GL_EXT_ray_tracing_position_fetch : require
+#define HIT_TRIANGLE_POSITION(i) gl_HitTriangleVertexPositionsEXT[i]
+#else
+// Portable fallback for devices without VK_KHR_ray_tracing_position_fetch. Zero edges make
+// rayConeTextureLod select base LOD and perturbNormal keep the geometric normal.
+#define HIT_TRIANGLE_POSITION(i) vec3(0.0)
+#endif
 
 // Closest-hit shader. Geometry is per-section: gl_InstanceCustomIndexEXT indexes a section table (BDA
 // array reached from the push constant) holding this section's {prim, index, uv} buffer addresses.
@@ -51,10 +58,10 @@ layout(binding = 2, set = 0) uniform sampler2D blockAtlas;
 // Parallel LabPBR _s (specular) and _n (normal) atlases, stitched to mirror the block atlas
 // sprite layout (RtBlockMaterials), sampled at the SAME uv as blockAtlas. Read only when the prim is
 // flagged (pr.mat.z for _s, pr.mat.w for _n).
-// Bindings follow raygen extras (GUIDE_COUNT=23 → resources at 3..25).
-// materialBase = firstExtra(3) + GUIDE_COUNT(23) = 26 (must match RtPipeline).
-layout(binding = 26, set = 0) uniform sampler2D blockSpecAtlas;
-layout(binding = 27, set = 0) uniform sampler2D blockNormalAtlas;
+// Bindings follow raygen extras (GUIDE_COUNT=24 → resources at 3..26).
+// materialBase = firstExtra(3) + GUIDE_COUNT(24) = 27 (must match RtPipeline).
+layout(binding = 27, set = 0) uniform sampler2D blockSpecAtlas;
+layout(binding = 28, set = 0) uniform sampler2D blockNormalAtlas;
 // Bindless entity textures — a runtime-sized array indexed per-prim (tint.w) by the entity
 // hit path. Slot 0 is a fallback. Entities use per-type texture files, so each RenderType gets a slot.
 layout(binding = 0, set = 1) uniform sampler2D entityTex[];
@@ -243,7 +250,8 @@ void decodeSpec(vec4 s, vec3 albedo, out float rough, out float metal, out vec3 
 }
 
 // LabPBR _n decode (shared): rotate the tangent-space normal into world space via a TBN built from the hit
-// triangle's vertex positions (VK_KHR_ray_tracing_position_fetch) + UVs. `n` must already be oriented
+// triangle's vertex positions + UVs. Without position fetch the synthetic zero edges take the degenerate
+// fallback and preserve the geometric normal. `n` must already be oriented
 // toward the viewer (`vdir`). Clamps the result above the horizon so grazing perturbations don't invert it
 // through the surface (the black-spot fix). Returns AO (blue) via `ao`; falls back to `n` on a degenerate
 // UV triangle. Instance transforms are translation-only, so object edges equal world edges.
@@ -318,9 +326,9 @@ void main() {
         vec3 pbary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
         vec2 puv = pbary.x * uvb.uv[p0] + pbary.y * uvb.uv[p1] + pbary.z * uvb.uv[p2];
         int pslot = int(pr.tint.w + 0.5);
-        vec3 pp0 = mat3(gl_ObjectToWorldEXT) * gl_HitTriangleVertexPositionsEXT[0];
-        vec3 pp1 = mat3(gl_ObjectToWorldEXT) * gl_HitTriangleVertexPositionsEXT[1];
-        vec3 pp2 = mat3(gl_ObjectToWorldEXT) * gl_HitTriangleVertexPositionsEXT[2];
+        vec3 pp0 = mat3(gl_ObjectToWorldEXT) * HIT_TRIANGLE_POSITION(0);
+        vec3 pp1 = mat3(gl_ObjectToWorldEXT) * HIT_TRIANGLE_POSITION(1);
+        vec3 pp2 = mat3(gl_ObjectToWorldEXT) * HIT_TRIANGLE_POSITION(2);
         float particleLod = rayConeTextureLod(vec2(textureSize(entityTex[nonuniformEXT(pslot)], 0)),
                 pp0, pp1, pp2, uvb.uv[p0], uvb.uv[p1], uvb.uv[p2]);
         vec3 pn = normalize(pr.normal.xyz);
@@ -369,9 +377,9 @@ void main() {
         vec3 ebary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
         vec2 euvCoord = ebary.x * euv.uv[e0] + ebary.y * euv.uv[e1] + ebary.z * euv.uv[e2];
         int texSlot = int(pr.tint.w + 0.5);
-        vec3 ep0 = entityO2w * gl_HitTriangleVertexPositionsEXT[0];
-        vec3 ep1 = entityO2w * gl_HitTriangleVertexPositionsEXT[1];
-        vec3 ep2 = entityO2w * gl_HitTriangleVertexPositionsEXT[2];
+        vec3 ep0 = entityO2w * HIT_TRIANGLE_POSITION(0);
+        vec3 ep1 = entityO2w * HIT_TRIANGLE_POSITION(1);
+        vec3 ep2 = entityO2w * HIT_TRIANGLE_POSITION(2);
         float entityLod = rayConeTextureLod(vec2(textureSize(entityTex[nonuniformEXT(texSlot)], 0)),
                 ep0, ep1, ep2, euv.uv[e0], euv.uv[e1], euv.uv[e2]);
         float blockEntityLod = rayConeTextureLod(vec2(textureSize(blockAtlas, 0)),
@@ -444,9 +452,9 @@ void main() {
     vec2 uv2 = uvs.uv[3u * pid + 2u];
     vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
     vec2 uv = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
-    vec3 tp0 = gl_HitTriangleVertexPositionsEXT[0];
-    vec3 tp1 = gl_HitTriangleVertexPositionsEXT[1];
-    vec3 tp2 = gl_HitTriangleVertexPositionsEXT[2];
+    vec3 tp0 = HIT_TRIANGLE_POSITION(0);
+    vec3 tp1 = HIT_TRIANGLE_POSITION(1);
+    vec3 tp2 = HIT_TRIANGLE_POSITION(2);
     float blockLod = rayConeTextureLod(vec2(textureSize(blockAtlas, 0)), tp0, tp1, tp2, uv0, uv1, uv2);
 
     // Orient the GEOMETRIC normal toward the viewer FIRST (double-sided geometry), so the normal-map TBN

@@ -4,22 +4,12 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-// SER builds three SPIR-V variants from this source. The shader body uses the EXT spelling everywhere; the
-// CAUSTICA_SER_NV variant aliases that spelling to GL_NV_shader_invocation_reorder and expands the EXT fused
-// trace/reorder/execute helper into the equivalent NV three-step sequence. The CAUSTICA_SER_NONE variant
-// targets GPUs with no Shader Execution Reordering extension at all (AMD RDNA, Intel Arc, older NVIDIA): it
-// collapses the fused helper into a plain traceRayEXT (no hit object, no reorder) and takes the no-SER branch
-// in visibility(). Every bounce site reads its result from `payload`, never from the hit object, so the
-// traceRayEXT expansion is functionally identical minus the reorder's scheduling win.
-#if defined(CAUSTICA_SER_NV)
-#extension GL_NV_shader_invocation_reorder : require
-#define hitObjectEXT hitObjectNV
-#define hitObjectTraceRayEXT hitObjectTraceRayNV
-#define hitObjectExecuteShaderEXT hitObjectExecuteShaderNV
-#define hitObjectIsMissEXT hitObjectIsMissNV
-#define hitObjectTraceReorderExecuteEXT(hitObject_, topLevel_, rayFlags_, cullMask_, sbtRecordOffset_, sbtRecordStride_, missIndex_, origin_, Tmin_, direction_, Tmax_, payload_) \
-    { hitObjectTraceRayEXT(hitObject_, topLevel_, rayFlags_, cullMask_, sbtRecordOffset_, sbtRecordStride_, missIndex_, origin_, Tmin_, direction_, Tmax_, payload_); reorderThreadNV(hitObject_); hitObjectExecuteShaderEXT(hitObject_, payload_); }
-#elif defined(CAUSTICA_SER_NONE)
+// Build two SPIR-V variants from this source. The default uses the cross-vendor
+// GL_EXT_shader_invocation_reorder path. CAUSTICA_SER_NONE targets devices with no SER
+// extension: it collapses the fused helper into a plain traceRayEXT and takes the no-SER
+// visibility branch. Every bounce reads its result from `payload`, so the fallback is
+// functionally identical without the scheduling reorder.
+#if defined(CAUSTICA_SER_NONE)
 // No SER: `hitObjectEXT hObj;` becomes a throwaway local and the fused trace/reorder/execute collapses to a
 // single traceRayEXT, which invokes the hit/miss shaders directly (they write `payload`, exactly as the
 // hit-object execute would). visibility()'s hit-object miss query is handled by its own #ifdef branch.
@@ -53,7 +43,7 @@ layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
 // HDR trace target (B10G11R11_UFLOAT, 32bpp pure RGB): linear radiance may exceed 1. The
 // HDR -> LDR tonemap happens later, at the display.comp seam, not here.
 layout(binding = 1, set = 0, r11f_g11f_b10f) uniform image2D outImage;
-// Guide buffers — first-hit (primary-visibility) attributes consumed by the denoiser/DLSS-RR. Written
+// Guide buffers — first-hit (primary-visibility) attributes consumed by temporal reconstruction. Written
 // every frame regardless of accumulation. gNormal.w carries roughness; gDepth carries HW reversed-Z depth.
 layout(binding = 3, set = 0, rgba16f) uniform image2D gNormal; // xyz world normal, w roughness
 layout(binding = 4, set = 0, rgba16f) uniform image2D gAlbedo; // rgb diffuse albedo
@@ -153,13 +143,13 @@ WorldPush pc; // populated from the BDA buffer at the top of main()
 // is deterministic (no AA jitter yet), so every SPP sample's bounce 0 yields identical values.
 vec3 gv_normal;
 vec3 gv_albedo;
-vec3 gv_specAlb; // specular albedo fed to DLSS-RR for specular demodulation (0 = pure diffuse).
+vec3 gv_specAlb; // specular albedo guide for specular demodulation (0 = pure diffuse).
 float gv_rough;
 float gv_metalness;  // primary surface metalness (for adaptive firefly clamping)
 float gv_emission;   // primary surface emission strength (for emissive-adjacent firefly suppression)
 uint gv_material;     // explicit closest-hit material class; never inferred from roughness
 // Linear VIEW-SPACE depth (perpendicular distance from the camera plane), computed in main() from
-// gv_hitCamRel · camForward — this is what DLSS-RR's Depth_Type_Linear wants, not the slant ray
+// gv_hitCamRel · camForward — linear view depth, not the slant ray distance
 // length. Always >= 0; sky resolves to a large far value (no negative sentinel).
 float gv_depth;
 vec3 gv_hitCamRel;  // primary-surface hit position relative to the current camera (also the depth guide)
@@ -294,7 +284,7 @@ float computeAdaptiveClampThreshold(float roughness, float metalness, bool nearE
 
 // Water is a smooth dielectric. IOR 1.333; absorption is per-block Beer-Lambert extinction.
 // Keep the extinction mostly neutral and low so water reads as clear glassy volume instead of a
-// strongly blue-green fog. Guide roughness feeds DLSS-RR / NRD a stable primary water hit.
+// strongly blue-green fog. Guide roughness gives temporal reconstruction a stable primary water hit.
 // Slightly above a pure mirror (0.02) so REBLUR is less aggressive on SPP-1 glint fireflies
 // while still reading as smooth water; must stay <= prepare_nrd_inputs kSmoothDielectric (0.08).
 const float WATER_IOR = 1.333;
@@ -303,7 +293,7 @@ const vec3 SKY_SPEC_ALBEDO = vec3(0.5); // RR guide default for sky pixels.
 const vec3 SKY_DIFF_ALBEDO = vec3(0.5);
 
 // Stained glass / ice (material 3): a thin colored dielectric. IOR ~1.5 (soda-lime glass); the guide
-// roughness feeds DLSS-RR / NRD a stable smooth primary surface, as for water.
+// roughness gives temporal reconstruction a stable smooth primary surface, as for water.
 const float GLASS_IOR = 1.52;
 const float GLASS_GUIDE_ROUGH = 0.06;
 // Transmitted-ray origin offset when crossing a glass face. Must be SMALLER than the terrain-side
@@ -399,7 +389,7 @@ vec3 applyWaterWaves(vec3 nGeo, vec2 worldXZ, float t) {
 // the inverse Jacobian determinant of that surface→floor mapping (area compression = brightening, real
 // fold caustics where det → 0). Because this uses the SAME wave field as the visible surface normals,
 // the caustic pattern stays in sync with the ripples, and the per-sample sun-quad jitter (sampleSquare)
-// shifts the pattern per sample → caustics physically blur with depth under DLSS-RR accumulation.
+// shifts the pattern per sample → caustics physically blur with depth under temporal accumulation.
 const float CAUSTIC_EPS = 0.25; // finite-difference step (m); also low-passes sub-step wave detail
 const float CAUSTIC_MAX = 6.0;  // focusing clamp: keeps fold-line singularities from becoming fireflies
 
@@ -468,7 +458,7 @@ float hg(float cosT, float g) {
     return (1.0 - g2) / (4.0 * PI * pow(max(0.0, 1.0 + g2 - 2.0 * g * cosT), 1.5));
 }
 
-// NVIDIA RR guide-buffer helper: integrated/view-dependent specular reflectivity, not raw F0.
+// Reconstruction guide helper: integrated/view-dependent specular reflectivity, not raw F0.
 // alpha is GGX alpha (perceptual roughness squared), NoV is the first-hit view cosine.
 vec3 rrSpecularAlbedo(vec3 specularColor, float alpha, float NoV) {
     NoV = abs(NoV);
@@ -1470,7 +1460,7 @@ vec3 cosineDir(vec3 n, inout uint s) {
 // Soft shadows: sample a direction within the light's SQUARE angular extent about `axis`. MC's
 // sun/moon are square quads, so the NEE shadow ray samples a square (not a cone) — the same square the
 // visible disc in world.rmiss uses, built from the same celestial tangent frame (right = arc-travel
-// direction, from pc.celestial.xyz). Averaged over frames by DLSS-RR this yields soft penumbrae that
+// direction, from pc.celestial.xyz). Averaged over frames by temporal reconstruction this yields soft penumbrae that
 // widen with occluder distance (contact-hardening) for free. halfAngle <= 0 ⇒ exact direction (hard).
 vec3 sampleSquare(vec3 axis, float halfAngle, inout uint s) {
     vec3 right = normalize(cross(axis, pc.celestial.xyz));
@@ -1566,7 +1556,7 @@ vec2 previousReflectionNdc(vec3 surfacePos, vec3 surfaceNormal, vec3 reflectedWo
     return projectPrevNdc(mirroredHit);
 }
 
-// Reflection (specular) motion vector for DLSS-RR. Covers smooth specular blocks (metals / LabPBR _s)
+// Reflection (specular) motion vector for temporal reconstruction. Covers smooth specular blocks (metals / LabPBR _s)
 // and water reflections including underwater total-internal-reflection — any primary surface with a
 // sharp specular lobe (specular albedo > 0, roughness <= 0.5). A sky miss is treated as a reflected
 // hit at infinity along the reflected direction, so the same mirror-image reprojection handles surface
@@ -1787,7 +1777,7 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
             if (bounce == 0) { // primary ray hit sky: guides describe "no surface"
                 acc.clearRadiance += clamp(throughput * sky, vec3(0.0), vec3(MAX_BOUNCE_RADIANCE));
                 gv_normal = vec3(0.0);
-                // Flat mid-grey albedo guide for sky (NOT the bright sky radiance): demodulating DLSS-RR
+                // Flat mid-grey albedo guide for sky (NOT the bright sky radiance): demodulating reconstruction
                 // by the huge sun-disc radiance rings/artifacts around the sun. A constant albedo keeps the
                 // brightness in the lighting channel where RR resolves it cleanly.
                 gv_albedo = SKY_DIFF_ALBEDO;
@@ -2362,8 +2352,8 @@ void main() {
     // ray jitter is quantized to the tile's coarse grid (only 8 distinct offsets), so the first-bounce
     // directions inside one warp / subgroup land in far fewer buckets than per-pixel independent
     // jitter would produce. The hardware ray traversal can then keep more rays coherent across the
-    // first-bounce box tests — the win that VK_NV_/VK_EXT_ray_tracing_invocation_reorder buys on RTX
-    // hardware, recovered in software here on AMD RDNA / Intel Arc / pre-Blackwell NVIDIA.
+    // first-bounce box tests — the win provided by invocation reordering on capable devices
+    // hardware, recovered in software on devices without a usable SER path.
     //
     // Cost: RR sees a 1/64th-of-pixel aliasing pattern this frame that the temporal stack resolves
     // in ~8 frames; the trade is huge first-bounce coherence for cheap.
@@ -2389,7 +2379,7 @@ void main() {
 
     // Offset the primary ray within the pixel by the tile-coalesced sub-pixel jitter. The guide buffers
     // below come from this jittered first hit (they must match the jittered colour); only the motion
-    // vector stays on the unjittered centre, which DLSS expects.
+    // vector stays on the unjittered centre expected by temporal reconstruction.
     vec2 jndc = (uv + effectiveJitter / size) * 2.0 - 1.0;
 
     vec4 nearH = pc.invViewProj * vec4(jndc.x, jndc.y, 1.0, 1.0);
@@ -2475,15 +2465,15 @@ void main() {
             + frameSpecular + frameTransmission
             + frameClearRadiance + frameEmission;
 
-    // Hardware (non-linear, reversed-Z) depth for DLSS-RR + Frame Generation: project the camera-relative
+    // Hardware (non-linear, reversed-Z) depth for denoise/upscale/frame generation: project the camera-relative
     // primary hit through the forward view-projection and take ndc z/w — exactly the value a rasterizer
-    // would write. Reversed-Z (near=1, far=0), so DLSS gets the DepthInverted flag; sky's far hit -> ~0.
+    // would write. Reversed-Z is near=1, far=0; the sky's far hit therefore maps to approximately zero.
     // Depth follows the primary surface (water included); only the MV tracks the refracted hit.
     vec4 curClip = pc.curViewProj * vec4(gv_hitCamRel, 1.0);
     gv_depth = curClip.w > 0.0 ? curClip.z / curClip.w : 0.0;
     float frameViewZ = length(gv_normal) < 0.5 ? 65504.0 : max(curClip.w, 0.0);
 
-    // Guide buffers: first-hit attributes for the denoiser / DLSS-RR (written every frame).
+    // Guide buffers: first-hit attributes for denoise and temporal reconstruction (written every frame).
     imageStore(gNormal, pix, vec4(gv_normal, gv_rough));
     imageStore(gAlbedo, pix, vec4(gv_albedo, 1.0));
     imageStore(gDepth, pix, vec4(gv_depth, 0.0, 0.0, 0.0));
@@ -2595,7 +2585,7 @@ void main() {
         return;
     }
 
-    // Single noisy estimate; the denoiser (DLSS-RR) handles temporal convergence.
+    // Single noisy estimate; the selected denoiser handles temporal convergence.
     //
     // Non-finite guard: a degenerate geometry hit (zero-area triangle, NaN t-hit
     // from a missed intersection on a near-zero-determinant sub-tetra) can leave

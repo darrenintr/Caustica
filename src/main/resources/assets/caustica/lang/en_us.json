@@ -1,44 +1,31 @@
 {
 	"caustica.options.rt.header": "Ray Tracing",
-
 	"caustica.options.rt.exposureMode": "Exposure",
 	"caustica.options.rt.exposureMode.tooltip": "How the ray-traced image is mapped to display brightness. Auto adapts to scene luminance; Manual uses the exposure value directly.",
 	"caustica.options.rt.exposureMode.auto": "Auto",
 	"caustica.options.rt.exposureMode.manual": "Manual",
-
 	"caustica.options.rt.manualEv": "Exposure EV",
 	"caustica.options.rt.manualEv.tooltip": "Exposure compensation in stops. In Manual, this is the fixed exposure. In Auto, this biases the auto exposure brighter or darker.",
-
 	"caustica.options.rt.spp": "Samples Per Pixel",
 	"caustica.options.rt.spp.tooltip": "Path-tracing samples taken per pixel each frame. Higher is cleaner but more demanding.",
-
 	"caustica.options.rt.maxBounces": "Path Bounces",
 	"caustica.options.rt.maxBounces.tooltip": "Maximum number of secondary path-tracing bounces after the primary hit. Higher captures more indirect light but costs more.",
-
 	"caustica.options.rt.sunSize": "Sun Size",
 	"caustica.options.rt.sunSize.tooltip": "Angular radius of the sun and moon disk. Larger discs cast softer shadow penumbrae.",
-
 	"caustica.options.rt.entities": "Ray-Traced Entities",
 	"caustica.options.rt.entities.tooltip": "Include entities and block entities in the ray-traced scene.",
-
 	"caustica.options.rt.particles": "Ray-Traced Particles",
 	"caustica.options.rt.particles.tooltip": "Draw particles as camera-ray billboards inside the traced scene.",
-
 	"caustica.options.rt.glow": "Entity Glow Outline",
 	"caustica.options.rt.glow.tooltip": "Draw the vanilla Glowing-effect outline (through walls) around glowing entities.",
-
 	"caustica.options.rt.waterWaves": "Animated Water",
 	"caustica.options.rt.waterWaves.tooltip": "Animate water-surface normals for moving wave highlights.",
-
 	"caustica.options.rt.hdr": "HDR Output",
 	"caustica.options.rt.hdr.tooltip": "Present in HDR (ST.2084/PQ) instead of SDR, when the display supports it. Takes effect after restarting the game.",
-
 	"caustica.options.rt.hdrPaperWhite": "HDR Paper White",
 	"caustica.options.rt.hdrPaperWhite.tooltip": "Absolute brightness (in nits) that SDR-equivalent scene brightness maps to on an HDR display.",
-
 	"caustica.options.rt.hdrPeak": "HDR Peak Brightness",
 	"caustica.options.rt.hdrPeak.tooltip": "Absolute brightness (in nits) highlights roll off toward. Set to your display's peak HDR brightness.",
-
 	"caustica.options.rt.dlssQuality": "DLSS Quality",
 	"caustica.options.rt.dlssQuality.tooltip": "DLSS Ray Reconstruction quality mode. Lower-quality modes render fewer pixels and upscale more aggressively for higher framerates; higher-quality modes render more pixels for a sharper image. Only affects the image when DLSS Ray Reconstruction is enabled.",
 	"caustica.options.rt.dlssQuality.3": "Ultra Performance",
@@ -46,7 +33,6 @@
 	"caustica.options.rt.dlssQuality.1": "Balanced",
 	"caustica.options.rt.dlssQuality.2": "Quality",
 	"caustica.options.rt.dlssQuality.5": "DLAA",
-
 	"caustica.options.rt.debugView": "Debug View",
 	"caustica.options.rt.debugView.tooltip": "Visualize an intermediate ray-tracing buffer instead of the final image.",
 	"caustica.options.rt.debugView.0": "Off",
@@ -60,10 +46,8 @@
 	"caustica.options.rt.debugView.8": "Shadow Hit",
 	"caustica.options.rt.debugView.9": "Diffuse Split",
 	"caustica.options.rt.debugView.10": "Reflection Split",
-
 	"caustica.options.rt.debugOverlay": "RT Debug Overlay",
 	"caustica.options.rt.debugOverlay.tooltip": "Show live ray-tracing pipeline state in the top-left of the screen (active upscaler, denoise mode, frame counter, last DLSS-RR return code, per-stage timings). Useful when an image looks wrong.",
-
 	"caustica.options.rt.upscalerMode": "Upscaler",
 	"caustica.options.rt.upscalerMode.tooltip": "Which upscaler to use. Auto uses TAAU. Pick FSR2 for classic FidelityFX Super Resolution (pairs with the AMD FidelityFX denoise preset). Changes take effect immediately.",
 	"caustica.options.rt.upscalerMode.auto": "Auto",
@@ -75,7 +59,6 @@
 	"caustica.options.rt.upscalerMode.fsr-4": "FSR 4.1 INT8 (RDNA 3/4)",
 	"caustica.options.rt.upscalerMode.xess": "XeSS",
 	"caustica.options.rt.upscalerMode.nis": "NIS (NVIDIA Image Scaling)",
-
 	"caustica.options.rt.denoiseMode": "Denoise",
 	"caustica.options.rt.denoiseMode.tooltip": "Internal denoise. AMD FidelityFX: FFX shadow/refl + residual GI, forces FSR2 (no NRD). Auto: vendor pick (AMD→NRD). NRD: REBLUR only. FFX: same FFX stack without forcing FSR2. Hybrid: currently NRD-only (FFX prepass disabled). Off: raw grain.",
 	"caustica.options.rt.denoiseMode.auto": "Auto (AMD→NRD)",
@@ -83,5 +66,12 @@
 	"caustica.options.rt.denoiseMode.ffx": "FFX only",
 	"caustica.options.rt.denoiseMode.nrd": "NRD only",
 	"caustica.options.rt.denoiseMode.hybrid": "Hybrid (NRD; FFX prepass off)",
-	"caustica.options.rt.denoiseMode.off": "Off"
+	"caustica.options.rt.denoiseMode.off": "Off",
+	"caustica.options.rt.upscalerQuality": "Upscaler Quality",
+	"caustica.options.rt.upscalerQuality.tooltip": "Render-scale quality used by the active upscaler. Higher quality renders more source pixels; lower quality improves performance.",
+	"caustica.options.rt.upscalerQuality.0": "Native",
+	"caustica.options.rt.upscalerQuality.1": "Quality",
+	"caustica.options.rt.upscalerQuality.2": "Balanced",
+	"caustica.options.rt.upscalerQuality.3": "Performance",
+	"caustica.options.rt.upscalerQuality.4": "Ultra Performance"
 }

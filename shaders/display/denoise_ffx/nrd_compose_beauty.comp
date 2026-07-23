@@ -13,7 +13,7 @@ layout(binding = 4, rgba16f) readonly  uniform image2D gNormalRough;
 layout(binding = 5, r11f_g11f_b10f) readonly  uniform image2D gClearRadiance; // pre-denoise beauty (sky + full frame)
 layout(binding = 6, r8)      readonly  uniform image2D gTransparencyMask; // 1.0=transparent, 0.0=opaque
 layout(binding = 7, r11f_g11f_b10f) readonly  uniform image2D gTransparentDenoised; // denoised glass/water
-layout(binding = 8, r11f_g11f_b10f) writeonly uniform image2D gOut;
+layout(binding = 8, rgba16f) writeonly uniform image2D gOut;
 layout(binding = 9, rgba16f) readonly uniform image2D gClearEmission;
 layout(binding = 10, rgba16f) readonly uniform image2D gTransmission;
 layout(binding = 11, rgba16f) readonly uniform image2D gSigmaShadow;

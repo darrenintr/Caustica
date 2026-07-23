@@ -37,8 +37,8 @@ layout(push_constant) uniform PushAddr { uint64_t worldPushAddr; } pcAddr;
 
 // Vanilla celestials atlas (sun + moon-phase sprites), bound by RtComposite. Sampled with an explicit
 // LOD (no derivatives in a miss shader). The sun/moon discs are drawn from its real texels.
-// materialBase = firstExtra(3)+GUIDE_COUNT(23)=26 → _s@26 _n@27 sky@28.
-layout(binding = 28, set = 0) uniform sampler2D celestialsAtlas;
+// materialBase = firstExtra(3)+GUIDE_COUNT(24)=27 → _s@27 _n@28 sky@29.
+layout(binding = 29, set = 0) uniform sampler2D celestialsAtlas;
 
 struct Payload {
     vec3 albedo;
@@ -250,7 +250,7 @@ vec3 stars(vec3 dir, float starBrightness, float VdotS) {
     float cs = cos(ang), sn = sin(ang);
     q = mat2(cs, -sn, sn, cs) * q;
     float box = max(abs(q.x), abs(q.y));               // Chebyshev distance → square
-    float star = 1.0 - smoothstep(sz * 0.6, sz, box);  // soft-edged square (helps DLSS stability)
+    float star = 1.0 - smoothstep(sz * 0.6, sz, box);  // soft-edged square (helps temporal reconstruction stability)
     if (star <= 0.0) return vec3(0.0);
     float bright = 0.55 + 0.45 * hash13(id + 71.0);    // mild per-star brightness variation
     star *= bright * min(dir.y * 3.0, 1.0) * max(0.0, 1.0 - pow(abs(VdotS) * 1.002, 100.0));

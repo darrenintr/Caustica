@@ -70,6 +70,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     private int height;
     private boolean nrdRanLogged;
     private boolean nrdFailLogged;
+    private boolean nrdMaxFramesSetterUnsupportedLogged;
     /** True if last dispatch finished REBLUR + compose (caller uses light residual TAA). */
     private volatile boolean lastNrdOk;
     private volatile boolean lastPrepareOk;
@@ -77,6 +78,17 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     private volatile boolean lastComposeOk;
     /** What the last frame actually did, for the debug overlay. */
     private volatile String lastPathLabel = "idle";
+
+    /**
+     * Render-resolution RGBA8 mix whose {@code .b} channel holds the NRD
+     * prep-pass disocclusion signal (already refined by the along-normal MV
+     * pre-filter). Used by the FSR2 self-derived reactive mask (see
+     * {@code fsr2_reactive_mask.comp}) to keep camera-cut / anti-parallax
+     * boundary texels from blending stale history.
+     */
+    public RtImage getDisocclusionMix() {
+        return disocclusionMix;
+    }
 
     private RtImage shadowHit;
     private RtImage diffuse;
@@ -141,6 +153,10 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
 
     private long prepDsl, prepPool, prepSet, prepLayout, prepPipe;
     private long prewarpDsl, prewarpPool, prewarpSet, prewarpLayout, prewarpPipe;
+    // Motion-disocclusion pre-filter (Sundial-style along-normal MV check). Runs after
+    // prepare_nrd_inputs and before the NRD dispatch. Refines gDisocclusionMix.b.
+    private long motionDisDsl, motionDisPool, motionDisSet, motionDisLayout, motionDisPipe;
+    private final long[] motionDisBindings = new long[6];
     private long compDsl, compPool, compSet, compLayout, compPipe;
     private final long[] prepBindings = new long[22];
     /** 5 slots: jitterGuide sampler, inDiff sampler, inSpec sampler, outDiff storage, outSpec storage. */
@@ -182,6 +198,11 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
             return nrdOnly ? "nrd-relax" : "hybrid-relax-nrd";
         }
         return nrdOnly ? "nrd-only" : "hybrid-ffx-nrd";
+    }
+
+    @Override
+    public int outputColorFormat(int rawBeautyFormat) {
+        return VK10.VK_FORMAT_R16G16B16A16_SFLOAT;
     }
 
     /** Last frame's resolved path label (e.g. {@code nrd}, {@code ffx→nrd}, {@code ffx-only}). */
@@ -374,6 +395,13 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                 CausticaMod.LOGGER.warn("Hybrid nrd_prewarp pipeline failed; NRD will see uncorrected input", t);
             }
         }
+        if (motionDisPipe == 0L) {
+            try {
+                createMotionDisocclusionPipeline(ctx);
+            } catch (Throwable t) {
+                CausticaMod.LOGGER.warn("Hybrid motion_disocclusion pipeline failed; NRD will use prep-only mix", t);
+            }
+        }
         if (compPipe == 0L) {
             try {
                 createComposePipeline(ctx);
@@ -426,6 +454,21 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
             // advertising it here makes the native shim create concurrent-sharing resources
             // even though no ownership transfer is performed, which breaks on AMD drivers.
             NrdRuntime.INSTANCE.ensureContext(dev, phys, graphicsFamily, -1, width, height);
+            // Push the user's denoise.nrd-max-accumulated-frames config into NRD now that
+            // the context exists. If the bundled .so predates the v3 setter symbols this
+            // returns false and we keep NRD's hardcoded default (32).
+            int userMaxFrames = CausticaConfig.Rt.Denoise.NRD_MAX_ACCUMULATED_FRAMES.value();
+            if (!NrdRuntime.INSTANCE.setReblurMaxAccumulatedFrames(userMaxFrames)) {
+                if (!NrdRuntime.INSTANCE.supportsReblurMaxAccumulatedFramesSetter()) {
+                    nrdMaxFramesSetterUnsupportedLogged = true;
+                    CausticaMod.LOGGER.info("nrd.maxAccumulatedFrameNum setter unavailable in bundled "
+                            + "NRD shim; using hardcoded default. Rebuild native to expose the runtime setter.");
+                }
+            }
+            if (useRelax) {
+                NrdRuntime.INSTANCE.ensureContextRelax(dev, phys, graphicsFamily, -1, width, height);
+                NrdRuntime.INSTANCE.setRelaxMaxAccumulatedFrames(userMaxFrames);
+            }
         } catch (Throwable t) {
             CausticaMod.LOGGER.warn("NRD ensureContext at resize failed", t);
         }
@@ -537,6 +580,33 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                 lastPrepareOk = true;
             } catch (Throwable t) {
                 CausticaMod.LOGGER.warn("Hybrid prepare_nrd_inputs failed", t);
+            }
+        }
+
+        // Motion-disocclusion pre-filter (Sundial-style along-normal MV check). Refines
+        // disocclusionMix.b before NRD sees it. Runs only when the pipeline compiled.
+        if (motionDisPipe != 0L && inMotion != null && viewZ != null
+                && inNormal != null && confidenceDisocclusion != null && disocclusionMix != null) {
+            try {
+                bindMotionDisocclusion(ctx, inMotion, viewZ, inDepth, inNormal,
+                        confidenceDisocclusion, disocclusionMix);
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd,
+                        "motion_disocclusion (sundial-style along-normal)")) {
+                    VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, motionDisPipe);
+                    VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, motionDisLayout, 0,
+                            stack.longs(motionDisSet), null);
+                    ByteBuffer push = stack.malloc(16);
+                    // 0.05 = Sundial's empirical 5%-of-view-distance tolerance.
+                    push.putFloat(0, 0.05f);
+                    push.putFloat(4, 0.0f);
+                    push.putFloat(8, 0.0f);
+                    push.putFloat(12, 0.0f);
+                    VK10.vkCmdPushConstants(cmd, motionDisLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
+                    VK10.vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+                }
+                barrier(stack, cmd, disocclusionMix.image);
+            } catch (Throwable t) {
+                CausticaMod.LOGGER.warn("Hybrid motion_disocclusion failed; continuing with prep-only mix", t);
             }
         }
 
@@ -783,6 +853,13 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                 VK10.vkDestroyDescriptorSetLayout(ctx.vk(), prepDsl, null);
                 prepPipe = prepLayout = prepPool = prepDsl = prepSet = 0L;
             }
+            if (motionDisPipe != 0L) {
+                VK10.vkDestroyPipeline(ctx.vk(), motionDisPipe, null);
+                VK10.vkDestroyPipelineLayout(ctx.vk(), motionDisLayout, null);
+                VK10.vkDestroyDescriptorPool(ctx.vk(), motionDisPool, null);
+                VK10.vkDestroyDescriptorSetLayout(ctx.vk(), motionDisDsl, null);
+                motionDisPipe = motionDisLayout = motionDisPool = motionDisDsl = motionDisSet = 0L;
+            }
             if (prewarpPipe != 0L) {
                 VK10.vkDestroyPipeline(ctx.vk(), prewarpPipe, null);
                 VK10.vkDestroyPipelineLayout(ctx.vk(), prewarpLayout, null);
@@ -835,6 +912,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
 
     private void destroyImages() {
         Arrays.fill(prepBindings, 0L);
+            Arrays.fill(motionDisBindings, 0L);
         Arrays.fill(compBindings, 0L);
         if (beautyRawCopy != null) {
             beautyRawCopy.destroy();
@@ -1053,6 +1131,104 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                     "vkCreateComputePipelines(hybrid-prep)");
             prepPipe = pPipe.get(0);
             VK10.vkDestroyShaderModule(ctx.vk(), mod, null);
+        }
+    }
+
+    private void createMotionDisocclusionPipeline(RtContext ctx) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            // 6 storage-image bindings (matches motion_disocclusion.comp):
+            //   0 = gMotion (rg16f), 1 = gViewZ (r32f), 2 = gDeviceDepth (r32f),
+            //   3 = gNormalRough (rgba16f), 4 = gConfidenceDisoccl (rgba8),
+            //   5 = gDisocclusionMix (rgba8) writeonly.
+            final int BINDINGS = 6;
+            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(BINDINGS, stack);
+            for (int i = 0; i < BINDINGS; i++) {
+                binds.get(i).binding(i).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                        .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+            }
+            LongBuffer pDsl = stack.mallocLong(1);
+            check(VK10.vkCreateDescriptorSetLayout(ctx.vk(),
+                    VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds), null, pDsl),
+                    "vkCreateDescriptorSetLayout(hybrid-motion-disocclusion)");
+            motionDisDsl = pDsl.get(0);
+
+            VkDescriptorPoolSize.Buffer sizes = VkDescriptorPoolSize.calloc(1, stack);
+            sizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(BINDINGS);
+            LongBuffer pPool = stack.mallocLong(1);
+            check(VK10.vkCreateDescriptorPool(ctx.vk(),
+                    VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(1).pPoolSizes(sizes), null, pPool),
+                    "vkCreateDescriptorPool(hybrid-motion-disocclusion)");
+            motionDisPool = pPool.get(0);
+
+            LongBuffer pSet = stack.mallocLong(1);
+            check(VK10.vkAllocateDescriptorSets(ctx.vk(),
+                    VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
+                            .descriptorPool(motionDisPool).pSetLayouts(stack.longs(motionDisDsl)), pSet),
+                    "vkAllocateDescriptorSets(hybrid-motion-disocclusion)");
+            motionDisSet = pSet.get(0);
+
+            // 16-byte push constant: float threshold + 3 pad floats
+            VkPushConstantRange.Buffer pcr = VkPushConstantRange.calloc(1, stack);
+            pcr.get(0).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(16);
+            LongBuffer pLayout = stack.mallocLong(1);
+            check(VK10.vkCreatePipelineLayout(ctx.vk(),
+                    VkPipelineLayoutCreateInfo.calloc(stack).sType$Default()
+                            .pSetLayouts(stack.longs(motionDisDsl)).pPushConstantRanges(pcr), null, pLayout),
+                    "vkCreatePipelineLayout(hybrid-motion-disocclusion)");
+            motionDisLayout = pLayout.get(0);
+
+            byte[] spv;
+            try (InputStream in = HybridFfxNrdBackend.class.getResourceAsStream(
+                    "/caustica/rt/motion_disocclusion.comp.spv")) {
+                if (in == null) {
+                    throw new IllegalStateException("missing motion_disocclusion.comp.spv");
+                }
+                spv = in.readAllBytes();
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+            ByteBuffer code = MemoryUtil.memAlloc(spv.length);
+            code.put(spv).flip();
+            LongBuffer pMod = stack.mallocLong(1);
+            check(VK10.vkCreateShaderModule(ctx.vk(),
+                    VkShaderModuleCreateInfo.calloc(stack).sType$Default().pCode(code), null, pMod),
+                    "vkCreateShaderModule(hybrid-motion-disocclusion)");
+            long mod = pMod.get(0);
+            MemoryUtil.memFree(code);
+
+            VkPipelineShaderStageCreateInfo stage = VkPipelineShaderStageCreateInfo.calloc(stack)
+                    .sType$Default()
+                    .stage(VK10.VK_SHADER_STAGE_COMPUTE_BIT)
+                    .module(mod)
+                    .pName(stack.UTF8("main"));
+            LongBuffer pPipe = stack.mallocLong(1);
+            check(VK10.vkCreateComputePipelines(ctx.vk(), 0,
+                    VkComputePipelineCreateInfo.calloc(1, stack).sType$Default()
+                            .stage(stage).layout(motionDisLayout), null, pPipe),
+                    "vkCreateComputePipelines(hybrid-motion-disocclusion)");
+            motionDisPipe = pPipe.get(0);
+            VK10.vkDestroyShaderModule(ctx.vk(), mod, null);
+        }
+    }
+
+    private void bindMotionDisocclusion(RtContext ctx,
+                                        RtImage motion, RtImage viewZ, RtImage deviceDepth,
+                                        RtImage normalRough, RtImage confidence, RtImage disocclusionMix) {
+        RtImage[] imgs = {motion, viewZ, deviceDepth, normalRough, confidence, disocclusionMix};
+        long[] views = Arrays.stream(imgs).mapToLong(image -> image.view).toArray();
+        if (Arrays.equals(motionDisBindings, views)) {
+            return;
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(imgs.length, stack);
+            for (int i = 0; i < imgs.length; i++) {
+                VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
+                info.get(0).imageView(imgs[i].view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+                writes.get(i).sType$Default().dstSet(motionDisSet).dstBinding(i)
+                        .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(info);
+            }
+            VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
+            System.arraycopy(views, 0, motionDisBindings, 0, views.length);
         }
     }
 

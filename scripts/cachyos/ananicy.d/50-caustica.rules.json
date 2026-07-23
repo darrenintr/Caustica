@@ -11,8 +11,8 @@
       }
     },
     {
-      "name": "Caustica NGX / FSR / XeSS native shims",
-      "comment": "The mod dlopens libngxshim.so, libamd_fidelityfx_*.so, and libxess.so at runtime. They are loaded into the same JVM process so ananicy's process-name match (java) catches them — no separate rule needed. Listed here for visibility.",
+      "name": "Caustica optional native providers",
+      "comment": "Optional denoise and upscaler libraries are loaded into the Minecraft JVM, so the existing Java process rule already covers them; no GPU-vendor-specific process rule is required.",
       "type": "Game",
       "nice": -6
     },

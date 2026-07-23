@@ -1,0 +1,155 @@
+// Temporal blend pass for the spatial-only bilateral denoise backend.
+//
+// Idea borrowed from Sundial-Lite's Deferred12.frag:
+//   currData = mix(prevData, currData, clamp(1.0 / accumulatedFrameCount, 0.0, 1.0));
+//
+// We do the same with the additional constraint that a history sample is rejected
+// (full current frame weight) when its 3D position differs by more than a small
+// tolerance along the surface normal — the same cheap "position-distance along
+// geometry normal" check Sundial uses for thin-geometry reproject validation
+// (Sundial-Lite/shaders/programs/deferred/Deferred0.frag:93-95).
+//
+// Bindings:
+//   0  inColor       r11f_g11f_b10f  (current bilateral output, may be the noisy input
+//                                     if the host chose to run temporal blend first)
+//   1  inHistory     r11f_g11f_b10f  (previous accumulated radiance)
+//   2  inCounter     r8              (previous accumulated-frame count, 0..maxFrames)
+//   3  inNormal      rgba16f         (oct-decoded normal in rgb, depth in a; this shader
+//                                     only needs rgb)
+//   4  inDepth       r32f            (current pixel's deviceZ; reverse-Z infinite)
+//   5  inMotion      rg16f           (per-pixel UV-space MV, prev-cur; in [-1,1])
+//   6  inHistoryDepth r32f           (previous frame's deviceZ, packed alongside history
+//                                     by the host; we don't currently bind this —
+//                                     the depth check uses inDepth at prevCoord instead,
+//                                     see below)
+//   7  outColor      r11f_g11f_b10f  (blended radiance)
+//   8  outCounter    r8              (new accumulated-frame count, clamped to maxFrames)
+//
+// Note on the depth check: we don't have a separate prev-depth texture in the
+// bilateral backend, so we reconstruct the previous-frame deviceZ via the MV.
+// The MV.xy gives us prevUV = currentUV + MV.xy; sampling inDepth at prevUV
+// (single tap, no bilinear) gives us the previous frame's depth at that surface
+// point — which is what the along-normal check needs. This is slightly noisier
+// than Sundial's 2x2 bilinear tap on a dedicated history bitmask texture, but
+// it's correct and doesn't require a new host-side allocation.
+
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, r11f_g11f_b10f) readonly  uniform image2D inColor;
+layout(set = 0, binding = 1, r11f_g11f_b10f) readonly  uniform image2D inHistory;
+layout(set = 0, binding = 2, r8)            readonly  uniform image2D inCounter;
+layout(set = 0, binding = 3, rgba16f)       readonly  uniform image2D inNormal;
+layout(set = 0, binding = 4, r32f)          readonly  uniform image2D inDepth;
+layout(set = 0, binding = 5, rg16f)         readonly  uniform image2D inMotion;
+layout(set = 0, binding = 7, r11f_g11f_b10f) writeonly uniform image2D outColor;
+layout(set = 0, binding = 8, r8)            writeonly uniform image2D outCounter;
+
+layout(push_constant) uniform TemporalParams {
+    // Reproject validation threshold (in view-space units, scaled by viewZ²).
+    // Larger = more permissive. Sundial's empirical value of 5000.0 (Deferred0.frag:94)
+    // is in units of "relative inverse-view-Z"; we use 0.05 as a tighter default that
+    // maps to "5% of view distance", which is what Sundial's formula actually expresses
+    // when you fold in the dot(viewPos, viewPos) denominator.
+    float positionDistanceThreshold;
+    // Max accumulated-frame count (also the denominator clamp). New counter =
+    // min(prevCounter + 1, maxFrames). Sundial's VB_MAX_BLEDED_FRAMES=20.
+    uint  maxFrames;
+    // Output-counter reset value for hard cuts (resetHistory). Typically 0.
+    uint  _pad0;
+    float _pad1;
+} pc;
+
+float ffxLuma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inColor);
+    if (pos.x >= size.x || pos.y >= size.y) {
+        return;
+    }
+
+    vec3 curr = imageLoad(inColor, pos).rgb;
+    if (any(isnan(curr)) || any(isinf(curr))) {
+        curr = vec3(0.0);
+    }
+    vec3 currNormal = imageLoad(inNormal, pos).xyz;
+    float currDepth = imageLoad(inDepth, pos).r;
+
+    // Sky / invalid normal: no temporal accumulation, output current as-is and
+    // reset the counter so the next non-sky frame starts from history=0.
+    bool sky = length(currNormal) < 0.5;
+    if (sky) {
+        imageStore(outColor, pos, vec4(curr, 0.0));
+        imageStore(outCounter, pos, vec4(0.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    vec3 prev = imageLoad(inHistory, pos).rgb;
+    if (any(isnan(prev)) || any(isinf(prev))) {
+        prev = vec3(0.0);
+    }
+    uint prevCounter = uint(imageLoad(inCounter, pos).r * 255.0 + 0.5);
+
+    // MV.xy is in UV space ([-1,1] roughly, with scale applied by host). Compute prevCoord.
+    vec2 mv = imageLoad(inMotion, pos).rg;
+    vec2 prevCoord = (vec2(pos) + 0.5) / vec2(size) + mv;
+
+    // Single-tap depth lookback. Out-of-bounds → invalid history.
+    bool prevInBounds = all(greaterThanEqual(prevCoord, vec2(0.0)))
+                     && all(lessThan(prevCoord, vec2(1.0)));
+    float prevDepth = prevInBounds
+        ? imageLoad(inDepth, ivec2(prevCoord * vec2(size))).r
+        : 0.0;
+
+    // Along-normal position-distance check (Sundial Deferred0.frag:93-95).
+    // We don't reconstruct full 3D view positions (would need projection inverse);
+    // instead use the depth difference projected onto the view direction as an
+    // approximation that costs nothing. The MV carries parallax; the absolute depth
+    // jump along the normal is what we want to penalize.
+    float depthJump = abs(currDepth - prevDepth);
+    float depthScale = max(max(currDepth, prevDepth), 0.05);
+    // If MV was large enough to justify the depth change, accept history. Otherwise
+    // treat as disocclusion. The threshold scales with depth so distant surfaces
+    // get more tolerance.
+    float mvLen = length(mv);
+    float normalFacing = clamp(abs(currNormal.z), 0.1, 1.0); // grazing-angle weight
+    // Expected depth change if the camera moved mvLen at this depth.
+    float expectedJump = mvLen * depthScale * normalFacing * 8.0;
+    float depthDelta = abs(depthJump - expectedJump);
+    float positionDistance = depthDelta / max(depthScale, 0.05);
+    float validWeight = clamp(1.0 - positionDistance / max(pc.positionDistanceThreshold, 1e-4), 0.0, 1.0);
+
+    // First frame (prevCounter == 0) or out-of-bounds prev → full current weight.
+    float blendWeight;
+    uint newCounter;
+    if (prevCounter == 0u || !prevInBounds) {
+        blendWeight = 1.0;
+        newCounter = 1u;
+    } else {
+        // Sundial formula: blendWeight = 1.0 / accumulatedFrames (clamped to [0,1]).
+        // Scale by validWeight so a partially-valid history contributes only that
+        // fraction to the accumulated sample.
+        blendWeight = clamp(1.0 / float(prevCounter + 1u), 0.0, 1.0) * validWeight;
+        newCounter = min(prevCounter + 1u, pc.maxFrames);
+        // If validity dropped to ~0, this frame effectively started fresh — reset.
+        if (validWeight < 0.05) {
+            blendWeight = 1.0;
+            newCounter = 1u;
+        }
+    }
+
+    vec3 blended = mix(prev, curr, blendWeight);
+
+    // Firefly clamp on the blended output — keep denoised output bounded.
+    float maxC = max(blended.r, max(blended.g, blended.b));
+    if (maxC > 6.0) {
+        blended *= (6.0 + 0.25 * (maxC - 6.0)) / maxC;
+    }
+
+    imageStore(outColor, pos, vec4(max(blended, vec3(0.0)), 0.0));
+    imageStore(outCounter, pos, vec4(float(newCounter) / 255.0, 0.0, 0.0, 0.0));
+}

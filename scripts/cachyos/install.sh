@@ -2,7 +2,7 @@
 # install.sh — one-shot setup for CachyOS / Arch.
 #
 # What this does (idempotent, safe to re-run):
-#   1. Installs runtime deps (gamemode, ananicy-cpp, nvidia-utils, lib32-...).
+#   1. Installs vendor-neutral runtime helpers (GameMode, ananicy-cpp, Vulkan tools).
 #   2. Enables ananicy-cpp service (the daemon that reads our rules).
 #   3. Installs the Caustica ananicy rule into /etc/ananicy.d/50-caustica.rules.
 #   4. Optimises a few kernel sysctls (THP defrag, vm.swappiness, NR-hugepages).
@@ -44,7 +44,6 @@ log "installing runtime deps (pacman)"
 pacman -S --needed --noconfirm \
     gamemode lib32-gamemode \
     numactl \
-    nvidia-utils lib32-nvidia-utils \
     vulkan-icd-loader vulkan-tools \
     ananicy-cpp ananicy-cpp-games 2>/dev/null || \
     warn "ananicy-cpp not in repos — install from AUR if you want auto-priority"

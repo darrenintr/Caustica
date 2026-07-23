@@ -54,7 +54,7 @@ import static dev.comfyfluffy.caustica.rt.RtContext.check;
  * tears everything down.
  *
  * <p>Motion-vector convention matches {@code world.rgen}'s {@code gMotion}
- * ({@code (prevNdc - curNdc) * 0.5 * size} = pixel offset current→previous, same as DLSS/FSR)
+ * ({@code (prevNdc - curNdc) * 0.5 * size} = pixel offset current→previous, matching temporal upscaler convention)
  * and {@code ffx_reproject.comp}: {@code prevUV = uv + mv * motionVectorScale}, with
  * {@code motionVectorScale = (1/w, 1/h)}. Using minus inverts the sample and produces multi-frame
  * ghost trails. Depth is compared against current {@code gDepth} (HW reversed-Z, near=1); sky

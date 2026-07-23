@@ -20,6 +20,7 @@ public final class RtExposure {
     private RtBuffer histogram;
     private RtBuffer state;
     private RtExposurePipeline pipeline;
+    private int pipelineInputFormat = -1;
     private boolean logged;
     private long lastFrameNanos;
 
@@ -31,7 +32,7 @@ public final class RtExposure {
         return image != null;
     }
 
-    public void ensureResources(RtContext ctx) {
+    public void ensureResources(RtContext ctx, int inputFormat) {
         if (image == null) {
             image = ctx.createStorageImage(1, 1, VK10.VK_FORMAT_R32_SFLOAT, "display exposure");
         }
@@ -45,8 +46,13 @@ public final class RtExposure {
                 state = ctx.createBuffer(16, VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "exposure state");
                 resetAutoHistory();
             }
+            if (pipeline != null && pipelineInputFormat != inputFormat) {
+                pipeline.destroy();
+                pipeline = null;
+            }
             if (pipeline == null) {
-                pipeline = RtExposurePipeline.create(ctx);
+                pipeline = RtExposurePipeline.create(ctx, inputFormat);
+                pipelineInputFormat = inputFormat;
             }
         }
         logOnce();
@@ -74,6 +80,7 @@ public final class RtExposure {
         if (pipeline != null) {
             pipeline.destroy();
             pipeline = null;
+            pipelineInputFormat = -1;
         }
         if (histogram != null) {
             histogram.destroy();

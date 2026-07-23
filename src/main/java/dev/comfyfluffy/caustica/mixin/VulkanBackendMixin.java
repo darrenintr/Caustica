@@ -1,7 +1,5 @@
 package dev.comfyfluffy.caustica.mixin;
 
-import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
-import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.llamalad7.mixinextras.sugar.Local;
 import com.mojang.blaze3d.shaders.GpuDebugOptions;
 import com.mojang.blaze3d.shaders.ShaderSource;
@@ -15,7 +13,6 @@ import dev.comfyfluffy.caustica.rt.VulkanDiagnostics;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VkDevice;
-import org.lwjgl.vulkan.VkDeviceCreateInfo;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
 import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
@@ -60,31 +57,12 @@ public abstract class VulkanBackendMixin {
 			new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "shaderFloat16", VkPhysicalDeviceVulkan12Features.SHADERFLOAT16));
 
 	private static final List<String> CAUSTICA_WANTED_EXTENSIONS = List.of(
-			// FFX (FSR)
+			// Cross-vendor SDK/runtime compatibility aliases.
 			"VK_KHR_get_memory_requirements2",
 			"VK_KHR_dedicated_allocation",
-			// NGX (DLSS) — NVIDIA-only; skipped on other vendors. (The NGX instance
-			// extension VK_KHR_get_physical_device_properties2 needs an instance hook;
-			// DLSS relies on it being core/enabled at instance level.)
-			"VK_NVX_binary_import",
-			"VK_NVX_image_view_handle",
 			"VK_KHR_push_descriptor");
 
 	private static final Set<String> loggedMissingSdkFeatures = new HashSet<>();
-
-	/** NVIDIA advertises AMD markers too, but its native diagnostic checkpoints contain better fault context. */
-	@WrapOperation(
-			method = "createDevice(JLcom/mojang/blaze3d/shaders/ShaderSource;Lcom/mojang/blaze3d/shaders/GpuDebugOptions;Ljava/lang/Runnable;)Lcom/mojang/blaze3d/systems/GpuDevice;",
-			at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/vulkan/VulkanPhysicalDevice;hasDeviceExtension(Ljava/lang/String;)Z"))
-	private boolean caustica$preferNvidiaCheckpoints(VulkanPhysicalDevice physicalDevice, String extension,
-			Operation<Boolean> original) {
-		if ("VK_AMD_buffer_marker".equals(extension)
-				&& "NVIDIA".equals(physicalDevice.vendorName())
-				&& physicalDevice.hasDeviceExtension("VK_NV_device_diagnostic_checkpoints")) {
-			return false;
-		}
-		return original.call(physicalDevice, extension);
-	}
 
 	@ModifyArgs(
 			method = "createDevice(JLcom/mojang/blaze3d/shaders/ShaderSource;Lcom/mojang/blaze3d/shaders/GpuDebugOptions;Ljava/lang/Runnable;)Lcom/mojang/blaze3d/systems/GpuDevice;",
@@ -95,14 +73,6 @@ public abstract class VulkanBackendMixin {
 		Collection<String> requested = args.get(0);
 		var augmented = new ArrayList<>(requested);
 		for (String extension : CAUSTICA_WANTED_EXTENSIONS) {
-			// NVX import/image-view handles belong exclusively to NGX.  Treating their
-			// absence as a generic upscaler failure produced false warnings on AMD even
-			// while FidelityFX was running successfully, and coupled device bring-up to
-			// an NVIDIA-only ABI for no reason.
-			boolean ngxOnly = extension.startsWith("VK_NVX_");
-			if (ngxOnly && !"NVIDIA".equalsIgnoreCase(physicalDevice.vendorName())) {
-				continue;
-			}
 			if (augmented.contains(extension)) {
 				continue;
 			}
@@ -132,7 +102,7 @@ public abstract class VulkanBackendMixin {
 		for (VulkanFeature feature : SDK_SHADER_FEATURES) {
 			if (!caustica$supportsFeature(physicalDevice, feature)) {
 				if (loggedMissingSdkFeatures.add(feature.name())) {
-					CausticaMod.LOGGER.warn("Device [{}] lacks {}; FSR/DLSS SDK shaders may fail validation",
+					CausticaMod.LOGGER.warn("Device [{}] lacks {}; external SDK shaders may fail validation",
 							physicalDevice.deviceName(), feature.name());
 				}
 				continue;
@@ -140,7 +110,7 @@ public abstract class VulkanBackendMixin {
 
 			if (features.add(feature)) {
 				changed = true;
-				CausticaMod.LOGGER.info("Enabling Vulkan feature {} for FSR/DLSS SDK shaders", feature.name());
+				CausticaMod.LOGGER.info("Enabling Vulkan feature {} for external SDK shaders", feature.name());
 			}
 		}
 		if (changed) {
@@ -171,12 +141,4 @@ public abstract class VulkanBackendMixin {
 		RtDeviceBringup.probe(device);
 	}
 
-	@Inject(
-			method = "createDevice(Ljava/util/Collection;Lcom/mojang/blaze3d/vulkan/VulkanPhysicalDevice;Ljava/util/Set;)Lorg/lwjgl/vulkan/VkDevice;",
-			at = @At(value = "INVOKE", target = "Lorg/lwjgl/vulkan/VK12;vkCreateDevice(Lorg/lwjgl/vulkan/VkPhysicalDevice;Lorg/lwjgl/vulkan/VkDeviceCreateInfo;Lorg/lwjgl/vulkan/VkAllocationCallbacks;Lorg/lwjgl/PointerBuffer;)I"))
-	private static void caustica$attachNvidiaDiagnostics(Collection<String> extensions,
-			VulkanPhysicalDevice physicalDevice, Set<VulkanFeature> features,
-			CallbackInfoReturnable<VkDevice> cir, @Local VkDeviceCreateInfo deviceCreateInfo) {
-		VulkanDiagnostics.attachNvDiagnosticsConfig(deviceCreateInfo, MemoryStack.stackGet());
-	}
 }

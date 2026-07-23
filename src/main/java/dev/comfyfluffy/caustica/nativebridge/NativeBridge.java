@@ -25,8 +25,7 @@ import dev.comfyfluffy.caustica.CausticaMod;
  *
  * {@link #tryLoad(Logger)} extracts the bundled {@code libcaustica_native.so} from the
  * JAR to {@code <gameDir>/caustica-native/natives/<platform>/}, then loads it by
- * absolute path. This follows the pattern Caustica's {@code NgxRuntime} already uses
- * for its NGX/DLSS shim — Fabric does not put JAR-bundled natives on
+ * absolute path. Fabric does not put JAR-bundled natives on
  * {@code java.library.path} automatically, so {@code System.loadLibrary(name)} would
  * silently fail on a typical player install.
  *
@@ -330,7 +329,7 @@ public final class NativeBridge {
     // ---------------------------------------------------------------------
 
     private static Path locateOrExtract() throws IOException {
-        // 1) Resolve where the lib should live on disk (same path NgxRuntime uses).
+        // 1) Resolve where the extracted library should live on disk.
         Path gameDir = FabricLoader.getInstance().getGameDir();
         Path target = gameDir.resolve(GAME_DIR_RELATIVE);
 

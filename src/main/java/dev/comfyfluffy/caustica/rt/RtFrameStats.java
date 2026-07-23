@@ -48,7 +48,6 @@ public final class RtFrameStats {
                     "frame.temporalAccum",
                     "frame.upscaler",
                     "frame.exposure",
-                    "frame.dlssRr",
                     "frame.upscale",
                     "frame.displayMap",
                     "frame.copyOutput"

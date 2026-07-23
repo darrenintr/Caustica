@@ -13,7 +13,7 @@ import org.lwjgl.vulkan.VkCommandBuffer;
  * <p>Source: NVIDIA {@code RTXNRD/Source/VK/ReBLUR_PrePass.hlsl}, {@code _TemporalAccumulation.hlsl},
  * {@code _Blur.hlsl}, {@code _PostBlur.hlsl}.
  *
- * <p>License: NVIDIA Source Code License (BSD-3-style; tracked in {@code THIRD_PARTY_NOTICES.md}).
+ * <p>License: NVIDIA RTX SDKs license; see {@code THIRD_PARTY_NOTICES.md}.
  *
  * <p>Diffuse-only first cut: requires a diffuse/specular radiance split from
  * {@code shaders/world/world.rgen} before {@code REBLUR_DIFFUSE} can run on

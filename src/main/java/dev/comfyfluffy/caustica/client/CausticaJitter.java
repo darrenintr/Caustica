@@ -1,12 +1,12 @@
 package dev.comfyfluffy.caustica.client;
 
 /**
- * Sub-pixel camera jitter for DLSS Ray Reconstruction.
+ * Sub-pixel camera jitter for temporal reconstruction.
  *
- * <p>Generates a Halton(2,3) low-discrepancy sequence in render-pixel space, with the DLSS phase-count
+ * <p>Generates a Halton(2,3) low-discrepancy sequence in render-pixel space, with a display-scale phase count
  * rule {@code ceil(8 * (display/render)^2)} and RR's recommended floor of 32 phases.
  * {@link dev.comfyfluffy.caustica.rt.RtComposite} reads the per-frame offset, applies it to the primary ray in the
- * path-tracing shader, and reports it to DLSS-RR's evaluate.
+ * path-tracing shader, and reports it to the active temporal upscaler.
  */
 public final class CausticaJitter {
 	public static final CausticaJitter INSTANCE = new CausticaJitter();

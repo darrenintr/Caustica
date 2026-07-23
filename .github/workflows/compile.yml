@@ -1,9 +1,8 @@
 name: compile (fast feedback)
 
 # Fast Java-compile-only feedback for Caustica. Catches `error: ...` lines in <2 min
-# without paying the full CI cost (Vulkan SDK download, native shim cmake, gradle build).
-# The full pipeline (native-windows + native-linux + package + bundle-full) lives in
-# ci.yml; this one is the daily-iteration companion.
+# without paying the full CI cost (SPIR-V validation, optional native bridge, tests, and JAR packaging).
+# The complete portable pipeline lives in ci.yml; this one is the daily-iteration companion.
 
 on:
   push:
@@ -29,8 +28,7 @@ on:
   workflow_dispatch:
 
 # Cancel in-progress runs for the same branch / PR so a follow-up push doesn't
-# sit behind a stale failure. The full ci.yml keeps its own (none) policy on
-# purpose — we don't want a fast-feedback re-run to cancel a release-bundle build.
+# sit behind a stale failure. The full ci.yml has its own concurrency group.
 concurrency:
   group: compile-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -48,10 +46,8 @@ jobs:
       # we want to see whether the failure is platform-specific.
       fail-fast: false
       matrix:
-        # Matches the platforms supported by the project (see `ngxNativePlatforms`
-        # in build.gradle). macOS is intentionally omitted: Caustica ships no
-        # native shim for macOS, and a pure Java compile on macOS would only
-        # duplicate what ubuntu catches. Run on your own Mac if you need it.
+        # Exercise Java compilation on the two primary development hosts.
+        # macOS is intentionally omitted because this job is source-level feedback.
         os: [ubuntu-latest, windows-2022]
     timeout-minutes: 15
 

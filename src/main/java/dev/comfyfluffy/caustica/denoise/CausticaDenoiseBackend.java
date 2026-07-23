@@ -15,6 +15,22 @@ public interface CausticaDenoiseBackend {
 
     String name();
 
+    /**
+     * Vulkan format accepted for the beauty input plate. Backends override this only when
+     * they require a staging format different from the renderer's raw beauty format.
+     */
+    default int inputColorFormat(int rawBeautyFormat) {
+        return rawBeautyFormat;
+    }
+
+    /**
+     * Vulkan format written to {@code outColor} after a successful dispatch. Keeping this
+     * contract on the provider removes concrete-backend checks from the RT plate layer.
+     */
+    default int outputColorFormat(int rawBeautyFormat) {
+        return rawBeautyFormat;
+    }
+
     void init(long vkDevice, long vkPhysicalDevice);
 
     void ensureSized(int width, int height);

@@ -1,0 +1,181 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, set = 0, rgba8) uniform writeonly image2D outputImage; // LDR world target image
+layout(binding = 1, set = 0, rgba16f) uniform readonly image2D rtImage; // HDR RT radiance (RGBA16F)
+layout(binding = 2, set = 0, r32f) uniform readonly image2D exposureImage; // 1x1 linear exposure scale
+layout(binding = 3, set = 0, rgba16f) uniform writeonly image2D hdrImage; // PQ-encoded ([0,1], ST.2084) HDR display
+
+// HDR display parameters. hdrEnabled gates the parallel PQ write; the SDR AgX path always runs because
+// vanilla main-target presentation still consumes LDR.
+layout(push_constant) uniform Push {
+    int hdrEnabled;        // 0 = SDR only, 1 = also write the PQ HDR image
+    float paperWhiteNits;  // absolute nits SDR paper white maps to
+    float headroom;        // highlight headroom above paper white (peakNits / paperWhiteNits, >= 1)
+} pc;
+
+// Tonemap seam: map HDR RT radiance to displayable LDR before copying back to the main target.
+// The path tracer emits true HDR radiance, so exposure is applied from the compositor-owned 1x1 image
+// before the AgX view transform. Temporal denoisers/upscalers consume HDR pre-tonemap.
+
+const mat3 AGX_INSET = mat3(
+    0.842479062253094, 0.042328242261012, 0.042375654905705,
+    0.078433599999999, 0.878468636469772, 0.078433600000000,
+    0.079223745147764, 0.079166127460543, 0.879142973793104
+);
+
+const mat3 AGX_OUTSET = mat3(
+    1.196879005120170, -0.052896851757456, -0.052971635514443,
+    -0.098020881140137, 1.151903129904170, -0.098043450117124,
+    -0.099029744079720, -0.098961176844843, 1.151073672641160
+);
+
+const float AGX_MIN_EV = -12.47393;
+const float AGX_MAX_EV = 4.026069;
+
+vec3 agxDefaultContrast(vec3 x) {
+    vec3 x2 = x * x;
+    vec3 x4 = x2 * x2;
+    return 15.5 * x4 * x2
+        - 40.14 * x4 * x
+        + 31.96 * x4
+        - 6.868 * x2 * x
+        + 0.4298 * x2
+        + 0.1191 * x
+        - 0.00232;
+}
+
+vec3 applyLook(vec3 color) {
+    // Mild post-AgX grade tuned for BetterRTX-style indoor richness.
+    // Wood rooms, brick, and saturated block dyes (terracotta, concrete) read muddy without a
+    // touch of contrast/sat bump; vanilla AgX-default is a touch too neutral for our biased light
+    // palette (warmer torches, deeper lava, brighter glowstone). Contrast lifts midtones gently;
+    // saturation leans colour without crushing luminance.
+    const float contrast = 1.08;
+    const float saturation = 1.14;
+
+    color = clamp((color - 0.5) * contrast + 0.5, 0.0, 1.0);
+
+    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    color = mix(vec3(luma), color, saturation);
+
+    return color;
+}
+
+// Soft shoulder for HDR peaks (outdoor through a window, emissives) so auto-exposure can
+// lift dim interiors without nuking bright outdoor to pure white. Midtones barely move.
+vec3 softHighlightShoulder(vec3 hdr) {
+    hdr = max(hdr, vec3(0.0));
+    float L = max(dot(hdr, vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
+    // Below ~0.9: identity. Above: asymptotically compress excess toward a soft white.
+    const float start = 0.9;
+    const float softness = 0.55; // higher = gentler roll-off
+    float excess = max(L - start, 0.0);
+    float L2 = L - excess + excess / (1.0 + excess * softness);
+    return hdr * (L2 / L);
+}
+
+vec3 agx(vec3 color) {
+    color = AGX_INSET * max(color, vec3(0.0));
+    color = clamp(log2(max(color, vec3(1.0e-10))), AGX_MIN_EV, AGX_MAX_EV);
+    color = (color - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV);
+    color = agxDefaultContrast(color);
+    color = applyLook(color);
+    color = AGX_OUTSET * color;
+    return clamp(color, 0.0, 1.0);
+}
+
+// Cheap screen-space bloom approximation: 5x5 disk sample on the HDR RT, threshold to keep only
+// emissive-level contributions (HDR radiance above the threshold is treated as a "glowing" surface),
+// Gaussian-weighted average, scaled by strength. Added PRE-tonemap so the AgX curve integrates the
+// bloom naturally and a bright torch still rolls off into a soft halo instead of a hard saturated dot.
+//
+// This is NOT real multi-pass mip bloom (which BetterRTX uses for its halo falloff); it is a single-pass
+// screen-space approximation chosen for zero extra GPU resources and no pass-chain rewiring. Visually
+// it delivers the "torch glows, lava bleeds orange into nearby walls" indoor feel that defines the
+// BetterRTX look. When we get a budget for a full mip-chain bloom pass this becomes its replacement.
+vec3 cheapBloom(ivec2 pix, ivec2 size, float threshold, float strength) {
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            ivec2 q = clamp(pix + ivec2(dx, dy), ivec2(0), size - 1);
+            vec3 s = imageLoad(rtImage, q).rgb;
+            vec3 b = max(s - vec3(threshold), vec3(0.0));
+            // Gaussian falloff (sigma ~ 1.5 px), distance-squared weight.
+            float w = exp(-float(dx * dx + dy * dy) * 0.22);
+            sum += b * w;
+            wsum += w;
+        }
+    }
+    return (sum / max(wsum, 1.0e-6)) * strength;
+}
+
+vec3 tonemap(vec3 hdr, float exposure) {
+    return agx(softHighlightShoulder(hdr * exposure));
+}
+
+const float PQ_M1 = 0.1593017578125;
+const float PQ_M2 = 78.84375;
+const float PQ_C1 = 0.8359375;
+const float PQ_C2 = 18.8515625;
+const float PQ_C3 = 18.6875;
+
+float pqEncode(float nits) {
+    float y = pow(max(nits, 0.0) / 10000.0, PQ_M1);
+    return pow((PQ_C1 + PQ_C2 * y) / (1.0 + PQ_C3 * y), PQ_M2);
+}
+
+// VK_COLOR_SPACE_HDR10_ST2084_EXT mandates BT.2020 primaries as its container gamut (not just the ST.2084
+// transfer function) — but every color we compute (textures, tonemap) is authored/blended in BT.709/sRGB
+// primaries. Feeding BT.709 numbers straight into a BT.2020-tagged buffer makes the display read them as
+// (more saturated) BT.2020 coordinates, oversaturating everything. This matrix converts linear-light
+// BT.709 -> BT.2020 right before the PQ encode, which is the container's actual gamut. (ITU-R BT.2087.)
+const mat3 BT709_TO_BT2020 = mat3(
+    0.6274039, 0.0690973, 0.0163916,
+    0.3292830, 0.9195406, 0.0880132,
+    0.0433131, 0.0113612, 0.8955953
+);
+
+// HDR display mapping: map exposed scene-linear radiance to absolute nits, then PQ-encode (ST.2084) for
+// direct presentation to a PQ/HDR10 swapchain. SDR-range values (<= 1.0 after exposure) stay identity so
+// paper white lands exactly at paperWhiteNits. Highlights above 1.0 roll off smoothly and asymptote to
+// `headroom`, i.e. the brightest pixels approach peakNits. No SDR clamp here — that is the point.
+vec3 tonemapHdr(vec3 hdr, float exposure) {
+    vec3 c = softHighlightShoulder(max(hdr * exposure, vec3(0.0)));
+    vec3 lo = min(c, vec3(1.0));
+    vec3 hi = max(c - vec3(1.0), vec3(0.0));
+    float k = max(pc.headroom - 1.0, 0.0);
+    vec3 rolled = (k > 0.0) ? (k * hi) / (k + hi) : vec3(0.0); // -> k as hi -> inf
+    vec3 paperReferred = lo + rolled;                          // 1.0 == paper white, max -> headroom
+    vec3 nits709 = paperReferred * pc.paperWhiteNits;
+    vec3 nits2020 = BT709_TO_BT2020 * nits709;
+    return vec3(pqEncode(nits2020.r), pqEncode(nits2020.g), pqEncode(nits2020.b));
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputImage);
+    if (pix.x >= size.x || pix.y >= size.y) {
+        return;
+    }
+
+    vec4 rt = imageLoad(rtImage, pix);
+    float exposure = max(imageLoad(exposureImage, ivec2(0)).r, 0.0);
+    // Pre-tonemap bloom disabled (2026-07-20): with SPP-2 path-traced radiance leaking
+    // HDR fireflies into the denoise output, even a moderate threshold (1.5) was treating
+    // every isolated high-energy spike as an emissive source and gauss-spreading it across
+    // the 5x5 neighbourhood. On dark walls the result read as a uniform orange-dot pattern
+    // — easily mistaken for residual RT noise. When the path-tracer ships a true mip-chain
+    // bloom or the bilateral residual learns to clamp HDR spikes pre-tonemap, this can
+    // come back behind a config gate; until then the cheap local sample does more harm
+    // than good on the dark scenes the user actually plays.
+    vec3 bloom = vec3(0.0);
+    vec3 ldr = tonemap(rt.rgb + bloom, exposure);
+    imageStore(outputImage, pix, vec4(ldr, 1.0));
+
+    if (pc.hdrEnabled != 0) {
+        imageStore(hdrImage, pix, vec4(tonemapHdr(rt.rgb, exposure), 1.0));
+    }
+}

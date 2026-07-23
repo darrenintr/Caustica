@@ -161,13 +161,17 @@ def test_denoise_backends_export_interface() -> None:
         assert "implements CausticaDenoiseBackend" in body, f"{name} must implement CausticaDenoiseBackend"
 
 
-def test_denoise_selector_resolves_via_vendor_for_auto() -> None:
+def test_denoise_selector_auto_is_capability_first() -> None:
     src = read("src/main/java/dev/comfyfluffy/caustica/denoise/DenoiseBackendSelector.java")
-    assert "autoPick" in src and "GpuVendor.detect" in src, (
-        "autoPick must dispatch via GpuVendor — AMD/Intel → FFX, NVIDIA → NRD"
+    assert "autoPick" in src and "GpuVendor" not in src, (
+        "AUTO denoise must probe provider capability instead of branching on PCI vendor"
     )
+    auto = method_body(src, "private static CausticaDenoiseBackend autoPick()")
+    assert "tryCreateNrdAuto(new HybridFfxNrdBackend(true))" in auto
+    nrd = method_body(src, "private static CausticaDenoiseBackend tryCreateNrdAuto")
+    assert "NrdRuntime.INSTANCE.tryLoad()" in nrd and "BilateralDenoiseBackend" in nrd
     assert "invalidate" in src and "resolvedOnce" in src, (
-        "DenoiseBackendSelector must be a resolved-once latch like UpscalerSelector"
+        "DenoiseBackendSelector must remain a resolved-once provider latch"
     )
 
 
@@ -176,12 +180,11 @@ def test_denoise_rt_composite_owns_dispatch_via_selector() -> None:
     assert "DenoiseBackendSelector.current(" in src, (
         "RtComposite recordFrame must dispatch through DenoiseBackendSelector.current(...)"
     )
-    # v0.5.2: the dispatch input is `denoiseInput`, which is `accumulatedColor` (when temporal
-    # accumulation ran) or `output` (raw noisy trace when it didn't). The variable name
-    # denoiseInput is the contract — the assignment chain must mention both accumulatedColor
-    # and output so a reader can see the temporal-precedence rule in one place.
-    assert "backend.dispatch(stack, cmd, output, gNormal, gDepth, gMotion," in src, (
-        "RtComposite must invoke the resolved backend with raw RT output and guide buffers"
+    assert "plateBridge.adaptToDenoise(cmd, output)" in src, (
+        "RtComposite must route raw RT beauty through the shared format bridge before denoise"
+    )
+    assert "RtImage denoiseTarget = plateBridge.denoiseOutputColor()" in src, (
+        "RtComposite must let Hybrid compose directly into the bridge-owned RGBA16F target"
     )
     assert "RtImage denoiseInput = temporalAccumRan ? accumulatedColor : output" not in src, (
         "RtComposite must not stack beauty TAA ahead of a temporal denoiser"
@@ -229,21 +232,18 @@ def test_denoise_svgf_settings_retired_from_config() -> None:
         )
 
 
-def test_auto_denoise_follows_resolved_upscaler_not_dlss_config() -> None:
+def test_auto_denoise_is_independent_of_upscaler_provider() -> None:
     src = read("src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java")
-    assert "private static boolean caustica$denoiseEnabled()" in src, (
-        "caustica$denoiseEnabled must exist"
-    )
+    assert "private static boolean caustica$denoiseEnabled()" in src
     body = method_body(src, "private static boolean caustica$denoiseEnabled()")
-    # 2026-07-14 kill-switch returns false unconditionally (black-screen emergency).
-    if "return false" in body and "kill-switch" in body.lower() or "kill-switch" in src.lower() or "EMERGENCY" in src or "black-screen" in body:
-        assert "return false" in body
-        return
     assert "DenoiserKind.OFF" in body and "DenoiserKind.AUTO" in body, (
-        "denoiseEnabled must check DenoiserKind (not the legacy StringSetting 'svgf'/'on' literals)"
+        "denoiseEnabled must check the typed denoiser mode"
     )
-    assert "UpscalerSelector.resolvedMode()" in body and "DLSS_RR" in body, (
-        "the AUTO rule must still key off the resolved upscaler: skip when DLSS-RR is active + usable"
+    assert "UpscalerSelector" not in body and "RtDlss" not in body and "DLSS_RR" not in body, (
+        "the modular upscaler boundary must not own or suppress denoise"
+    )
+    assert body.rstrip().endswith("return true;"), (
+        "AUTO must run the selected denoise backend independently of the upscaler"
     )
 
 
@@ -284,29 +284,51 @@ def test_world_rgen_motion_vector_projects_same_hit_in_both_frames() -> None:
     )
 
 
-def test_dlss_rr_exposes_request_reset_history() -> None:
-    """v0.5.3 hard-cut fix: DLSS-RR's internal temporal history must be
-    droppable on teleport / dimension change / resource reload. The private
-    `resetHistory` flag is set only inside `ensureFeature` (i.e. only when the
-    feature is freshly created); the public `invalidateHistory()` call path
-    on RtComposite never reaches it, so the NGX accumulator keeps stale data
-    across hard cuts. We need a public request latch that the next evaluate()
-    observes."""
-    src = read("src/main/java/dev/comfyfluffy/caustica/rt/pipeline/RtDlssRr.java")
-    assert "public void requestResetHistory()" in src, (
-        "RtDlssRr must expose `public void requestResetHistory()` so "
-        "RtComposite.invalidateHistory() can drop the NGX internal temporal "
-        "accumulator on hard cuts (teleport / dimension change / resource "
-        "reload), matching the behaviour of the FFX denoise backend's "
-        "resetHistory()."
+def test_temporal_upscalers_expose_request_reset_history() -> None:
+    """Every active temporal provider must drop history on hard cuts."""
+    for path in (
+        "src/main/java/dev/comfyfluffy/caustica/upscale/TaaUpscaler.java",
+        "src/main/java/dev/comfyfluffy/caustica/fsr/Fsr2ClassicUpscaler.java",
+    ):
+        src = read(path)
+        assert "public void requestResetHistory()" in src, (
+            f"{path} must override requestResetHistory for teleport/dimension/resource hard cuts"
+        )
+
+
+def test_ngx_dlss_runtime_and_build_paths_are_deleted() -> None:
+    deleted = (
+        "native/ngx_shim",
+        "src/main/java/dev/comfyfluffy/caustica/ngx/NgxLibrary.java",
+        "src/main/java/dev/comfyfluffy/caustica/ngx/NgxRuntime.java",
+        "src/main/java/dev/comfyfluffy/caustica/rt/pipeline/RtDlssFg.java",
+        "src/main/java/dev/comfyfluffy/caustica/rt/pipeline/RtDlssRr.java",
+    )
+    for path in deleted:
+        assert not (ROOT / path).exists(), f"dead NVIDIA runtime path must be deleted: {path}"
+
+    gradle = read("build.gradle")
+    for symbol in ("DLSS_SDK", "bundleNgxNatives", "ngxNativeGenRoot", "native/ngx_shim"):
+        assert symbol not in gradle, f"build.gradle must not retain dead NGX build symbol {symbol}"
+
+    for path in (ROOT / "src/main/java").rglob("*.java"):
+        source = path.read_text(encoding="utf-8")
+        for symbol in ("NgxRuntime", "NgxLibrary", "RtDlssFg", "RtDlssRr"):
+            assert symbol not in source, f"{path} must not reference deleted runtime {symbol}"
+
+    config = read("src/main/java/dev/comfyfluffy/caustica/CausticaConfig.java")
+    assert 's.equalsIgnoreCase("dlss-rr")' in config, (
+        "the old config key must still parse as a deprecated compatibility alias"
+    )
+    assert "return AUTO;" in method_body(config, "public static UpscalerMode fromKey"), (
+        "legacy upscaler keys must resolve to the portable AUTO/TAAU route"
     )
 
 
 def test_upscaler_interface_exposes_request_reset_history() -> None:
     """v0.5.3: the Upscaler interface should expose requestResetHistory()
-    so any upscaler (DLSS-RR / FSR / XeSS) can drop its internal temporal
-    accumulator on hard cuts. DLSS-RR's NGX supports a per-evaluate reset
-    flag; FSR / XeSS can override the default no-op with their SDK's own
+    so any temporal upscaler can drop its internal accumulator on hard cuts.
+    Providers can override the default no-op with their SDK or compute path's
     reset path (or destroy+recreate the context lazily on next ensureFeature).
     """
     src = read("src/main/java/dev/comfyfluffy/caustica/upscale/Upscaler.java")
@@ -668,24 +690,24 @@ def test_fsr2_receives_render_jitter_after_denoise() -> None:
 
     The camera-equivalent jitter for ray-offset-based tracers is (-jitterX, -jitterY):
     shifting the ray right produces the *opposite* screen effect of shifting the camera
-    right, and temporal upscalers (FSR2, XeSS, DLSS-RR) expect camera-jitter semantics.
+    right, and temporal upscalers (FSR2, XeSS) expect camera-jitter semantics.
     TAAU is the exception (it knows the raw ray offset).
     """
     src = read("src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java")
-    assert "activeUpscaler.mode() == UpscalerSelector.Mode.TAAU" in src, (
-        "TAAU branch must still exist for the pure-compute fallback"
+    assert "activeUpscaler.expectsRawRenderJitter()" in src, (
+        "jitter convention must be provider capability, not a selector-mode branch"
     )
+    taau = read("src/main/java/dev/comfyfluffy/caustica/upscale/TaaUpscaler.java")
+    assert "public boolean expectsRawRenderJitter()" in taau and "return true;" in method_body(
+        taau, "public boolean expectsRawRenderJitter()"
+    ), "TAAU must advertise that it consumes the raw ray offset"
     assert "fsrJx = -jitterX;" in src and "fsrJy = -jitterY;" in src, (
-        "camera-equivalent jitter = (-jitterX, -jitterY) for ray-offset path tracers"
+        "camera-equivalent jitter = (-jitterX, -jitterY) for external temporal reconstruction"
     )
-    # TAAU branch still passes raw ray offset (its shader knows the ray convention);
-    # the else branch (FSR2/XeSS) must use the camera-equivalent negation.
     import re as _re
-    branch = _re.search(r"if.*TAAU.*\{[^}]*\}.*else\s*\{[^}]*\}", src, _re.DOTALL)
-    assert branch is not None, "the TAAU/else jitter branch pattern must exist"
-    assert "jitterX" in branch.group() and "-jitterX" in branch.group(), (
-        "the TAAU branch passes raw jitterX; the else branch passes -jitterX"
-    )
+    branch = _re.search(r"if \(activeUpscaler\.expectsRawRenderJitter\(\)\) \{[^}]*\} else \{[^}]*\}", src, _re.DOTALL)
+    assert branch is not None, "the capability-driven raw/camera jitter branch must exist"
+    assert "jitterX" in branch.group() and "-jitterX" in branch.group()
     assert "else if (lastDenoiseOn)" not in src, (
         "FSR jitter must not be forced to zero merely because denoise ran"
     )
@@ -694,18 +716,170 @@ def test_fsr2_receives_render_jitter_after_denoise() -> None:
     assert "Math.ceil" not in phase and "(int) (8.0f * ratio * ratio)" in phase, (
         "classic FSR2 truncates 8*ratio^2; ceil desynchronizes its lock phase"
     )
-    assert "&& !(activeUpscaler instanceof dev.comfyfluffy.caustica.fsr.Fsr2ClassicUpscaler)" in src, (
-        "FSR2 SDK RCAS must not be followed by a second display-resolution CAS pass"
+    assert "!activeUpscaler.includesSharpening()" in src, (
+        "providers with integrated sharpening must not receive a second display-resolution CAS pass"
     )
 
 
-def test_non_nvidia_device_does_not_request_ngx_extensions() -> None:
-    src = read("src/main/java/dev/comfyfluffy/caustica/mixin/VulkanBackendMixin.java")
-    assert 'extension.startsWith("VK_NVX_")' in src
-    assert '"NVIDIA".equalsIgnoreCase(physicalDevice.vendorName())' in src
-    assert "upscaling will be unavailable" not in src, (
-        "missing NVIDIA-only NVX must not be reported as generic upscaling failure"
+def test_vulkan_device_bringup_is_vendor_neutral() -> None:
+    backend = read("src/main/java/dev/comfyfluffy/caustica/mixin/VulkanBackendMixin.java")
+    bringup = read("src/main/java/dev/comfyfluffy/caustica/rt/RtDeviceBringup.java")
+    diagnostics = read("src/main/java/dev/comfyfluffy/caustica/rt/VulkanDiagnostics.java")
+    combined = backend + bringup + diagnostics
+    for vendor_extension in ("VK_NVX_", "VK_NV_", "NVLowLatency", "NVRayTracing"):
+        assert vendor_extension not in combined, (
+            f"bottom-level Vulkan negotiation must not depend on {vendor_extension}"
+        )
+    assert "VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME" in bringup
+    assert '"world_noser.rgen.spv"' in bringup, (
+        "SER must retain a no-extension fallback for maximum device compatibility"
     )
+    build = read("build.gradle")
+    raygen = read("shaders/world/world.rgen")
+    for dead_nv_route in ("CAUSTICA_SER_NV", "world_nv.rgen.spv", "GL_NV_shader_invocation_reorder"):
+        assert dead_nv_route not in build + raygen, (
+            f"dead NVIDIA SER route {dead_nv_route} must not remain in the shader build graph"
+        )
+    assert "CAUSTICA_SER_NONE" in build and "GL_EXT_shader_invocation_reorder" in raygen
+
+
+def test_vulkan_12_capability_fallbacks_and_ringed_bindless_descriptors() -> None:
+    """Portable RT must not turn optional shader conveniences into device-creation gates."""
+    build = read("build.gradle")
+    bringup = read("src/main/java/dev/comfyfluffy/caustica/rt/RtDeviceBringup.java")
+    composite = read("src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java")
+    accel = read("src/main/java/dev/comfyfluffy/caustica/rt/accel/RtAccel.java")
+    outline = read("src/main/java/dev/comfyfluffy/caustica/rt/overlay/RtBlockOutlineFeature.java")
+    pipeline = read("src/main/java/dev/comfyfluffy/caustica/rt/pipeline/RtPipeline.java")
+
+    assert '"--target-env", "vulkan1.2"' in build
+    assert "vulkan1.4" not in build, "shader build/validation must stay on Blaze3D's Vulkan 1.2 baseline"
+    assert "world_noposfetch.rchit.spv" in build and "CAUSTICA_POSITION_FETCH_NONE" in build
+    assert "block_outline_no_ray_query.frag.spv" in build and "CAUSTICA_RAY_QUERY_NONE" in build
+
+    mandatory_extensions = re.search(
+        r"RT_EXTENSIONS\s*=\s*List\.of\((.*?)\);", bringup, re.DOTALL
+    )
+    assert mandatory_extensions is not None
+    mandatory_extensions_body = mandatory_extensions.group(1)
+    assert "VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME" in mandatory_extensions_body
+    assert "VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME" in mandatory_extensions_body
+    assert "VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME" in mandatory_extensions_body
+    assert "POSITION_FETCH" not in mandatory_extensions_body and "RAY_QUERY" not in mandatory_extensions_body
+
+    mandatory_features = method_body(bringup, "private static List<VulkanFeature> mandatoryFeatures()")
+    assert "runtimeDescriptorArray" in mandatory_features
+    assert "shaderSampledImageArrayNonUniformIndexing" in mandatory_features
+    assert "descriptorBindingPartiallyBound" not in mandatory_features
+    assert "descriptorBindingSampledImageUpdateAfterBind" not in mandatory_features
+    assert "supportsFeature(physicalDevice, feature)" in bringup
+    for optional_probe in ("supportsPositionFetch", "supportsRayQuery", "supportsOmm", "supportsVrs"):
+        assert optional_probe in bringup
+
+    assert "RtDeviceBringup.worldClosestHitShader()" in composite
+    build_flags = method_body(accel, "private static int buildFlags")
+    assert "RtDeviceBringup.positionFetchEnabled()" in build_flags
+    assert "VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR" in build_flags
+
+    assert '"block_outline_no_ray_query.frag.spv"' in outline
+    assert "RtDeviceBringup.rayQueryEnabled() ? accelSet.bind(ctx, tlas) : 0L" in outline
+    assert "if (RtDeviceBringup.rayQueryEnabled())" in outline
+
+    # A six-slot ordinary descriptor ring plus full fallback initialization replaces both descriptor
+    # indexing convenience features without racing older submitted frames.
+    assert "private final long[] bindlessSets;" in pipeline
+    assert "initializeBindlessFallback" in pipeline
+    assert "flushBindlessDirty(currentSet);" in pipeline
+    assert "bindlessSets[currentSet]" in pipeline
+    for update_after_bind_token in (
+        "VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT",
+        "VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT",
+        "VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT",
+        "VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT",
+    ):
+        assert update_after_bind_token not in pipeline
+    assert "active.setTlas(frameTlas.accel.handle);" in composite
+    assert composite.index("active.setTlas(frameTlas.accel.handle);") < composite.index(
+        "RtMaterialSystem.INSTANCE.flushBeforeTrace(active, atlasSampler(ctx));"
+    ), "bindless writes must happen after advancing to the safe descriptor-ring slot"
+
+
+def test_upscaler_selection_is_provider_probed_not_vendor_routed() -> None:
+    selector = read("src/main/java/dev/comfyfluffy/caustica/upscale/UpscalerSelector.java")
+    fsr = read("src/main/java/dev/comfyfluffy/caustica/fsr/Fsr2ClassicUpscaler.java")
+    assert "GpuVendor" not in selector and "GpuVendor" not in fsr
+    assert "Fsr2ClassicUpscaler.tryCreate()" in selector
+    assert "public static Fsr2ClassicUpscaler tryCreate()" in fsr
+    assert not (ROOT / "src/main/java/dev/comfyfluffy/caustica/vendor/GpuVendor.java").exists(), (
+        "dead vendor-policy detector must not survive after providers own capability probing"
+    )
+
+
+def test_upscaler_and_framegen_contracts_do_not_leak_selector_modes() -> None:
+    """Runtime providers expose metadata/capabilities, never config selector enums."""
+    upscaler = read("src/main/java/dev/comfyfluffy/caustica/upscale/Upscaler.java")
+    framegen = read("src/main/java/dev/comfyfluffy/caustica/framegen/FrameGen.java")
+    composite = read("src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java")
+    selector = read("src/main/java/dev/comfyfluffy/caustica/framegen/FrameGenSelector.java")
+    config = read("src/main/java/dev/comfyfluffy/caustica/CausticaConfig.java")
+
+    assert "UpscalerSelector" not in upscaler
+    assert "String id()" in upscaler
+    assert "performsTemporalReconstruction()" in upscaler
+    assert "isPassThrough()" in upscaler
+    assert "UpscalerSelector" not in framegen and "sourceMode()" not in framegen
+    assert "UpscalerSelector.Mode" not in composite
+    assert "activeUpscaler.performsTemporalReconstruction()" in composite
+    assert "FrameGen resolve(Upscaler source)" in selector
+    assert "sourceUpscalerId" in selector
+    assert "UpscalerSelector.Mode" not in selector
+    assert "valueEnum()" not in config and "UpscalerSelector" not in config
+
+
+def test_framegen_provider_boundary_hides_vendor_backend() -> None:
+    """Presentation/client/composite code depends on FrameGen, not a concrete vendor SDK."""
+    interface = read("src/main/java/dev/comfyfluffy/caustica/framegen/FrameGen.java")
+    assert "interpolate(Object" not in interface and "Object..." not in interface
+    assert "boolean ensureFeature(long commandBuffer" in interface
+    assert "boolean interpolate(long commandBuffer" in interface
+    assert "void probeAvailabilityOnce()" in interface and "void destroy()" in interface
+
+    selector = read("src/main/java/dev/comfyfluffy/caustica/framegen/FrameGenSelector.java")
+    assert "private static volatile FrameGen active" in selector
+    assert "FrameGen resolve(Upscaler source)" in selector
+    assert "GpuVendor" not in selector
+    assert "public static synchronized void shutdown()" in selector
+    assert "VulkanMotionFrameGen.INSTANCE" in selector
+    assert "GpuVendor.Vendor.NVIDIA" not in selector and "RtDlssFg" not in selector, (
+        "frame-generation selection must not branch on GPU vendor or a DLSS backend"
+    )
+
+    backend = read("src/main/java/dev/comfyfluffy/caustica/framegen/VulkanMotionFrameGen.java")
+    assert "implements FrameGen" in backend and "public synchronized boolean interpolate(long commandBuffer" in backend
+    assert "VK_FORMAT_R8G8B8A8_UNORM" in backend and "VK_FORMAT_R16G16B16A16_SFLOAT" in backend
+    assert "if (generatedFrameIndex == generatedFrameCount)" in backend
+    final_index = method_body(backend, "private void copyCurrentToHistory")
+    assert "currentColorImage" in final_index and "currentDepthImage" in final_index
+    assert "vkCmdCopyImage" in final_index
+
+    sdr = read("shaders/display/framegen_motion_rgba8.comp")
+    hdr = read("shaders/display/framegen_motion_rgba16f.comp")
+    assert "binding = 5, rgba8" in sdr
+    assert "binding = 5, rgba16f" in hdr
+    for shader in (sdr, hdr):
+        assert "pc.historyReady == 0u" in shader
+        assert "vec4(current.rgb, 1.0)" in shader
+        assert "previousUv = uv + motion" in shader
+        assert "relativeDepthDelta" in shader
+
+    for path in (
+        "src/main/java/dev/comfyfluffy/caustica/client/CausticaClient.java",
+        "src/main/java/dev/comfyfluffy/caustica/mixin/VulkanGpuSurfaceMixin.java",
+        "src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java",
+    ):
+        source = read(path)
+        assert "RtDlssFg" not in source, f"{path} must not directly reference the DLSS-FG backend"
+        assert "FrameGenSelector" in source, f"{path} must use the provider selector"
 
 
 def test_official_ffx_transfer_operations_have_transfer_barriers() -> None:
@@ -832,20 +1006,15 @@ def test_amd_fidelityfx_temporal_disables_luma_bypass() -> None:
     )
 
 
-def test_auto_mode_amd_uses_fidelityfx_stack() -> None:
-    """AUTO on AMD resolves to NRD (commit 1, 2026-07-20). The 2.x modular
-    loader does not ship a denoiser effect provider, so the legacy FFX-only
-    AMD FidelityFX stack is gone. AMD now uses the same NRD path as Intel/Unknown.
-    """
+def test_auto_mode_has_one_cross_vendor_denoise_graph() -> None:
+    """AUTO must not change denoise topology from a PCI vendor name."""
     src = read("src/main/java/dev/comfyfluffy/caustica/denoise/DenoiseBackendSelector.java")
-    auto = method_body(src, "private static CausticaDenoiseBackend autoPick")
-    amd_branch = auto.split("case AMD ->")[1].split("case ")[0]
-    assert "AmdFidelityFxDenoiseBackend" not in amd_branch, (
-        "AUTO on AMD must NOT route to AmdFidelityFxDenoiseBackend (FFX 2.x modular has no denoiser provider)"
+    auto = method_body(src, "private static CausticaDenoiseBackend autoPick()")
+    assert "switch" not in auto and "case AMD" not in auto and "case NVIDIA" not in auto
+    assert "HybridFfxNrdBackend(true)" in auto, (
+        "AUTO must use the portable NRD graph and let native probing decide availability"
     )
-    assert "HybridFfxNrdBackend(true)" in amd_branch or "NRD" in amd_branch, (
-        "AUTO on AMD must route to NRD (HybridFfxNrdBackend with no FFX prepass, or NRD-only)"
-    )
+    assert "tryCreateNrdAuto" in auto, "AUTO must retain the bilateral compatibility fallback"
 
 
 def test_ffx_reproject_encodes_motion_into_variance() -> None:
@@ -975,8 +1144,7 @@ def test_composite_spp_default_is_one_after_firefly_fix() -> None:
 
 def test_debug_overlay_uses_canonical_stage_names() -> None:
     """v0.5.x debug overlay typo: CausticaDebugOverlay looked up `frame.upscaler`
-    but RtFrameStats.FRAME registers the stages as `frame.upscale` /
-    `frame.dlssRr` (see RtFrameStats.java line 32-55). The overlay therefore
+    while the fallback blit stage is registered as `frame.upscale`. The overlay therefore
     always rendered `upscaler=0ms` even when the upscale pipeline had run for
     tens of milliseconds per frame, making hitch triage impossible from the in-
     game overlay alone. Same applies to `trace` — that one is canonical but the
@@ -1012,7 +1180,12 @@ def test_fsr2_declares_required_storage_format_feature_and_valid_depth_range() -
     assert "vec4(rgb, 1.0)" in pack_src, "pack must initialize the RGBA16F staging alpha"
     assert "rgba16f" in unpack_src and "r11f_g11f_b10f" in unpack_src
     up = read("src/main/java/dev/comfyfluffy/caustica/fsr/Fsr2ClassicUpscaler.java")
-    assert "fsr_color_pack.comp.spv" in up and "fsr_color_unpack.comp.spv" in up
+    bridge = read("src/main/java/dev/comfyfluffy/caustica/rt/plate/RtPlateBridge.java")
+    assert "fsr_color_pack.comp.spv" in bridge and "fsr_color_unpack.comp.spv" in bridge
+    assert "plate.convertToUpscalerInput(cmd, color, inputColorFormat)" in up
+    assert "new RtPlateBridge" not in up and "plate.destroy()" not in up, (
+        "FSR2 must use RtComposite's non-owning plate bridge"
+    )
     assert "vkCmdBlitImage" not in up, "FSR2 must not raw-blit incompatible B10G11R11/RGBA16F formats"
     assert "1_000_000.0f" in up, (
         "reverse-infinite FSR2 dispatch must pass a non-zero far sentinel; far=0 collapses depth reconstruction"
@@ -1049,9 +1222,9 @@ def test_multi_dispatch_passes_do_not_mutate_one_descriptor_set() -> None:
     assert amd.count("residual.dispatch(") == 1, (
         "AMD residual must not invoke and rebind the same backend twice in one command buffer"
     )
-    fsr = read("src/main/java/dev/comfyfluffy/caustica/fsr/Fsr2ClassicUpscaler.java")
-    assert "long[] convSets" in fsr and "convSets[setIndex]" in fsr, (
-        "FSR pack and unpack must use distinct descriptor sets"
+    bridge = read("src/main/java/dev/comfyfluffy/caustica/rt/plate/RtPlateBridge.java")
+    assert "convSetPack" in bridge and "convSetUnpack" in bridge, (
+        "shared plate bridge pack and unpack must use distinct descriptor sets"
     )
     cas = read("src/main/java/dev/comfyfluffy/caustica/display/CasSharpenPass.java")
     cas_dispatch = method_body(cas, "public boolean dispatchInPlace")
@@ -1086,6 +1259,128 @@ def test_multi_dispatch_passes_do_not_mutate_one_descriptor_set() -> None:
     )
 
 
+
+def test_hybrid_fsr_hdr_rgba16f_seam_and_pq_encode() -> None:
+    """Hybrid compose -> FSR2 -> HDR mapper stays RGBA16F and SDR UI is PQ encoded."""
+    compose = read("shaders/display/denoise_ffx/nrd_compose_beauty.comp")
+    assert "layout(binding = 8, rgba16f)" in compose
+
+    profile = read("src/main/java/dev/comfyfluffy/caustica/rt/plate/RtPlateProfile.java")
+    assert "instanceof HybridFfxNrdBackend" not in profile and "UpscalerSelector.Mode" not in profile
+    assert "denoise.outputColorFormat(rawBeautyFormat)" in profile
+    assert "upscale.inputColorFormat(rawBeautyFormat)" in profile
+    assert "upscale.displayColorFormat(rawBeautyFormat, hdrEnabled)" in profile
+
+    denoise_iface = read("src/main/java/dev/comfyfluffy/caustica/denoise/CausticaDenoiseBackend.java")
+    upscaler_iface = read("src/main/java/dev/comfyfluffy/caustica/upscale/Upscaler.java")
+    hybrid = read("src/main/java/dev/comfyfluffy/caustica/denoise/HybridFfxNrdBackend.java")
+    fsr = read("src/main/java/dev/comfyfluffy/caustica/fsr/Fsr2ClassicUpscaler.java")
+    assert "default int outputColorFormat(int rawBeautyFormat)" in denoise_iface
+    assert "public int outputColorFormat(int rawBeautyFormat)" in hybrid
+    assert "VK_FORMAT_R16G16B16A16_SFLOAT" in method_body(hybrid, "public int outputColorFormat")
+    for capability in ("inputColorFormat", "displayColorFormat", "needsReactiveMask", "needsBlackoutGuard"):
+        assert capability in upscaler_iface and capability in fsr
+
+    bridge = read("src/main/java/dev/comfyfluffy/caustica/rt/plate/RtPlateBridge.java")
+    assert "convertToUpscalerInput(" in bridge and "int colorFormat" in bridge
+    assert "colorFormat == profile.upscalerInputFormat" in bridge
+    assert "currentUpscalerInput = color" in bridge
+
+    composite = read("src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java")
+    assert "beautyAfterDenoiseFormat = plateProfile.denoiseOutputFormat" in composite
+    assert "activeUpscaler.setInputColorFormat(displayPlateFormat)" in composite
+    assert "desiredRrOutputFormat" in composite and "activeUpscaler.displayColorFormat(" in composite
+
+    display = read("shaders/display/display_rgba16f.comp")
+    hist = read("shaders/display/exposure_hist_rgba16f.comp")
+    guard = read("shaders/display/fsr_blackout_guard_rgba16f.comp")
+    assert "binding = 1, set = 0, rgba16f" in display
+    assert "binding = 0, set = 0, rgba16f" in hist
+    assert "binding = 2, rgba16f" in guard
+
+    pq = read("shaders/display/sdr_present.comp")
+    assert "BT709_TO_BT2020" in pq and "pqEncode" in pq
+    assert "PQ_M1" in pq and "PQ_M2" in pq and "paperWhiteNits" in pq
+
+def test_labpbr_material_system_owns_pipeline_lifecycle() -> None:
+    """LabPBR GPU stores share one renderer lifecycle boundary without double ownership."""
+    system = read("src/main/java/dev/comfyfluffy/caustica/rt/material/RtMaterialSystem.java")
+    for signature in (
+        "public BlockAtlasViews prepareForPipeline",
+        "public void flushBeforeTrace",
+        "public void releaseAfterPipelineDestroy",
+        "public void destroy()",
+    ):
+        assert signature in system, f"RtMaterialSystem missing lifecycle operation {signature}"
+
+    prepare = method_body(system, "public BlockAtlasViews prepareForPipeline")
+    assert "RtEntityTextures.INSTANCE.resetForPipeline(descriptorCapacity)" in prepare
+    assert "RtBlockMaterials.INSTANCE.reset()" in prepare
+    assert "RtBlockMaterials.INSTANCE.prepareAll()" in prepare
+
+    flush = method_body(system, "public void flushBeforeTrace")
+    assert "RtEntityTextures.INSTANCE.uploadPending" in flush
+    assert "RtBlockMaterials.INSTANCE.flush()" in flush
+    assert "RtEntityMaterials.INSTANCE.flushAll()" in flush
+
+    release = method_body(system, "public void releaseAfterPipelineDestroy")
+    assert "RtEntityTextures.INSTANCE.destroy()" in release
+    assert "RtBlockMaterials.INSTANCE.destroy()" in release
+    assert "RtEntityMaterials.INSTANCE.destroy()" not in release, (
+        "block-entity parallel atlases must have one destruction owner: RtEntityTextures"
+    )
+
+    entity_textures = read("src/main/java/dev/comfyfluffy/caustica/rt/entity/RtEntityTextures.java")
+    reset = method_body(entity_textures, "public void resetForPipeline")
+    for stale_state in (
+        "viewCache.clear()",
+        "viewSlotCache.clear()",
+        "atlasSlotCache.clear()",
+        "atlasMaterialBound.clear()",
+        "pending.clear()",
+        "materialCache.clear()",
+    ):
+        assert stale_state in reset, f"pipeline recreation must invalidate {stale_state}"
+    assert reset.count("RtEntityMaterials.INSTANCE.destroy()") == 1
+    assert "dt.close()" in reset, "resource reload must close owned entity material DynamicTextures"
+    assert "whiteTexture.close()" in reset, "the material registry must own and close its white fallback"
+    white_slot = method_body(entity_textures, "public int whiteSlot()")
+    assert "new DynamicTexture" in white_slot and "getTextureManager().register" not in white_slot, (
+        "the white fallback must not leak through repeated global texture-manager registration"
+    )
+    block_entity_slot = method_body(entity_textures, "public int slotForBlockEntityAtlas")
+    assert "nView != 0L && sView != 0L" in block_entity_slot
+    assert block_entity_slot.index("pending.add(new Pending(2") < block_entity_slot.index(
+        "atlasMaterialBound.add(slot)"
+    ), "parallel atlas binding must only latch after both descriptor views are valid"
+
+    composite = read("src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java")
+    assert "RtMaterialSystem.INSTANCE.prepareForPipeline" in composite
+    assert "RtMaterialSystem.INSTANCE.flushBeforeTrace" in composite
+    reload_body = method_body(composite, "public void onResourceReloadStart()")
+    assert "RtMaterialSystem.INSTANCE.releaseAfterPipelineDestroy()" in reload_body
+    assert reload_body.index("worldPipeline.destroy()") < reload_body.index(
+        "RtMaterialSystem.INSTANCE.releaseAfterPipelineDestroy()"
+    ), "reload must drop descriptor ownership before destroying referenced material images"
+    for direct_lifecycle in (
+        "RtEntityTextures.INSTANCE.reset(",
+        "RtBlockMaterials.INSTANCE.reset()",
+        "RtBlockMaterials.INSTANCE.destroy()",
+        "RtEntityMaterials.INSTANCE.reset()",
+        "RtEntityMaterials.INSTANCE.destroy()",
+    ):
+        assert direct_lifecycle not in composite, (
+            f"RtComposite must coordinate material lifecycle through RtMaterialSystem, found {direct_lifecycle}"
+        )
+
+    client = read("src/main/java/dev/comfyfluffy/caustica/client/CausticaClient.java")
+    shutdown = method_body(client, "private static void shutdownRt()")
+    assert shutdown.index("RtComposite.INSTANCE.destroy()") < shutdown.index(
+        "RtMaterialSystem.INSTANCE.destroy()"
+    ), "shutdown must destroy descriptor sets before their LabPBR resources"
+    assert "RtEntityTextures.INSTANCE" not in client and "RtBlockMaterials.INSTANCE" not in client
+
+
 def test_vrs_restores_storage_layout_before_each_compute_write() -> None:
     src = read("src/main/java/dev/comfyfluffy/caustica/rt/RtVariableRateShading.java")
     body = method_body(src, "public void generateShadingRate")
@@ -1103,16 +1398,18 @@ if __name__ == "__main__":
         test_amd_fidelityfx_preset_skips_nrd_and_pairs_fsr,
         test_fsr2_declares_required_storage_format_feature_and_valid_depth_range,
         test_multi_dispatch_passes_do_not_mutate_one_descriptor_set,
+        test_hybrid_fsr_hdr_rgba16f_seam_and_pq_encode,
+        test_labpbr_material_system_owns_pipeline_lifecycle,
         test_vrs_restores_storage_layout_before_each_compute_write,
         test_denoise_mode_legacy_svgf_alias_maps_to_ffx,
         test_denoise_backends_export_interface,
-        test_denoise_selector_resolves_via_vendor_for_auto,
+        test_denoise_selector_auto_is_capability_first,
         test_denoise_rt_composite_owns_dispatch_via_selector,
         test_denoise_image_barriers_replace_blanket_mem_barriers,
         test_denoise_video_options_invalidate_selection_on_set,
         test_denoise_video_options_widget_keeps_method_name,
         test_denoise_svgf_settings_retired_from_config,
-        test_auto_denoise_follows_resolved_upscaler_not_dlss_config,
+        test_auto_denoise_is_independent_of_upscaler_provider,
         test_denoise_legacy_files_deleted,
         test_world_rgen_motion_vector_uses_half_render_pixel_units,
         test_world_rgen_motion_vector_projects_same_hit_in_both_frames,
@@ -1122,7 +1419,8 @@ if __name__ == "__main__":
         test_denoise_composite_invalidate_history_on_teleport_dimension_reload,
         test_denoise_ffx_temporal_weight_max_is_user_tunable,
         test_denoise_temporal_accum_skips_when_denoise_runs,
-        test_dlss_rr_exposes_request_reset_history,
+        test_temporal_upscalers_expose_request_reset_history,
+        test_ngx_dlss_runtime_and_build_paths_are_deleted,
         test_upscaler_interface_exposes_request_reset_history,
         test_composite_invalidate_history_requests_upscaler_reset,
         test_raygen_final_color_store_guards_non_finite,
@@ -1133,12 +1431,16 @@ if __name__ == "__main__":
         test_ffx_resolve_does_not_kill_history_on_color_diff,
         test_ffx_and_temporal_reproject_mv_sign_matches_world_rgen,
         test_fsr2_receives_render_jitter_after_denoise,
-        test_non_nvidia_device_does_not_request_ngx_extensions,
+        test_vulkan_device_bringup_is_vendor_neutral,
+        test_vulkan_12_capability_fallbacks_and_ringed_bindless_descriptors,
+        test_upscaler_selection_is_provider_probed_not_vendor_routed,
+        test_upscaler_and_framegen_contracts_do_not_leak_selector_modes,
+        test_framegen_provider_boundary_hides_vendor_backend,
         test_official_ffx_transfer_operations_have_transfer_barriers,
         test_ffx_reflection_composite_is_config_gated_and_default_on,
         test_amd_fidelityfx_stack_has_temporal_radiance_stage,
         test_amd_fidelityfx_temporal_disables_luma_bypass,
-        test_auto_mode_amd_uses_fidelityfx_stack,
+        test_auto_mode_has_one_cross_vendor_denoise_graph,
         test_ffx_reproject_encodes_motion_into_variance,
         test_ffx_temporal_weight_default_not_ghost_level,
         test_ffx_history_has_transfer_to_shader_barriers,

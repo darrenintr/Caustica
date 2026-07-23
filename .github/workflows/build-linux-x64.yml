@@ -1,205 +1,87 @@
 name: build-linux-x64
 
-# Build the Caustica JAR with the full linux-x64 native bundle (NGX + FSR +
-# XeSS + Vulkan RT shim). Output is uploaded as a downloadable artifact so
-# Linux users (CachyOS, Arch, NixOS, etc.) can drop the JAR into
-# ~/.minecraft/mods/ without building locally.
-#
-# Windows / native-windows still goes through ci.yml (with NVIDIA DLSS SDK
-# clone etc.) — this workflow is the equivalent for the linux-x64 platform
-# only, so the matrix stays small and the artifact is predictable.
-
 on:
   push:
-    branches: [main]
     paths:
       - ".github/workflows/build-linux-x64.yml"
       - "build.gradle"
-      - "settings.gradle"
       - "gradle.properties"
+      - "settings.gradle"
       - "gradle/**"
       - "gradlew"
-      - "gradlew.bat"
-      - "native/**"
-      - "shaders/**"
       - "src/**"
-      - "scripts/cachyos/**"
+      - "shaders/**"
+      - "native/**"
+      - "scripts/test_denoise_regressions.py"
   pull_request:
     paths:
       - ".github/workflows/build-linux-x64.yml"
       - "build.gradle"
-      - "settings.gradle"
       - "gradle.properties"
+      - "settings.gradle"
       - "gradle/**"
       - "gradlew"
-      - "gradlew.bat"
-      - "native/**"
-      - "shaders/**"
       - "src/**"
-      - "scripts/cachyos/**"
+      - "shaders/**"
+      - "native/**"
+      - "scripts/test_denoise_regressions.py"
   workflow_dispatch:
 
-# Cancel in-progress runs for the same branch / PR so a follow-up push
-# doesn't sit behind a stale build.
+permissions:
+  contents: read
+
 concurrency:
   group: build-linux-x64-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  JAVA_VERSION: "25"
-  DLSS_SDK_REF: v310.7.0
-  FFX_SDK_REF: fsr3-v3.0.4
-  XESS_SDK_REF: v3.0.1
-  # Must match the version + SHA256 baked into ci.yml's package job. The
-  # "Install LunarG Vulkan SDK" step below reads these to download the
-  # SDK tarball and verify it.
-  VULKAN_SDK_VERSION: 1.4.350.0
-  VULKAN_SDK_SHA256: b65f068ab36263559da49d7cacd7e7b9df23824ca8b68ccc522a2b06f5725df2
-
 jobs:
   build:
-    name: Build linux-x64 JAR
+    name: Build portable Linux x64 JAR
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Caustica
         uses: actions/checkout@v4
 
-      - name: Set up JDK ${{ env.JAVA_VERSION }}
+      - name: Set up Java 25
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: "25"
           cache: gradle
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # Build toolchain: cmake / ninja / clang for the shim, glslang /
-      # spirv-tools for the GLSL->SPIR-V shader compile, vulkan headers
-      # for the shim's Vulkan includes.
-      - name: Install build dependencies (apt)
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-              cmake ninja-build clang lld \
-              glslang-tools spirv-tools \
-              libvulkan-dev vulkan-tools
+          sudo apt-get install -y \
+            glslang-tools spirv-tools \
+            cmake ninja-build clang \
+            libvulkan-dev
 
-      # LunarG Vulkan SDK: the system glslang-tools (14.x on Ubuntu 24.04)
-      # is too strict about --target-env vulkan1.2 — it rejects
-      # `GL_EXT_shader_invocation_reorder` (Vulkan 1.3) used by the project's
-      # world.rgen ray-gen shader. LunarG 1.4.350.0 ships glslang 16.3.0
-      # which permits it. The cmake shim uses ${VULKAN_SDK}/include for
-      # its Vulkan headers — the SDK's include dir replaces /usr/include.
-      # Symlink the SDK's glslangValidator + spirv-val into /usr/local/bin
-      # so they shadow the system versions on PATH (compileShaders'
-      # resolveVulkanTool() falls through to PATH for the binary lookup).
-      # DON'T set VULKAN_SDK in GITHUB_ENV here — that would affect the Gradle
-      # step later, and build.gradle's resolveVulkanTool() tries ${VULKAN_SDK}/Bin/
-      # (capital B, Windows-only path) which breaks on Linux. Instead, rely on
-      # PATH symlinks + per-step VULKAN_SDK env for the NGX shim build only.
-      - name: Install LunarG Vulkan SDK
-        env:
-          VULKAN_SDK_VERSION: ${{ env.VULKAN_SDK_VERSION }}
-          VULKAN_SDK_SHA256: ${{ env.VULKAN_SDK_SHA256 }}
+      - name: Build regular JAR
+        run: bash ./gradlew --no-daemon build
+
+      - name: Run renderer seam regressions
+        run: python3 scripts/test_denoise_regressions.py
+
+      - name: Inspect packaged native resources
         run: |
-          archive="vulkansdk-linux-x86_64-${VULKAN_SDK_VERSION}.tar.xz"
-          url="https://sdk.lunarg.com/sdk/download/${VULKAN_SDK_VERSION}/linux/${archive}"
-          sdk_root="${RUNNER_TEMP}/vulkan-sdk/${VULKAN_SDK_VERSION}/x86_64"
-          curl --fail --location --retry 3 --retry-delay 5 --output "${archive}" "${url}"
-          echo "${VULKAN_SDK_SHA256}  ${archive}" | sha256sum --check
-          mkdir -p "${RUNNER_TEMP}/vulkan-sdk"
-          tar -xf "${archive}" -C "${RUNNER_TEMP}/vulkan-sdk"
-          echo "${sdk_root}/bin" >> "${GITHUB_PATH}"
-          sudo ln -sf "${sdk_root}/bin/glslangValidator" /usr/local/bin/glslangValidator
-          sudo ln -sf "${sdk_root}/bin/spirv-val" /usr/local/bin/spirv-val
-          glslangValidator --version
-          spirv-val --version
+          jar_file="$(find build/libs -maxdepth 1 -type f -name 'caustica-*.jar' \
+            ! -name '*-sources.jar' ! -name '*-dev.jar' | head -1)"
+          test -n "$jar_file"
+          echo "JAR: $jar_file"
+          unzip -l "$jar_file" | grep 'caustica/natives/' || true
 
-      # Vendor SDKs. Public github mirrors — same as ci.yml's matrix.
-      - name: Checkout DLSS SDK
-        uses: actions/checkout@v4
-        with:
-          repository: NVIDIA/DLSS
-          ref: ${{ env.DLSS_SDK_REF }}
-          path: third_party/DLSS
-
-      - name: Checkout AMD FidelityFX SDK
-        uses: actions/checkout@v4
-        with:
-          repository: GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
-          ref: ${{ env.FFX_SDK_REF }}
-          path: third_party/FidelityFX-SDK
-
-      # XeSS Linux binaries are gated to Intel DevZone; the public release
-      # only ships libxess.dll. build.gradle's bundleXessNatives task will
-      # log a warning and skip — the mod still builds and runs, just without
-      # XeSS upscaling.
-      - name: Checkout Intel XeSS SDK
-        uses: actions/checkout@v4
-        with:
-          repository: intel/xess
-          ref: ${{ env.XESS_SDK_REF }}
-          path: third_party/xess
-        continue-on-error: true
-
-      - name: Build native NGX shim (linux-x64 / release)
-        env:
-          DLSS_SDK: ${{ github.workspace }}/third_party/DLSS
-          # native/ngx_shim/CMakeLists.txt hard-requires VULKAN_SDK and
-          # adds ${VULKAN_SDK}/include to the include path. On Ubuntu the
-          # libvulkan-dev package puts vulkan/vulkan.h under /usr/include,
-          # so VULKAN_SDK=/usr makes the path resolve correctly. (Same trick
-          # the existing ci.yml native-linux job uses.)
-          VULKAN_SDK: /usr
-        run: |
-          cmake -S native/ngx_shim -B build/cmake/ngx_shim/release \
-                -G Ninja \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_C_COMPILER=clang \
-                -DCMAKE_CXX_COMPILER=clang++ \
-                -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
-                -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld"
-          cmake --build build/cmake/ngx_shim/release --config Release
-
-      - name: Build Caustica JAR (linux-x64 native bundle)
-        env:
-          DLSS_SDK: ${{ github.workspace }}/third_party/DLSS
-          FFX_SDK: ${{ github.workspace }}/third_party/FidelityFX-SDK
-          XESS_SDK: ${{ github.workspace }}/third_party/xess
-        # VULKAN_SDK is intentionally NOT set — build.gradle's resolveVulkanTool()
-        # tries ${VULKAN_SDK}/Bin/ (Windows-style capital B) which never matches
-        # on Linux; the PATH fallback (to /usr/local/bin via symlinks from step
-        # "Install LunarG Vulkan SDK") is what we want — this gives us the LunarG
-        # glslang 16.3.0 that permits GL_EXT_shader_invocation_reorder.
-        # `chmod +x ./gradlew` defends against git ever dropping the +x bit on
-        # checkout (core.fileMode is false by default — same trap compile.yml
-        # hit on its first run; see `Ensure gradlew is executable` there).
-        run: |
-          chmod +x ./gradlew
-          ./gradlew --no-daemon build \
-              -PngxPlatforms=linux-x64 \
-              -PfsrPlatforms=linux-x64 \
-              -PxessPlatforms=linux-x64
-
-      - name: List bundled linux-x64 natives
-        if: always()
-        run: |
-          ls -la build/generated/ngx-natives/caustica/natives/linux-x64/ || true
-          ls -la build/generated/fsr-natives/caustica/natives/linux-x64/ || true
-          ls -la build/generated/xess-natives/caustica/natives/linux-x64/ || true
-
-      - name: Upload JAR + build log
-        if: always()
+      - name: Upload Linux build
         uses: actions/upload-artifact@v4
         with:
           name: caustica-linux-x64-jar
           path: |
-            build/libs/caustica-*.jar
-            build/generated/ngx-natives/caustica/natives/linux-x64/
-            build/generated/fsr-natives/caustica/natives/linux-x64/
-            build/generated/xess-natives/caustica/natives/linux-x64/
-          if-no-files-found: warn
-          retention-days: 14
+            build/libs/*.jar
+            !build/libs/*-sources.jar
+            !build/libs/*-dev.jar
+          if-no-files-found: error

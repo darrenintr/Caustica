@@ -57,8 +57,8 @@ public final class RtEntityMaterials {
         }
     }
 
-    /** Free every parallel atlas + drop the registry (pipeline recreate / resource reload). */
-    public void reset() {
+    /** Free every parallel atlas + drop the registry (pipeline recreate / resource reload / shutdown). */
+    public void destroy() {
         for (RtParallelAtlas pa : atlases.values()) {
             pa.close();
         }

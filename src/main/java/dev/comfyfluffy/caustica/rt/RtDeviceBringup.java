@@ -23,12 +23,11 @@ import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingPipelinePropertiesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayQueryFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT;
-import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
+import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
 import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
 import org.lwjgl.vulkan.VkPhysicalDeviceOpacityMicromapFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceOpacityMicromapPropertiesEXT;
-import org.lwjgl.vulkan.VkPhysicalDevicePresentIdFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceFragmentShadingRateFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceFragmentShadingRatePropertiesKHR;
 import org.lwjgl.vulkan.VkQueueFamilyProperties;
@@ -52,17 +51,12 @@ import static org.lwjgl.vulkan.KHRRayQuery.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME;
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_PROPERTIES_EXT;
-import static org.lwjgl.vulkan.NVLowLatency2.VK_NV_LOW_LATENCY_2_EXTENSION_NAME;
-import static org.lwjgl.vulkan.KHRPresentId.VK_KHR_PRESENT_ID_EXTENSION_NAME;
-import static org.lwjgl.vulkan.KHRPresentId.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
 import static org.lwjgl.vulkan.EXTRayTracingInvocationReorder.VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME;
 import static org.lwjgl.vulkan.EXTRayTracingInvocationReorder.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT;
-import static org.lwjgl.vulkan.NVRayTracingInvocationReorder.VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME;
-import static org.lwjgl.vulkan.NVRayTracingInvocationReorder.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV;
 import static org.lwjgl.vulkan.KHRFragmentShadingRate.VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRFragmentShadingRate.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
 import static org.lwjgl.vulkan.KHRFragmentShadingRate.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR;
-import static org.lwjgl.vulkan.VK14.VK_API_VERSION_1_4;
+import static org.lwjgl.vulkan.VK12.VK_API_VERSION_1_2;
 
 /**
  * RT device bring-up. Enables the hardware ray-tracing device extensions and their
@@ -71,9 +65,10 @@ import static org.lwjgl.vulkan.VK14.VK_API_VERSION_1_4;
  * <p>Vanilla assembles a {@code VkPhysicalDeviceFeatures2} pNext chain from the
  * {@code Set<VulkanFeature>} (arg2) via {@code VulkanFeature.set} →
  * {@code findOrCreateStructInPNextChain} (dedup by sType), so {@code bufferDeviceAddress}
- * merges into the existing {@code VkPhysicalDeviceVulkan12Features} struct and the two
+ * merges into the existing {@code VkPhysicalDeviceVulkan12Features} struct and the RT
  * KHR structs are created fresh. BDA / descriptor-indexing / SPIR-V 1.4 are core on the
- * 1.4 device, so only three extension <i>names</i> are needed; the rest are feature enables.
+ * Vulkan 1.2 baseline already required by Blaze3D, so only the RT extension names are
+ * needed; the rest are feature enables.
  *
  * <p>Extension names are added to the device extension list separately; feature structs are added here.
  * Both are gated on the selected device actually supporting RT; if not, nothing is added
@@ -87,72 +82,55 @@ public final class RtDeviceBringup {
     }
 
     /**
-     * The device extensions RT needs (BDA/descriptor-indexing/SPIR-V 1.4 are core on 1.4).
-     * {@code ray_tracing_position_fetch} lets the closest-hit read hit triangle vertex positions
-     * ({@code gl_HitTriangleVertexPositionsEXT}) for the normal-map TBN, avoiding a positions buffer
-     * plumbed through the geometry tables. Supported on NVIDIA RTX and AMD RDNA 3+ (Mesa 26+).
-     * {@code ray_query} lets fragment shaders (the world-overlay pass, e.g. block outline) issue inline
-     * {@code rayQueryEXT} occlusion tests against the same TLAS the ray-tracing pipeline traces, without a
-     * dedicated raygen dispatch.
+     * The minimum device extensions for a KHR ray-tracing pipeline. Buffer device address,
+     * descriptor indexing, SPIR-V 1.4, and shader float controls are core in Vulkan 1.2, which
+     * is already Blaze3D's baseline. Position fetch and ray query are optional capabilities below.
      */
     public static final List<String> RT_EXTENSIONS = List.of(
             VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
             VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
-            VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
-            VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME,
-            VK_KHR_RAY_QUERY_EXTENSION_NAME);
+            VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
 
     /**
-     * Shader Execution Reordering — a scheduling optimisation for the world raygen, NOT a hard requirement.
-     * The SPIR-V extension differs between the original NVIDIA path and the ratified EXT path; prefer EXT when
-     * present, else NV for older NVIDIA drivers. When a device exposes neither (AMD RDNA, Intel Arc, older
-     * NVIDIA), {@link SerBackend#NONE} is selected and the {@code world_noser.rgen.spv} variant — which traces
-     * with plain {@code traceRayEXT} instead of a hit object — is used, so RT still comes up. SER is therefore
-     * treated like the other optional extensions below, never gating {@link #firstUnsupported}.
+     * Ratified cross-vendor Shader Execution Reordering extension. This is an optional scheduling
+     * optimisation only: devices without {@code VK_EXT_ray_tracing_invocation_reorder} use the
+     * {@code world_noser.rgen.spv} variant and remain fully RT-capable.
      */
     public static final List<String> SER_EXTENSIONS = List.of(
-            VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME,
             VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
 
     /**
-     * OPTIONAL RT extensions: enabled only when the selected device supports them AND the gate is on, but
-     * never required — a device lacking them still comes up RT-capable (unlike {@link #RT_EXTENSIONS}, whose
-     * absence disables RT entirely). {@code VK_EXT_opacity_micromap} (any-hit opt, lever C): per-triangle
+     * OPTIONAL RT extensions: position fetch and ray query enable automatically when both the extension and
+     * feature bit are available; opacity micromaps additionally require their config gate. None is required —
+     * a device lacking them still comes up RT-capable (unlike {@link #RT_EXTENSIONS}, whose absence disables
+     * RT entirely). {@code VK_EXT_opacity_micromap} (any-hit opt, lever C): per-triangle
      * opacity micromaps let the hardware skip {@code world.rahit} on fully-opaque/transparent cutout micro-
-     * triangles, so the alpha-test any-hit runs only on the foliage silhouette. Hardware-accelerated on RTX
-     * 40-series and Blackwell; absent / software elsewhere, hence optional.
+     * triangles, so the alpha-test any-hit runs only on the foliage silhouette. It remains optional because
+     * implementations may omit the extension or provide no useful acceleration for the workload.
      */
     public static final List<String> OPTIONAL_RT_EXTENSIONS = List.of(
+            VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME,
+            VK_KHR_RAY_QUERY_EXTENSION_NAME,
             VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
 
     /**
      * Performance extensions: VK_KHR_fragment_shading_rate enables Variable Rate Shading for adaptive
      * sampling based on scene content (sky/flat areas at quarter-rate, high-detail at full-rate).
-     * Supported on RDNA2+, RTX 20+, Arc+. Provides 15-30% FPS boost in typical scenes.
+     * Enabled only when the device advertises the standard fragment-shading-rate extension.
      */
     public static final List<String> OPTIONAL_PERF_EXTENSIONS = List.of(
             VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
 
-    /**
-     * NVIDIA Reflex. {@code VK_NV_low_latency2} adds no feature bits (function-only extension). Bundled with
-     * {@code VK_KHR_present_id}: Reflex's latency markers carry a {@code presentID} that only correlates with
-     * a specific present call when that present's {@code vkQueuePresentKHR} chains a matching
-     * {@code VkPresentIdKHR} — which needs its own device feature bit (unlike low_latency2, which is
-     * function-only).
-     */
-    public static final List<String> REFLEX_EXTENSIONS = List.of(
-            VK_NV_LOW_LATENCY_2_EXTENSION_NAME, VK_KHR_PRESENT_ID_EXTENSION_NAME);
-
     private static volatile boolean rtRequested;
     private static volatile SerBackend serBackend = SerBackend.NONE;
+    private static volatile boolean positionFetchEnabled; // closest-hit position built-in + BLAS data-access flag
+    private static volatile boolean rayQueryEnabled; // inline TLAS queries in overlay fragment shaders
     private static volatile boolean ommEnabled; // VK_EXT_opacity_micromap actually enabled on the device
     private static volatile boolean vrsEnabled; // VK_KHR_fragment_shading_rate actually enabled on the device
     private static volatile int vrsMinTexelWidth; // minimum shading rate attachment texel width
     private static volatile int vrsMinTexelHeight; // minimum shading rate attachment texel height
     private static volatile int vrsMaxTexelWidth; // maximum shading rate attachment texel width
     private static volatile int vrsMaxTexelHeight; // maximum shading rate attachment texel height
-    private static volatile boolean reflexEnabled; // VK_NV_low_latency2 actually enabled on the device
-    private static volatile boolean presentIdEnabled; // VK_KHR_present_id actually enabled on the device
     private static volatile boolean wideLinesEnabled; // VkPhysicalDeviceFeatures.wideLines actually enabled
     private static volatile float maxLineWidth = 1.0f; // device's lineWidthRange[1]; 1.0 unless wideLinesEnabled
     private static volatile int overlayMsaaSamples = VK10.VK_SAMPLE_COUNT_1_BIT; // capped to the device's framebufferColorSampleCounts
@@ -161,18 +139,10 @@ public final class RtDeviceBringup {
     private static volatile boolean asyncComputeAvailable; // true if we found a dedicated compute queue
     private static volatile int computeQueueFamilyIndex = -1; // queue family index, or -1 if not available
     private static volatile int computeQueueIndex = 0; // queue index within the family
-    /** True when the device's apiVersion is >= VK 1.4 — the baseline the SPIR-V compile target assumes. */
-    private static volatile boolean vk14Device;
-    /** True when VK_KHR_push_descriptor is enabled; lets us bind the RT frame's per-frame descriptor set
-     *  inline (vkCmdPushDescriptorSetKHR) instead of allocating a descriptor set + binding. Win on the
-     *  hot path where tlas/outImage/guide buffers change every frame. Core on VK 1.4; otherwise we need
-     *  the KHR_push_descriptor extension explicitly. */
-    private static volatile boolean pushDescriptorEnabled;
     private static boolean loggedUnavailable;
 
     private enum SerBackend {
         NONE("none", null, "world_noser.rgen.spv"),
-        NV("NV", VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME, "world_nv.rgen.spv"),
         EXT("EXT", VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME, "world.rgen.spv");
 
         final String label;
@@ -198,12 +168,24 @@ public final class RtDeviceBringup {
         return serBackend.worldRaygenShader;
     }
 
-    public static boolean serNvEnabled() {
-        return serBackend == SerBackend.NV;
+    /** Closest-hit variant selected at device creation. The fallback omits the optional position-fetch
+     * capability, uses base-LOD texture sampling, and keeps geometric normals instead of LabPBR _n. */
+    public static String worldClosestHitShader() {
+        return positionFetchEnabled ? "world.rchit.spv" : "world_noposfetch.rchit.spv";
     }
 
     public static boolean serExtEnabled() {
         return serBackend == SerBackend.EXT;
+    }
+
+    /** True if hit-triangle position fetch was enabled. */
+    public static boolean positionFetchEnabled() {
+        return positionFetchEnabled;
+    }
+
+    /** True if inline ray queries were enabled for optional overlay occlusion. */
+    public static boolean rayQueryEnabled() {
+        return rayQueryEnabled;
     }
 
     /** True if {@code VK_EXT_opacity_micromap} was enabled on the device (gate on + device support). */
@@ -252,16 +234,6 @@ public final class RtDeviceBringup {
         return computeQueueIndex;
     }
 
-    /** True if {@code VK_NV_low_latency2} (Reflex) was enabled on the device (gate on + device support). */
-    public static boolean reflexEnabled() {
-        return reflexEnabled;
-    }
-
-    /** True if {@code VK_KHR_present_id} was enabled on the device (needed for Reflex marker/present correlation). */
-    public static boolean presentIdEnabled() {
-        return presentIdEnabled;
-    }
-
     /** Hardware limit for 4-state opacity micromaps, populated by {@link #probe(VkDevice)}. */
     public static int maxOpacity4StateSubdivisionLevel() {
         return maxOpacity4StateSubdivisionLevel;
@@ -271,20 +243,6 @@ public final class RtDeviceBringup {
      *  lines, e.g. the block outline, use this instead of a screen-space quad when available). */
     public static boolean wideLinesEnabled() {
         return wideLinesEnabled;
-    }
-
-    /** True if the device reports {@code apiVersion >= VK 1.4}. SPIR-V compile target is {@code vulkan1.4}
-     *  so we refuse RT on older devices — BDA / descriptor-indexing / SPIR-V 1.4 features are core on
-     *  1.4 but KHR-only on older, and bringing the KHR extensions in adds duplication for no benefit. */
-    public static boolean vk14Device() {
-        return vk14Device;
-    }
-
-    /** True if {@code VK_KHR_push_descriptor} is enabled on the device (core on VK 1.4). When true, the
-     *  RT composite path uses {@code vkCmdPushDescriptorSetKHR} for the per-frame TLAS / output / guide
-     *  bindings, eliminating one descriptor set allocation + bind per frame. */
-    public static boolean pushDescriptorEnabled() {
-        return pushDescriptorEnabled;
     }
 
     /** The device's max native line width (raster {@code lineWidthRange[1]}); 1.0 if wideLines isn't
@@ -302,16 +260,113 @@ public final class RtDeviceBringup {
         return overlayMsaaSamples;
     }
 
-    /** Optional extensions the gate wants AND the device supports — added but never required. */
+    private static VulkanFeature vk10Feature(String name, long fieldOffset) {
+        return new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, name, fieldOffset);
+    }
+
+    private static VulkanFeature vk12Feature(String name, long fieldOffset) {
+        return new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, name, fieldOffset);
+    }
+
+    private static VulkanFeature extensionFeature(int sType, int structSize, String name, long fieldOffset) {
+        return new VulkanFeature(new VulkanPNextStruct(sType, structSize), name, fieldOffset);
+    }
+
+    /** Query one feature bit without requesting it. This keeps optional extensions from turning into
+     * {@code vkCreateDevice} failures on drivers that advertise an extension but expose its feature as false. */
+    private static boolean supportsFeature(VulkanPhysicalDevice physicalDevice, VulkanFeature feature) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkPhysicalDeviceFeatures2 features = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default();
+            feature.struct().findOrCreateStructInPNextChain(features, stack);
+            VK12.vkGetPhysicalDeviceFeatures2(physicalDevice.vkPhysicalDevice(), features);
+            return feature.get(features);
+        }
+    }
+
+    private static VulkanFeature accelerationStructureFeature() {
+        return extensionFeature(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+                VkPhysicalDeviceAccelerationStructureFeaturesKHR.SIZEOF, "accelerationStructure",
+                VkPhysicalDeviceAccelerationStructureFeaturesKHR.ACCELERATIONSTRUCTURE);
+    }
+
+    private static VulkanFeature rayTracingPipelineFeature() {
+        return extensionFeature(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
+                VkPhysicalDeviceRayTracingPipelineFeaturesKHR.SIZEOF, "rayTracingPipeline",
+                VkPhysicalDeviceRayTracingPipelineFeaturesKHR.RAYTRACINGPIPELINE);
+    }
+
+    private static VulkanFeature positionFetchFeature() {
+        return extensionFeature(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR,
+                VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR.SIZEOF, "rayTracingPositionFetch",
+                VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR.RAYTRACINGPOSITIONFETCH);
+    }
+
+    private static VulkanFeature rayQueryFeature() {
+        return extensionFeature(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+                VkPhysicalDeviceRayQueryFeaturesKHR.SIZEOF, "rayQuery",
+                VkPhysicalDeviceRayQueryFeaturesKHR.RAYQUERY);
+    }
+
+    private static VulkanFeature serFeature() {
+        return extensionFeature(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT,
+                VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.SIZEOF, "rayTracingInvocationReorder",
+                VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.RAYTRACINGINVOCATIONREORDER);
+    }
+
+    private static VulkanFeature ommFeature() {
+        return extensionFeature(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT,
+                VkPhysicalDeviceOpacityMicromapFeaturesEXT.SIZEOF, "micromap",
+                VkPhysicalDeviceOpacityMicromapFeaturesEXT.MICROMAP);
+    }
+
+    private static VulkanFeature pipelineVrsFeature() {
+        return extensionFeature(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR,
+                VkPhysicalDeviceFragmentShadingRateFeaturesKHR.SIZEOF, "pipelineFragmentShadingRate",
+                VkPhysicalDeviceFragmentShadingRateFeaturesKHR.PIPELINEFRAGMENTSHADINGRATE);
+    }
+
+    private static VulkanFeature attachmentVrsFeature() {
+        return extensionFeature(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR,
+                VkPhysicalDeviceFragmentShadingRateFeaturesKHR.SIZEOF, "attachmentFragmentShadingRate",
+                VkPhysicalDeviceFragmentShadingRateFeaturesKHR.ATTACHMENTFRAGMENTSHADINGRATE);
+    }
+
+    private static boolean supportsPositionFetch(VulkanPhysicalDevice physicalDevice) {
+        return physicalDevice.hasDeviceExtension(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME)
+                && supportsFeature(physicalDevice, positionFetchFeature());
+    }
+
+    private static boolean supportsRayQuery(VulkanPhysicalDevice physicalDevice) {
+        return physicalDevice.hasDeviceExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME)
+                && supportsFeature(physicalDevice, rayQueryFeature());
+    }
+
+    private static boolean supportsOmm(VulkanPhysicalDevice physicalDevice) {
+        return ommRequested()
+                && physicalDevice.hasDeviceExtension(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME)
+                && supportsFeature(physicalDevice, ommFeature());
+    }
+
+    private static boolean supportsVrs(VulkanPhysicalDevice physicalDevice) {
+        return physicalDevice.hasDeviceExtension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)
+                && supportsFeature(physicalDevice, pipelineVrsFeature())
+                && supportsFeature(physicalDevice, attachmentVrsFeature());
+    }
+
+    /** Optional extensions whose actual feature bits are usable — added but never required. */
     private static List<String> supportedOptionalExtensions(VulkanPhysicalDevice physicalDevice) {
         List<String> supported = new ArrayList<>();
-        if (ommRequested()) {
-            OPTIONAL_RT_EXTENSIONS.stream().filter(physicalDevice::hasDeviceExtension).forEach(supported::add);
+        if (supportsPositionFetch(physicalDevice)) {
+            supported.add(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME);
         }
-        // Performance extensions (VRS): always add when supported, no config gate
-        OPTIONAL_PERF_EXTENSIONS.stream().filter(physicalDevice::hasDeviceExtension).forEach(supported::add);
-        if (reflexRequested()) {
-            REFLEX_EXTENSIONS.stream().filter(physicalDevice::hasDeviceExtension).forEach(supported::add);
+        if (supportsRayQuery(physicalDevice)) {
+            supported.add(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+        }
+        if (supportsOmm(physicalDevice)) {
+            supported.add(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
+        }
+        if (supportsVrs(physicalDevice)) {
+            supported.add(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
         }
         return supported;
     }
@@ -320,48 +375,50 @@ public final class RtDeviceBringup {
         return CausticaConfig.Rt.Omm.ENABLED.value();
     }
 
-    private static boolean reflexRequested() {
-        return CausticaConfig.Rt.Reflex.ENABLED.value();
-    }
-
     /** Query the raw {@code VkPhysicalDeviceFeatures} for {@code wideLines} support — no wrapper on
-     *  {@code VulkanPhysicalDevice} exposes this, so it's fetched directly off the raw handle, same as
-     *  {@link #probe} already does for other physical-device queries. */
+     * {@code VulkanPhysicalDevice} exposes this, so it is fetched directly off the raw handle. */
     private static boolean supportsWideLines(VulkanPhysicalDevice physicalDevice) {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkPhysicalDeviceFeatures features = VkPhysicalDeviceFeatures.calloc(stack);
-            VK10.vkGetPhysicalDeviceFeatures(physicalDevice.vkPhysicalDevice(), features);
-            return features.wideLines();
-        }
+        return supportsFeature(physicalDevice,
+                vk10Feature("wideLines", VkPhysicalDeviceFeatures.WIDELINES));
     }
 
     private static SerBackend selectSerBackend(VulkanPhysicalDevice physicalDevice) {
-        if (physicalDevice.hasDeviceExtension(VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME)) {
+        if (physicalDevice.hasDeviceExtension(VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME)
+                && supportsFeature(physicalDevice, serFeature())) {
             return SerBackend.EXT;
-        }
-        if (physicalDevice.hasDeviceExtension(VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME)) {
-            return SerBackend.NV;
         }
         return SerBackend.NONE;
     }
 
+    private static List<VulkanFeature> mandatoryFeatures() {
+        return List.of(
+                vk10Feature("shaderStorageImageExtendedFormats",
+                        VkPhysicalDeviceFeatures.SHADERSTORAGEIMAGEEXTENDEDFORMATS),
+                vk10Feature("shaderInt64", VkPhysicalDeviceFeatures.SHADERINT64),
+                vk12Feature("bufferDeviceAddress", VkPhysicalDeviceVulkan12Features.BUFFERDEVICEADDRESS),
+                vk12Feature("runtimeDescriptorArray", VkPhysicalDeviceVulkan12Features.RUNTIMEDESCRIPTORARRAY),
+                vk12Feature("shaderSampledImageArrayNonUniformIndexing",
+                        VkPhysicalDeviceVulkan12Features.SHADERSAMPLEDIMAGEARRAYNONUNIFORMINDEXING),
+                accelerationStructureFeature(),
+                rayTracingPipelineFeature());
+    }
+
     private static String firstUnsupported(VulkanPhysicalDevice physicalDevice) {
-        // VK 1.4 baseline: BDA / descriptor-indexing / SPIR-V 1.4 are core. Older drivers expose them
-        // as KHR extensions; requiring both forms doubled the extension list and the feature struct
-        // wiring for zero benefit. The compile target is vulkan1.4 too — older apiVersions would
-        // mismatch what glslangValidator produced and the validation layer would flag mismatched
-        // SPIR-V / API versions on the pipeline creation.
         int apiVersion = physicalDevice.vkPhysicalDeviceProperties().apiVersion();
-        if (apiVersion < VK_API_VERSION_1_4) {
-            return "Vulkan 1.4 (got 0x" + Integer.toHexString(apiVersion) + ", need 0x" + Integer.toHexString(VK_API_VERSION_1_4) + ")";
+        if (apiVersion < VK_API_VERSION_1_2) {
+            return "Vulkan 1.2 (got 0x" + Integer.toHexString(apiVersion)
+                    + ", need 0x" + Integer.toHexString(VK_API_VERSION_1_2) + ")";
         }
         for (String ext : RT_EXTENSIONS) {
             if (!physicalDevice.hasDeviceExtension(ext)) {
                 return ext;
             }
         }
-        // SER is intentionally NOT checked here: a device without it still comes up RT-capable via the
-        // no-SER raygen variant (see SER_EXTENSIONS / SerBackend.NONE). Only RT_EXTENSIONS are mandatory.
+        for (VulkanFeature feature : mandatoryFeatures()) {
+            if (!supportsFeature(physicalDevice, feature)) {
+                return "feature " + feature.name();
+            }
+        }
         return null;
     }
 
@@ -392,95 +449,48 @@ public final class RtDeviceBringup {
         if (!enabledByProperty()) {
             return;
         }
+        rtRequested = false;
         serBackend = SerBackend.NONE;
-        pushDescriptorEnabled = false;
+        positionFetchEnabled = false;
+        rayQueryEnabled = false;
+        ommEnabled = false;
+        vrsEnabled = false;
         String missing = firstUnsupported(physicalDevice);
         if (missing != null) {
             if (!loggedUnavailable) {
                 loggedUnavailable = true;
-                CausticaMod.LOGGER.warn("Ray tracing unavailable: device [{}] lacks {}", physicalDevice.deviceName(), missing);
+                CausticaMod.LOGGER.warn("Ray tracing unavailable: device [{}] lacks {}",
+                        physicalDevice.deviceName(), missing);
             }
             return;
         }
-        // VK 1.4 baseline — confirmed by firstUnsupported. Record the device version + push-descriptor
-        // availability for the composite path. Push descriptors are core on 1.4; on older drivers the
-        // VK_KHR_push_descriptor extension would need an explicit enable, but we refuse those outright.
-        vk14Device = true;
-        pushDescriptorEnabled = true;
 
         Set<VulkanFeature> features = new HashSet<>((Set<VulkanFeature>) args.get(2));
-        VulkanPNextStruct asStruct = new VulkanPNextStruct(
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
-                VkPhysicalDeviceAccelerationStructureFeaturesKHR.SIZEOF);
-        VulkanPNextStruct rtStruct = new VulkanPNextStruct(
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
-                VkPhysicalDeviceRayTracingPipelineFeaturesKHR.SIZEOF);
-        VulkanPNextStruct posFetchStruct = new VulkanPNextStruct(
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR,
-                VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR.SIZEOF);
-        VulkanPNextStruct rayQueryStruct = new VulkanPNextStruct(
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
-                VkPhysicalDeviceRayQueryFeaturesKHR.SIZEOF);
+        features.addAll(mandatoryFeatures());
+
         SerBackend selectedSerBackend = selectSerBackend(physicalDevice);
-        // SER feature struct only when the device actually has an SER extension; SerBackend.NONE (no-SER
-        // raygen) enables no reorder feature and comes up RT-capable without it.
-        VulkanPNextStruct serStruct = null;
-        if (selectedSerBackend == SerBackend.NV) {
-            serStruct = new VulkanPNextStruct(
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV,
-                    VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV.SIZEOF);
-        } else if (selectedSerBackend == SerBackend.EXT) {
-            serStruct = new VulkanPNextStruct(
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT,
-                    VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.SIZEOF);
-        }
-        // bufferDeviceAddress merges into vanilla's existing Vulkan12Features struct.
-        features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "bufferDeviceAddress",
-                VkPhysicalDeviceVulkan12Features.BUFFERDEVICEADDRESS));
-        // Bindless entity textures: a runtime-sized sampler2D[] indexed non-uniformly in the hit shader,
-        // with partially-bound + update-after-bind slots (a growing per-RenderType registry). Core on the
-        // VK 1.4 device; just needs enabling alongside bufferDeviceAddress on the same struct.
-        features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "runtimeDescriptorArray",
-                VkPhysicalDeviceVulkan12Features.RUNTIMEDESCRIPTORARRAY));
-        features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "shaderSampledImageArrayNonUniformIndexing",
-                VkPhysicalDeviceVulkan12Features.SHADERSAMPLEDIMAGEARRAYNONUNIFORMINDEXING));
-        features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "descriptorBindingPartiallyBound",
-                VkPhysicalDeviceVulkan12Features.DESCRIPTORBINDINGPARTIALLYBOUND));
-        features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "descriptorBindingSampledImageUpdateAfterBind",
-                VkPhysicalDeviceVulkan12Features.DESCRIPTORBINDINGSAMPLEDIMAGEUPDATEAFTERBIND));
-        // shaderInt64: the world hit shader uses uint64_t buffer-reference addresses (Int64 capability).
-        features.add(new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderInt64",
-                VkPhysicalDeviceFeatures.SHADERINT64));
-        features.add(new VulkanFeature(asStruct, "accelerationStructure",
-                VkPhysicalDeviceAccelerationStructureFeaturesKHR.ACCELERATIONSTRUCTURE));
-        features.add(new VulkanFeature(rtStruct, "rayTracingPipeline",
-                VkPhysicalDeviceRayTracingPipelineFeaturesKHR.RAYTRACINGPIPELINE));
-        features.add(new VulkanFeature(posFetchStruct, "rayTracingPositionFetch",
-                VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR.RAYTRACINGPOSITIONFETCH));
-        features.add(new VulkanFeature(rayQueryStruct, "rayQuery",
-                VkPhysicalDeviceRayQueryFeaturesKHR.RAYQUERY));
-        if (serStruct != null) {
-            features.add(new VulkanFeature(serStruct, "rayTracingInvocationReorder",
-                    selectedSerBackend == SerBackend.NV
-                            ? VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV.RAYTRACINGINVOCATIONREORDER
-                            : VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.RAYTRACINGINVOCATIONREORDER));
+        if (selectedSerBackend == SerBackend.EXT) {
+            features.add(serFeature());
         }
 
-        // Optional: wideLines (core VK10 feature, no extension). Lets the world-overlay pass (block
-        // outline) draw a real thick native line via a raster pipeline's lineWidth / VK_DYNAMIC_STATE_LINE
-        // _WIDTH instead of a screen-space quad. Its absence must not disable RT — the overlay falls back
-        // to whatever the device's mandated lineWidth (1.0) allows.
+        positionFetchEnabled = supportsPositionFetch(physicalDevice);
+        if (positionFetchEnabled) {
+            features.add(positionFetchFeature());
+        }
+        rayQueryEnabled = supportsRayQuery(physicalDevice);
+        if (rayQueryEnabled) {
+            features.add(rayQueryFeature());
+        }
+
+        // Optional: wideLines (core VK10 feature, no extension). Its absence leaves the mandated 1px path.
         wideLinesEnabled = supportsWideLines(physicalDevice);
         if (wideLinesEnabled) {
-            features.add(new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "wideLines",
-                    VkPhysicalDeviceFeatures.WIDELINES));
+            features.add(vk10Feature("wideLines", VkPhysicalDeviceFeatures.WIDELINES));
             maxLineWidth = physicalDevice.vkPhysicalDeviceProperties().limits().lineWidthRange(1);
         } else {
             maxLineWidth = 1.0f;
         }
 
-        // World-overlay MSAA (block outline edge AA): a framebuffer property, not a feature — no
-        // VulkanFeature entry needed, just cap the desired 4x down to what the device actually supports.
         int colorSampleCounts = physicalDevice.vkPhysicalDeviceProperties().limits().framebufferColorSampleCounts();
         if ((colorSampleCounts & VK10.VK_SAMPLE_COUNT_4_BIT) != 0) {
             overlayMsaaSamples = VK10.VK_SAMPLE_COUNT_4_BIT;
@@ -490,56 +500,24 @@ public final class RtDeviceBringup {
             overlayMsaaSamples = VK10.VK_SAMPLE_COUNT_1_BIT;
         }
 
-        // Optional: opacity micromaps (any-hit opt). Only when the gate is on AND the device advertises the
-        // extension — its absence must not disable RT, so it is kept out of the mandatory feature set above.
-        ommEnabled = ommRequested() && physicalDevice.hasDeviceExtension(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
+        ommEnabled = supportsOmm(physicalDevice);
         if (ommEnabled) {
-            VulkanPNextStruct ommStruct = new VulkanPNextStruct(
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT,
-                    VkPhysicalDeviceOpacityMicromapFeaturesEXT.SIZEOF);
-            features.add(new VulkanFeature(ommStruct, "micromap",
-                    VkPhysicalDeviceOpacityMicromapFeaturesEXT.MICROMAP));
+            features.add(ommFeature());
         }
 
-        // Optional: Variable Rate Shading (VK_KHR_fragment_shading_rate). Always enable when the device
-        // advertises it (no config gate). Enables adaptive sampling: sky/flat areas at quarter-rate (4x4),
-        // high-detail areas at full-rate (1x1). Typical gain: +15-30% FPS. Supported on RDNA2+, RTX 20+, Arc+.
-        vrsEnabled = physicalDevice.hasDeviceExtension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+        vrsEnabled = supportsVrs(physicalDevice);
         if (vrsEnabled) {
-            VulkanPNextStruct vrsStruct = new VulkanPNextStruct(
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR,
-                    VkPhysicalDeviceFragmentShadingRateFeaturesKHR.SIZEOF);
-            features.add(new VulkanFeature(vrsStruct, "pipelineFragmentShadingRate",
-                    VkPhysicalDeviceFragmentShadingRateFeaturesKHR.PIPELINEFRAGMENTSHADINGRATE));
-            features.add(new VulkanFeature(vrsStruct, "attachmentFragmentShadingRate",
-                    VkPhysicalDeviceFragmentShadingRateFeaturesKHR.ATTACHMENTFRAGMENTSHADINGRATE));
-        }
-
-        // Optional: NVIDIA Reflex (VK_NV_low_latency2). Function-only extension, no feature struct to add.
-        reflexEnabled = reflexRequested() && physicalDevice.hasDeviceExtension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
-
-        // Optional: VK_KHR_present_id (presentID<->present correlation for Reflex markers). Its absence must
-        // not disable Reflex sleep/pacing itself — only marker correlation degrades.
-        presentIdEnabled = reflexEnabled && physicalDevice.hasDeviceExtension(VK_KHR_PRESENT_ID_EXTENSION_NAME);
-        if (presentIdEnabled) {
-            VulkanPNextStruct presentIdStruct = new VulkanPNextStruct(
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
-                    VkPhysicalDevicePresentIdFeaturesKHR.SIZEOF);
-            features.add(new VulkanFeature(presentIdStruct, "presentId",
-                    VkPhysicalDevicePresentIdFeaturesKHR.PRESENTID));
+            features.add(pipelineVrsFeature());
+            features.add(attachmentVrsFeature());
         }
 
         args.set(2, features);
-
         rtRequested = true;
         serBackend = selectedSerBackend;
         CausticaMod.LOGGER.info(
-                "Ray tracing: enabling {} + {}{}{} + features [bufferDeviceAddress, accelerationStructure, rayTracingPipeline, rayQuery, rayTracingInvocationReorder({}), pushDescriptor"
-                        + (wideLinesEnabled ? ", wideLines(max=" + maxLineWidth + ")" : "")
-                        + (ommEnabled ? ", opacityMicromap" : "") + "] + overlayMsaa=" + overlayMsaaSamples + "x on VK1.4 [{}]",
-                RT_EXTENSIONS, serBackend.extensionName != null ? serBackend.extensionName : "no SER extension",
-                ommEnabled ? " + " + OPTIONAL_RT_EXTENSIONS : "",
-                reflexEnabled ? " + " + REFLEX_EXTENSIONS : "", serBackend.label, physicalDevice.deviceName());
+                "Ray tracing: Vulkan 1.2 baseline, extensions={}, SER={}, positionFetch={}, rayQuery={}, OMM={}, VRS={}, wideLines={}, overlayMsaa={}x [{}]",
+                RT_EXTENSIONS, serBackend.label, positionFetchEnabled, rayQueryEnabled, ommEnabled, vrsEnabled,
+                wideLinesEnabled, overlayMsaaSamples, physicalDevice.deviceName());
     }
 
     /**
@@ -552,8 +530,6 @@ public final class RtDeviceBringup {
             CausticaMod.LOGGER.info("Ray tracing not requested; skipping RT probe");
             maxOpacity4StateSubdivisionLevel = 0;
             vrsMinTexelWidth = vrsMinTexelHeight = vrsMaxTexelWidth = vrsMaxTexelHeight = 0;
-            vk14Device = false;
-            pushDescriptorEnabled = false;
             return;
         }
         try {
@@ -618,21 +594,7 @@ public final class RtDeviceBringup {
                     vrsMinTexelWidth = vrsMinTexelHeight = vrsMaxTexelWidth = vrsMaxTexelHeight = 0;
                 }
             }
-            if (reflexEnabled) {
-                boolean sleepMode = caps.vkSetLatencySleepModeNV != 0L;
-                boolean sleep = caps.vkLatencySleepNV != 0L;
-                boolean marker = caps.vkSetLatencyMarkerNV != 0L;
-                boolean timings = caps.vkGetLatencyTimingsNV != 0L;
-                if (sleepMode && sleep && marker && timings) {
-                    CausticaMod.LOGGER.info(
-                            "Reflex (VK_NV_low_latency2) entry points loaded — presentId={}", presentIdEnabled);
-                } else {
-                    CausticaMod.LOGGER.error(
-                            "Reflex extension enabled but entry points missing (sleepMode={}, sleep={}, marker={}, timings={})",
-                            sleepMode, sleep, marker, timings);
-                    reflexEnabled = false;
-                }
-            }
+
 
             // Async compute — probe for dedicated compute queue
             probeAsyncCompute(device);
@@ -645,7 +607,7 @@ public final class RtDeviceBringup {
 
     /**
      * Probe for a dedicated compute queue (different family from graphics) for async compute.
-     * AMD RDNA2+ typically has dedicated compute queues; NVIDIA uses the same queue family.
+     * Availability is detected from queue-family capabilities rather than vendor assumptions.
      */
     private static void probeAsyncCompute(VkDevice device) {
         try (MemoryStack stack = MemoryStack.stackPush()) {

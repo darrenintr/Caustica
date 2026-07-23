@@ -4,81 +4,71 @@ Caustica's project-owned code is licensed under `LGPL-3.0-or-later`. This file
 documents third-party components and license boundaries that are not changed by
 Caustica's license.
 
-## NVIDIA DLSS / NGX SDK
+## NVIDIA Real-Time Denoisers (NRD)
 
-Caustica can build and distribute release artifacts that include NVIDIA DLSS/NGX
-SDK runtime components, including DLSS Ray Reconstruction and Frame Generation
-libraries. These NVIDIA components are proprietary third-party software and are
-not licensed under the LGPL.
+Caustica includes an optional NRD-based Vulkan denoise provider and may bundle a
+native library such as:
 
-The NVIDIA SDK components remain subject to the NVIDIA RTX SDKs license:
+- `caustica/natives/windows-x64/nrd_caustica.dll`
+- `caustica/natives/linux-x64/libnrd_caustica.so`
 
-<https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt>
+NRD is third-party software from NVIDIA Corporation and remains subject to the
+NVIDIA RTX SDKs license distributed with the NRD source tree. The local pinned
+source/build copy records that license at `build/vendor/NRD/LICENSE.txt` when
+present. Caustica's LGPL license does not replace or extend the rights granted
+by that license.
 
-The LGPL license grant for Caustica does not grant rights to NVIDIA SDK
-components. Redistribution and use of those components must comply with
-NVIDIA's license terms.
+Required attribution for source-derived portions:
 
-This software contains source code provided by NVIDIA Corporation.
+> This software contains source code provided by NVIDIA Corporation.
 
-Bundled NVIDIA SDK runtime libraries may include files matching:
+NRD is used as a cross-vendor Vulkan denoiser. This attribution does not imply
+that Caustica includes NGX, DLSS Ray Reconstruction, DLSS Frame Generation,
+Reflex, CUDA, or another NVIDIA-specific runtime; those runtime paths are not
+part of the current renderer.
 
-- `caustica/natives/windows-x64/nvngx_dlssd.dll`
-- `caustica/natives/windows-x64/nvngx_dlssg.dll`
-- `caustica/natives/linux-x64/libnvidia-ngx-dlssd.so*`
-- `caustica/natives/linux-x64/libnvidia-ngx-dlssg.so*`
+## AMD FidelityFX
 
-Caustica's `ngxshim` native library is project-owned glue code and follows
-Caustica's project license unless otherwise noted.
+Caustica includes FidelityFX-derived shader/native components for its optional
+FFX denoise and classic FSR2 Vulkan providers. Release or development artifacts
+may include files such as:
 
-## AMD FidelityFX SDK (FSR 3 / FSR 4)
+- `caustica/natives/windows-x64/ffx_denoiser_caustica.dll`
+- `caustica/natives/linux-x64/libffx_denoiser_caustica.so`
+- `caustica/natives/windows-x64/ffx_fsr2_caustica.dll`
+- `caustica/natives/linux-x64/libffx_fsr2_caustica.so`
 
-Caustica can build and distribute release artifacts that include AMD FidelityFX
-SDK runtime components (FSR 3, FSR 4.1 INT8, and FSR Frame Generation). These
-AMD components are proprietary third-party software licensed under the AMD
-FidelityFX SDK EULA and are not licensed under the LGPL.
+The regular source/resource tree also currently carries FidelityFX modular-loader
+binaries used by development probes:
 
-The AMD SDK components remain subject to the AMD FidelityFX SDK license:
-
-<https://gpuopen.com/fidelityfx-sdk-license/>
-
-The LGPL license grant for Caustica does not grant rights to AMD SDK
-components. Redistribution and use of those components must comply with
-AMD's license terms.
-
-Bundled AMD SDK runtime libraries may include files matching:
-
-- `caustica/natives/windows-x64/amd_fidelityfx_loader.dll`
-- `caustica/natives/windows-x64/amd_fidelityfx_upscaler.dll`
-- `caustica/natives/windows-x64/amd_fidelityfx_framegeneration.dll`
 - `caustica/natives/linux-x64/libamd_fidelityfx_loader.so`
 - `caustica/natives/linux-x64/libamd_fidelityfx_upscaler.so`
 - `caustica/natives/linux-x64/libamd_fidelityfx_framegeneration.so`
 
-FSR 3 / FSR 4 share the same set of DLLs; the AMD modular loader picks the
-right model per device. Caustica's FFX Java bindings are project-owned glue
-code and follow Caustica's project license unless otherwise noted.
+Their presence does not advertise an active FSR3, FSR4, or vendor
+frame-generation provider in the current Java renderer.
 
-## Intel XeSS SDK
+The AMD-provided components remain subject to the license and third-party
+notices shipped with the FidelityFX SDK. In a local SDK checkout these are:
 
-Caustica can build and distribute release artifacts that include Intel XeSS
-SDK runtime components (XeSS upscaler + XeSS-FG on SDK 2.1+). These Intel
-components are proprietary third-party software licensed under the Intel
-Software License and are not licensed under the LGPL.
+- `third_party/FidelityFX-SDK/docs/license.md`
+- `third_party/FidelityFX-SDK/3rdpartynotice.md`
 
-The Intel SDK components remain subject to the Intel XeSS SDK license:
+The FidelityFX license permits specified binary redistribution subject to its
+conditions, including retaining its copyright, permission, disclaimer, and
+notice text. Consult the complete SDK license rather than this summary before
+redistributing AMD binaries.
 
-<https://github.com/intel/xess/blob/main/LICENSE.txt>
+## Project-owned native glue
 
-The LGPL license grant for Caustica does not grant rights to Intel SDK
-components. Redistribution and use of those components must comply with
-Intel's license terms.
+Caustica's JNI bridges, provider adapters, Vulkan resource plumbing, and other
+project-authored native glue follow Caustica's project license unless a source
+file states otherwise. Linking or packaging them with a third-party SDK does not
+relicense that SDK under the LGPL.
 
-Bundled Intel SDK runtime libraries may include files matching:
+## No XeSS or NGX bundle
 
-- `caustica/natives/windows-x64/libxess.dll`
-- `caustica/natives/linux-x64/libxess.so`
-
-XeSS is a cross-vendor SDK (XMX path on Intel Arc / Xe-LPG, DP4a fallback
-on NVIDIA / AMD SM 6.4+). Caustica's XeSS Java bindings are project-owned
-glue code and follow Caustica's project license unless otherwise noted.
+The current build does not fetch or bundle Intel XeSS or NVIDIA NGX/DLSS SDK
+runtimes. Legacy config spellings may still parse so older configuration files
+can fall back safely; parsing an old name does not indicate that its SDK is
+present.

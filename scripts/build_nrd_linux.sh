@@ -22,6 +22,29 @@ cmake -S "$NRD_SRC" -B "$NRD_BUILD" -G Ninja \
   -DNRD_NORMAL_ENCODING="$NRD_NORMAL_ENCODING" \
   -DNRD_ROUGHNESS_ENCODING="$NRD_ROUGHNESS_ENCODING" \
   -DCMAKE_BUILD_TYPE=Release
+
+# Caustica Linux workaround: NRD's CMake invokes
+#   ${NRD_BUILD}/_deps/shadermake-build/build/ShaderMake
+# but the user media mount (/run/media/darren/...) is noexec — even with
+# chmod +x the binary can't be invoked there. Workaround: after the cmake
+# configure step writes build.ninja, sed-replace the two noexec paths
+# (ShaderMake + dxc-src/bin/dxc) with copies under /tmp.
+SM_TMP=/tmp/ShaderMake.caustica
+DXC_TMP=/tmp/dxc.caustica
+if [ ! -x "$SM_TMP" ] && [ -x "$HOME/bin/ShaderMake" ]; then
+    cp "$HOME/bin/ShaderMake" "$SM_TMP" && chmod +x "$SM_TMP"
+fi
+if [ ! -x "$DXC_TMP/bin/dxc" ] && [ -x "/tmp/dxc/bin/dxc" ]; then
+    cp -r /tmp/dxc "$DXC_TMP"
+fi
+if [ -x "$SM_TMP" ]; then
+    sed -i "s|${NRD_BUILD}/_deps/shadermake-build/build/ShaderMake|${SM_TMP}|g" \
+        "$NRD_BUILD/build.ninja"
+fi
+if [ -x "$DXC_TMP/bin/dxc" ]; then
+    sed -i "s|${NRD_BUILD}/_deps/dxc-src/bin/dxc|${DXC_TMP}/bin/dxc|g" \
+        "$NRD_BUILD/build.ninja"
+fi
 cmake --build "$NRD_BUILD" --config Release --parallel
 
 SM_BLOB="$(find "$NRD_BUILD" -type f -name 'libShaderMakeBlob.a' -print -quit)"
@@ -40,12 +63,16 @@ cmake --build "$SHIM_BUILD" --config Release --parallel
 
 SHIM="$SHIM_BUILD/libnrd_caustica.so"
 test -f "$SHIM"
-if nm -D "$SHIM" 2>/dev/null | grep -q ' U .*FindPermutationInBlob'; then
+# Caustica: use process substitution so `grep -q` (which exits early on match
+# and would otherwise SIGPIPE `nm`, triggering pipefail under set -e) doesn't
+# kill the script with a false-positive missing export.
+if grep -q ' U .*FindPermutationInBlob' < <(nm -D "$SHIM" 2>/dev/null); then
   echo "ERROR: FindPermutationInBlob remains undefined" >&2
   exit 1
 fi
 for symbol in caustica_nrd_probe caustica_nrd_abi_version caustica_nrd_create_v2; do
-  nm -D "$SHIM" | grep -q " $symbol$" || { echo "ERROR: missing export $symbol" >&2; exit 1; }
+  grep -q " $symbol$" < <(nm -D "$SHIM" 2>/dev/null) \
+    || { echo "ERROR: missing export $symbol" >&2; exit 1; }
 done
 
 mkdir -p "$OUT_LIB"

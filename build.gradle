@@ -31,12 +31,8 @@ loom {
 			// java.lang.foreign restricted methods (FFM bindings to amd_fidelityfx_vk.dll)
 			vmArg "--enable-native-access=ALL-UNNAMED"
 
-            // NVIDIA NGX (DLSS) allocates ~1MB on the stack during init, which overflows Java's default 1MB thread stack.
-            // pass -Xss here directly so the main render thread is resized before the VM parses JAVA_TOOL_OPTIONS.
-            vmArg "-Xss16m"
-
-            // NixOS fix: Gradle forks drop the dev-shell's LD_LIBRARY_PATH.
-            // We manually add the driver path so NGX can successfully dlopen libnvidia-ngx.so.1.
+            // NixOS fix: Gradle forks drop the dev-shell's LD_LIBRARY_PATH. Keep the system Vulkan
+            // driver directory visible to native Vulkan providers launched by runClient.
             if (file("/run/opengl-driver/lib").exists()) {
                 def inherited = System.getenv("LD_LIBRARY_PATH")
                 environmentVariable "LD_LIBRARY_PATH",
@@ -115,14 +111,14 @@ abstract class CompileShaders extends DefaultTask {
 				// emits OpExtInstWithForwardRefsKHR (SPV_KHR_relaxed_extended_instruction), which trips a
 				// validation error unless the shaderRelaxedExtendedInstruction device feature is enabled.
 				// -g keeps source-level debug info for Nsight/RenderDoc without needing that extension.
-				// --target-env vulkan1.4 unlocks SPIR-V 1.6 + Vulkan 1.4 builtins (push descriptor, dynamic
-				// rendering local read, maintenance5/6) without source changes; the device side already
-				// requires VK 1.4 (RtDeviceBringup.VK14_DEVICE) so this stays in lock-step.
-				commandLine([glslang.get(), "-V", "--target-env", "vulkan1.4", "-g"] + defines
+				// Vulkan 1.2 is Blaze3D's device baseline and already includes SPIR-V 1.4,
+				// buffer-device-address, descriptor indexing, and shader float controls. Keeping the
+				// shader environment at 1.2 avoids excluding otherwise capable KHR RT drivers.
+				commandLine([glslang.get(), "-V", "--target-env", "vulkan1.2", "-g"] + defines
 						+ [src.absolutePath, "-o", spv.absolutePath])
 			}
 			execOps.exec {
-				commandLine spirvVal.get(), "--target-env", "vulkan1.4", spv.absolutePath
+				commandLine spirvVal.get(), "--target-env", "vulkan1.2", spv.absolutePath
 			}
 		}
 		def shaderFiles = srcDir.get().asFileTree.matching {
@@ -139,8 +135,13 @@ abstract class CompileShaders extends DefaultTask {
 			def spv = new File(outDirFile, "${src.name}.spv")
 			compileOne(src, spv, [])
 			if (src.name == "world.rgen") {
-				compileOne(src, new File(outDirFile, "world_nv.rgen.spv"), ["-DCAUSTICA_SER_NV=1"])
 				compileOne(src, new File(outDirFile, "world_noser.rgen.spv"), ["-DCAUSTICA_SER_NONE=1"])
+			} else if (src.name == "world.rchit") {
+				compileOne(src, new File(outDirFile, "world_noposfetch.rchit.spv"),
+						["-DCAUSTICA_POSITION_FETCH_NONE=1"])
+			} else if (src.name == "block_outline.frag") {
+				compileOne(src, new File(outDirFile, "block_outline_no_ray_query.frag.spv"),
+						["-DCAUSTICA_RAY_QUERY_NONE=1"])
 			}
 		}
 	}
@@ -159,162 +160,9 @@ def compileShaders = tasks.register("compileShaders", CompileShaders) {
 // same /caustica/rt/ path the loader (RtPipeline/RtBlendPipeline) reads. builtBy wires the dependency.
 sourceSets.main.resources.srcDir(files(shaderGenRoot).builtBy(compileShaders))
 
-def ngxNativeGenRoot = layout.buildDirectory.dir("generated/ngx-natives")
-def requestedTaskNames = gradle.startParameter.taskNames.collect { it.toLowerCase(java.util.Locale.ROOT) }
-def isRunClientInvocation = requestedTaskNames.any { it == "runclient" || it.endsWith(":runclient") }
-def ngxShimConfig = (findProperty("ngxShimConfig") ?: findProperty("ngxNativeConfig") ?: "release")
-		.toString().toLowerCase(java.util.Locale.ROOT)
-def normalizeNgxVendorConfig = { String config ->
-	def normalized = config.toLowerCase(java.util.Locale.ROOT)
-	if (normalized == "release") {
-		return "rel"
-	}
-	if (normalized == "debug") {
-		return "dev"
-	}
-	if (normalized != "rel" && normalized != "dev") {
-		throw new GradleException("Unknown NGX vendor config '${config}'. Expected 'rel' or 'dev'.")
-	}
-	return normalized
-}
-def ngxVendorConfig = normalizeNgxVendorConfig(
-		(findProperty("ngxVendorConfig") ?: (isRunClientInvocation ? "dev" : "rel")).toString())
-def ngxNativeRoot = layout.buildDirectory.dir("native/ngx_shim").get().asFile
-def ngxShimOutDir = new File(ngxNativeRoot, ngxShimConfig)
-def currentNgxPlatform = {
-	def os = org.gradle.internal.os.OperatingSystem.current()
-	def arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT)
-	def x64 = arch == "x86_64" || arch == "amd64"
-	if (os.windows && x64) {
-		return "windows-x64"
-	}
-	if (os.linux && x64) {
-		return "linux-x64"
-	}
-	return null
-}()
-def ngxNativePlatforms = [
-	[
-		name: "windows-x64",
-		shimIncludes: [
-			"ngxshim.dll"
-		],
-		vendorRoot: { dlssSdkRoot, vendorConfig -> new File(dlssSdkRoot, "lib/Windows_x86_64/${vendorConfig}") },
-		vendorIncludes: [
-			"nvngx_dlssd.dll",
-			"nvngx_dlssg.dll"
-		]
-	],
-	[
-		name: "linux-x64",
-		shimIncludes: [
-			"libngxshim.so"
-		],
-		vendorRoot: { dlssSdkRoot, vendorConfig -> new File(dlssSdkRoot, "lib/Linux_x86_64/${vendorConfig}") },
-		vendorIncludes: [
-			"libnvidia-ngx-dlssd.so*",
-			"libnvidia-ngx-dlssg.so*"
-		]
-	]
-]
-def ngxNativePlatformByName = ngxNativePlatforms.collectEntries { platform -> [(platform.name): platform] }
-def requestedNgxPlatformsRaw = (findProperty("ngxPlatforms") ?: "current").toString()
-		.split(",")
-		.collect { it.trim() }
-		.findAll { !it.isEmpty() }
-def selectedNgxNativePlatforms
-if (requestedNgxPlatformsRaw.size() == 1 && requestedNgxPlatformsRaw[0].equalsIgnoreCase("all")) {
-	selectedNgxNativePlatforms = ngxNativePlatforms
-} else if (requestedNgxPlatformsRaw.size() == 1 && requestedNgxPlatformsRaw[0].equalsIgnoreCase("current")) {
-	if (currentNgxPlatform == null || !ngxNativePlatformByName.containsKey(currentNgxPlatform)) {
-		throw new GradleException("No NGX native platform is configured for this host.")
-	}
-	selectedNgxNativePlatforms = [ngxNativePlatformByName[currentNgxPlatform]]
-} else {
-	def unknownPlatforms = requestedNgxPlatformsRaw.findAll { !ngxNativePlatformByName.containsKey(it) }
-	if (!unknownPlatforms.empty) {
-		throw new GradleException("Unknown NGX platform(s): ${unknownPlatforms.join(', ')}")
-	}
-	selectedNgxNativePlatforms = requestedNgxPlatformsRaw.collect { ngxNativePlatformByName[it] }
-}
-
-def dlssSdkEnv = providers.environmentVariable("DLSS_SDK")
-def dlssSdkRootProvider = dlssSdkEnv.map { file(it) }
-
-def bundleNgxNatives = tasks.register("bundleNgxNatives") {
-	group = "build"
-	description = "Bundles NGX shim and ${ngxVendorConfig} DLSS native libraries into the mod resources."
-
-	inputs.property "ngxShimConfig", ngxShimConfig
-	inputs.property "ngxVendorConfig", ngxVendorConfig
-
-	selectedNgxNativePlatforms.each { platform ->
-		inputs.files(fileTree(ngxShimOutDir) {
-			include platform.shimIncludes
-		}).withPropertyName("ngxNatives.${platform.name}.shim")
-		inputs.files(fileTree(platform.vendorRoot(dlssSdkRootProvider.getOrElse(file("__missing_dlss_sdk__")), ngxVendorConfig)) {
-			include platform.vendorIncludes
-		}).withPropertyName("ngxNatives.${platform.name}.vendor")
-	}
-	outputs.dir(ngxNativeGenRoot)
-	outputs.upToDateWhen { false }
-
-	doLast {
-		delete(ngxNativeGenRoot)
-		def missing = []
-		def dlssSdkRoot = dlssSdkRootProvider.orNull
-		if (dlssSdkRoot == null) {
-			logger.warn("DLSS_SDK environment variable is not set; skipping NGX/DLSS native bundle. Set it to the NVIDIA DLSS SDK root to enable DLSS / DLSS-RR / DLSS-FG (NVIDIA only). AMD (FSR) and Intel (XeSS) GPUs do not need this.")
-			return
-		}
-		selectedNgxNativePlatforms.each { platform ->
-			def platformShimFiles = fileTree(ngxShimOutDir) {
-				include platform.shimIncludes
-			}.files
-			if (platformShimFiles.empty) {
-				missing += "${platform.name} shim library in ${ngxShimOutDir}"
-			}
-		}
-		selectedNgxNativePlatforms.each { platform ->
-			def platformVendorRoot = platform.vendorRoot(dlssSdkRoot, ngxVendorConfig)
-			def missingVendorIncludes = platform.vendorIncludes.findAll { vendorInclude ->
-				fileTree(platformVendorRoot) {
-					include vendorInclude
-				}.files.empty
-			}
-			if (!missingVendorIncludes.empty) {
-				missing += "${platform.name} vendor libraries ${missingVendorIncludes.join(', ')} in ${platformVendorRoot}"
-			}
-		}
-		if (!missing.empty) {
-			throw new GradleException("Missing NGX native inputs:\n - " + missing.join("\n - "))
-		}
-
-		copy {
-			selectedNgxNativePlatforms.each { platform ->
-				from(fileTree(ngxShimOutDir) {
-					include platform.shimIncludes
-				}) {
-					into "caustica/natives/${platform.name}"
-				}
-				from(fileTree(platform.vendorRoot(dlssSdkRoot, ngxVendorConfig))) {
-					include platform.vendorIncludes
-					into "caustica/natives/${platform.name}"
-				}
-			}
-			into ngxNativeGenRoot
-		}
-	}
-}
-
-sourceSets.main.resources.srcDir(files(ngxNativeGenRoot).builtBy(bundleNgxNatives))
-
-// AMD FidelityFX SDK (FSR 3 / FSR 4) and Intel XeSS SDK native bundles were removed:
-// the corresponding Java backends (FsrUpscaler / FsrRuntime / XeSsRuntime / XeSsUpscaler /
-// FsrFrameGen / XeSsFrameGen / DlssFgFrameGen / NoopFrameGen) are gone in the TAAU-only refactor,
-// and Linux XeSS has no public SO binaries (Intel DevZone gated). Their gradle tasks
-// (bundleFsrNatives, bundleXessNatives) and the -PfsrPlatforms / -PxessPlatforms flags are
-// dead config now. To re-enable, reintroduce the task block here alongside the Java backends.
+// Legacy SDK bundle tasks were removed with their old provider implementations. Optional
+// upscalers and frame generators now own capability probing and native loading behind their
+// provider interfaces; the build does not route runtime behavior by GPU vendor.
 
 // libcaustica_native JNI scaffold (Phase 1, 2026-07-20). The native half is a single
 // `ping()` round-trip to prove cmake → ninja → jar → System.load → JNI call works
@@ -355,7 +203,7 @@ def buildNative = tasks.register("buildNative") {
 				return
 			}
 
-			// Platform routing — same naming as the AMD/Intel/NVIDIA natives.
+			// Platform routing for the portable JNI resource layout.
 			def os = org.gradle.internal.os.OperatingSystem.current()
 			def arch = System.getProperty("os.arch", "").toLowerCase()
 			boolean x64 = arch == "x86_64" || arch == "amd64"

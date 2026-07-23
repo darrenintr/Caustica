@@ -10,7 +10,7 @@ import dev.comfyfluffy.caustica.CausticaMod;
  * <p>When GPU is overloaded, DRS lowers the internal render resolution to maintain framerate.
  * When GPU has headroom, DRS increases resolution back up to maximize quality.
  *
- * <p>The upscaler (TAAU/FSR/XeSS/DLSS) then scales the dynamic resolution to the fixed display resolution,
+ * <p>The selected upscaler then scales the dynamic resolution to the fixed display resolution,
  * making resolution changes nearly invisible to the user while maintaining smooth framerate.
  */
 public class RtDynamicResolution {

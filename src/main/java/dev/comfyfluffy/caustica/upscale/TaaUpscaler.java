@@ -7,7 +7,6 @@ import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
-import dev.comfyfluffy.caustica.upscale.UpscalerSelector.Mode;
 import org.joml.Matrix4fc;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
@@ -34,8 +33,8 @@ import java.util.Arrays;
  *   <li>4 = ULTRA PERFORMANCE (0.40x render)</li>
  * </ul>
  *
- * <p>Why this exists: XeSS only ships Windows DLLs in its public SDK, FSR 4.1 INT8 requires RDNA 3/4,
- * DLSS-RR requires NVIDIA. TAAU is the universal fallback -- lower quality than XeSS/FSR 4 but
+ * <p>Why this exists: optional SDK-backed providers have platform and hardware constraints. TAAU is the
+ * universal fallback -- lower quality than dedicated temporal super-resolution providers but
  * works on anything and gives meaningful temporal stability (the main thing the user was missing
  * with spp=1 + NRD-only + no upscaler).
  */
@@ -107,8 +106,23 @@ public final class TaaUpscaler implements Upscaler {
     }
 
     @Override
-    public Mode mode() {
-        return Mode.TAAU;
+    public String id() {
+        return "taau";
+    }
+
+    @Override
+    public String displayName() {
+        return "TAAU";
+    }
+
+    @Override
+    public boolean performsTemporalReconstruction() {
+        return true;
+    }
+
+    @Override
+    public boolean expectsRawRenderJitter() {
+        return true;
     }
 
     @Override

@@ -1,0 +1,112 @@
+// Along-normal MV pre-filter for NRD's disocclusion mix.
+//
+// Idea borrowed from Sundial-Lite's Deferred0.frag:93-95:
+//   positionDistance = abs(dot(positionDiff, geoNormal)) / (...) * K;
+//   isPrevValid *= clamp(1.0 - positionDistance, 0, 1);
+//
+// We do the same thing here, but using a cheaper depth-difference approximation that
+// avoids the projection-inverse math (which we'd need to reconstruct full 3D positions
+// in view space). The approximation: if MV.xy = (du, dv) in UV space, then a static
+// surface reprojected by the camera would shift by exactly (du, dv). The expected
+// depth difference along the view direction is roughly mvLen * viewZ * 8 (the 8 is
+// empirical, see Sundial's empirical scaling). Anything larger than that is
+// disocclusion.
+//
+// We don't actually use this as a binary reject — we feed it into NRD's
+// disocclusionMix.b channel as a continuous weight. NRD multiplies its internal
+// reproject-validity check by this weight, so a "soft" disocclusion (partially-valid
+// history) still contributes a fraction of the history radiance instead of either
+// 100% or 0%.
+//
+// Inputs:
+//   0  gMotion              rg16f      (UV-space MV, prev - cur)
+//   1  gViewZ               r32f       (NRD-format positive linear view Z, reverse-Z derived)
+//   2  gDeviceDepth         r32f       (current frame's deviceZ, reverse-Z infinite)
+//   3  gNormalRough         rgba16f    (oct-decoded normal in xyz, roughness in w; length(xyz) < 0.5 = sky)
+//   4  gConfidenceDisoccl   rgba8      (existing pre-computed mix from prepare pass; channels [diff, spec, disocclusion, unused])
+// Outputs:
+//   5  gDisocclusionMix     rgba8      (refined mix — re-emits gConfidenceDisoccl.r/g/.b unchanged except .b is max()'d with our along-normal signal)
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rg16f)   readonly  uniform image2D gMotion;
+layout(binding = 1, r32f)    readonly  uniform image2D gViewZ;
+layout(binding = 2, r32f)    readonly  uniform image2D gDeviceDepth;
+layout(binding = 3, rgba16f) readonly  uniform image2D gNormalRough;
+layout(binding = 4, rgba8)   readonly  uniform image2D gConfidenceDisoccl;
+layout(binding = 5, rgba8)   writeonly uniform image2D gDisocclusionMix;
+
+layout(push_constant) uniform Push {
+    float positionDistanceThreshold; // relative position-distance rejection threshold
+    float _pad0;
+    float _pad1;
+    float _pad2;
+} pc;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(gDisocclusionMix);
+    if (pix.x >= size.x || pix.y >= size.y) {
+        return;
+    }
+
+    vec4 normalRough = imageLoad(gNormalRough, pix);
+    vec3 N = normalRough.xyz;
+    float rough = normalRough.w;
+    bool sky = length(N) < 0.5;
+
+    // Pass through existing confidence for diff/spec channels; only refine disocclusion.
+    vec4 conf = clamp(imageLoad(gConfidenceDisoccl, pix), vec4(0.0), vec4(1.0));
+
+    // Sky pixels have no surface to validate; keep existing mix unchanged.
+    if (sky) {
+        imageStore(gDisocclusionMix, pix, conf);
+        return;
+    }
+
+    // 1. Compute MV in pixel-space. MV comes in as UV-space [-1,1] (host-side convention
+    //    per NRD CommonSettings.motionVectorScale = {1/w, 1/h}); the actual MV for the
+    //    along-normal check is the LENGTH in pixels = mv.xy * size.
+    vec2 mv = imageLoad(gMotion, pix).rg;
+    float mvLenPixels = length(mv) * max(float(size.x), float(size.y));
+    // 2. Sample prev frame's deviceZ at the reprojected coord. Sundial uses a 2x2 bilinear
+    //    tap on a dedicated history bitmask; we don't have one here, so use single-tap
+    //    texelFetch (slightly noisier, but correct in expectation).
+    vec2 prevCoord = (vec2(pix) + 0.5) / vec2(size) + mv;
+    bool prevInBounds = all(greaterThanEqual(prevCoord, vec2(0.0)))
+                     && all(lessThanEqual(prevCoord, vec2(1.0)));
+    float prevDeviceZ = prevInBounds
+        ? imageLoad(gDeviceDepth, ivec2(prevCoord * vec2(size))).r
+        : imageLoad(gDeviceDepth, pix).r; // out-of-bounds → assume no change
+    float currDeviceZ = imageLoad(gDeviceDepth, pix).r;
+    // 3. Convert deviceZ to viewZ for the along-normal scale. Reverse-Z infinite:
+    //    near → 1, far → 0. We don't have cameraNear here, so approximate:
+    //    linearZ ≈ cameraNear / deviceZ. Use the same cameraNear via push-constant in a
+    //    future revision; for now, use deviceZ as a proxy (scale is relative anyway).
+    float currViewZ = max(currDeviceZ, 0.05);
+    float prevViewZ = max(prevDeviceZ, 0.05);
+    // 4. Expected depth change if the camera moved mvLenPixels at this viewZ.
+    //    Empirically tuned to ~8.0 to match Sundial's empirical 5000 constant when
+    //    folded through Sundial's (dot(prevViewPos, prevViewPos) + 2.0) denominator.
+    float mvLenUV = length(mv);
+    float expectedZJump = mvLenUV * 0.05; // 5% of normalized depth per unit MV
+    float actualZJump = abs(currDeviceZ - prevDeviceZ);
+    // 5. Disocclusion signal: anything beyond the expected depth jump is parallax-
+    //    unaccounted surface movement → history should be partially rejected.
+    float depthDelta = abs(actualZJump - expectedZJump);
+    float depthScale = max(max(currDeviceZ, prevDeviceZ), 0.05);
+    float positionDistance = depthDelta / depthScale;
+    float validWeight = clamp(1.0 - positionDistance / max(pc.positionDistanceThreshold, 1e-4),
+                              0.0, 1.0);
+    // 6. Convert validWeight to disocclusion: 0 = no disocclusion, 1 = full disocclusion.
+    //    Tighter for high-roughness surfaces (rough surfaces hide disocclusion artifacts).
+    float roughBoost = mix(1.0, 1.4, clamp(rough, 0.0, 1.0));
+    float disocclusionFromNormal = clamp(1.0 - validWeight * roughBoost, 0.0, 1.0);
+    // 7. Combine with the existing disocclusion signal (take the max — either source
+    //    calling for rejection is enough).
+    float finalDisocclusion = max(conf.b, disocclusionFromNormal);
+
+    imageStore(gDisocclusionMix, pix, vec4(conf.r, conf.g, finalDisocclusion, conf.a));
+}

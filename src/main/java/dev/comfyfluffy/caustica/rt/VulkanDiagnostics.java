@@ -14,14 +14,10 @@ import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.util.vma.Vma;
 import org.lwjgl.util.vma.VmaBudget;
 import org.lwjgl.vulkan.EXTDeviceFault;
-import org.lwjgl.vulkan.NVDeviceDiagnosticsConfig;
-import org.lwjgl.vulkan.NVDeviceDiagnosticCheckpoints;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VK11;
 import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VkDevice;
-import org.lwjgl.vulkan.VkDeviceCreateInfo;
-import org.lwjgl.vulkan.VkDeviceDiagnosticsConfigCreateInfoNV;
 import org.lwjgl.vulkan.VkDeviceFaultAddressInfoEXT;
 import org.lwjgl.vulkan.VkDeviceFaultCountsEXT;
 import org.lwjgl.vulkan.VkDeviceFaultInfoEXT;
@@ -31,11 +27,8 @@ import org.lwjgl.vulkan.VkLayerProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceFaultFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
-import org.lwjgl.vulkan.VkPhysicalDeviceDiagnosticsConfigFeaturesNV;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties;
 import org.lwjgl.vulkan.VkQueueFamilyProperties;
-import org.lwjgl.vulkan.VkCheckpointDataNV;
-import org.lwjgl.vulkan.VkQueue;
 import org.spongepowered.asm.mixin.injection.invoke.arg.Args;
 
 import java.io.IOException;
@@ -72,9 +65,6 @@ public final class VulkanDiagnostics {
     private static volatile boolean deviceFaultRequested;
     private static volatile boolean deviceFaultVendorBinaryRequested;
     private static volatile boolean deviceFaultEnabled;
-    private static volatile boolean nvDiagnosticsRequested;
-    private static volatile VkQueue lastCausticaQueue;
-    private static volatile String lastCausticaQueueLabel;
     private static int memoryHeapCount;
     private static boolean startupLogged;
     private static boolean instanceLayersLogged;
@@ -155,10 +145,8 @@ public final class VulkanDiagnostics {
         FaultSupport faultSupport = physicalDevice.hasDeviceExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)
                 ? queryDeviceFaultSupport(physicalDevice) : new FaultSupport(false, false);
         deviceFaultRequested = faultSupport.fault();
-        // The vendor binary is an Aftermath-format dump on NVIDIA; producing one may require the driver
-        // to run crash-dump tracking from device creation, so it shares the heavy-diagnostics toggle.
-        // Plain deviceFault (fault addresses + vendor records) stays on: it reports MMU fault state the
-        // hardware captures regardless.
+        // Vendor fault binaries can be large and may require additional driver-side tracking, so
+        // they share the heavy-diagnostics toggle. Plain fault addresses and vendor records stay on.
         deviceFaultVendorBinaryRequested = faultSupport.vendorBinary()
                 && CausticaConfig.Rt.Diagnostics.HEAVY_CRASH_DIAGNOSTICS.value();
         if (deviceFaultRequested) {
@@ -171,19 +159,12 @@ public final class VulkanDiagnostics {
             CausticaMod.LOGGER.warn("Vulkan device-fault diagnostics unavailable on [{}]",
                     physicalDevice.deviceName());
         }
-        nvDiagnosticsRequested = CausticaConfig.Rt.Diagnostics.HEAVY_CRASH_DIAGNOSTICS.value()
-                && physicalDevice.hasDeviceExtension(
-                        NVDeviceDiagnosticsConfig.VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)
-                && supportsNvDiagnostics(physicalDevice);
-        if (nvDiagnosticsRequested) {
-            extensions.add(NVDeviceDiagnosticsConfig.VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
-            CausticaMod.LOGGER.info("NVIDIA device diagnostics config requested");
-        }
+
     }
 
     @SuppressWarnings("unchecked")
     public static void addDeviceFaultFeature(Args args) {
-        if (!deviceFaultRequested && !nvDiagnosticsRequested) {
+        if (!deviceFaultRequested) {
             return;
         }
         Set<VulkanFeature> features = new HashSet<>((Set<VulkanFeature>) args.get(2));
@@ -198,28 +179,8 @@ public final class VulkanDiagnostics {
                         VkPhysicalDeviceFaultFeaturesEXT.DEVICEFAULTVENDORBINARY));
             }
         }
-        if (nvDiagnosticsRequested) {
-            VulkanPNextStruct diagnosticsStruct = new VulkanPNextStruct(
-                    NVDeviceDiagnosticsConfig.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV,
-                    VkPhysicalDeviceDiagnosticsConfigFeaturesNV.SIZEOF);
-            features.add(new VulkanFeature(diagnosticsStruct, "diagnosticsConfig",
-                    VkPhysicalDeviceDiagnosticsConfigFeaturesNV.DIAGNOSTICSCONFIG));
-        }
-        args.set(2, features);
-    }
 
-    /** Prepend NVIDIA's device-create diagnostics flags while vanilla's creation stack is alive. */
-    public static void attachNvDiagnosticsConfig(VkDeviceCreateInfo deviceCreateInfo, MemoryStack stack) {
-        if (!nvDiagnosticsRequested) {
-            return;
-        }
-        int flags = NVDeviceDiagnosticsConfig.VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_DEBUG_INFO_BIT_NV
-                | NVDeviceDiagnosticsConfig.VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV
-                | NVDeviceDiagnosticsConfig.VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV
-                | NVDeviceDiagnosticsConfig.VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_ERROR_REPORTING_BIT_NV;
-        VkDeviceDiagnosticsConfigCreateInfoNV config = VkDeviceDiagnosticsConfigCreateInfoNV.calloc(stack)
-                .sType$Default().flags(flags).pNext(deviceCreateInfo.pNext());
-        deviceCreateInfo.pNext(config.address());
+        args.set(2, features);
     }
 
     public static void logEnabledExtensions(Collection<String> extensions) {
@@ -234,9 +195,6 @@ public final class VulkanDiagnostics {
         if (deviceFaultRequested) {
             CausticaMod.LOGGER.info("Vulkan device-fault diagnostics {}",
                     deviceFaultEnabled ? "enabled" : "FAILED: entry point missing");
-        }
-        if (nvDiagnosticsRequested) {
-            CausticaMod.LOGGER.info("NVIDIA diagnostics config enabled (shader debug, resource tracking, automatic checkpoints, shader errors)");
         }
     }
 
@@ -259,12 +217,7 @@ public final class VulkanDiagnostics {
         }
     }
 
-    /** Remember the queue before submission so a later device-loss report queries the relevant queue. */
-    public static void noteQueueSubmission(VkQueue queue, String label) {
-        lastCausticaQueue = queue;
-        lastCausticaQueueLabel = label;
-    }
-
+    /** Register a device-address range so device-fault reports can resolve nearby GPU resources. */
     public static void registerBuffer(long address, long size, long handle, String label) {
         if (address != 0L && size > 0L) {
             BUFFERS.put(address, new BufferRange(address, size, handle, label));
@@ -279,10 +232,6 @@ public final class VulkanDiagnostics {
     public static void reportDeviceLost(VulkanDevice device, String operation) {
         if (FAULT_REPORTED.get()) {
             return;
-        }
-        VkQueue queue = lastCausticaQueue;
-        if (queue != null) {
-            logNvQueueCheckpoints(queue, lastCausticaQueueLabel);
         }
         try {
             String checkpoints = VulkanUtils.formatCheckpoints(
@@ -411,39 +360,6 @@ public final class VulkanDiagnostics {
         }
     }
 
-    private static void logNvQueueCheckpoints(VkQueue queue, String label) {
-        if (queue.getCapabilities().vkGetQueueCheckpointDataNV == 0L) {
-            return;
-        }
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            java.nio.IntBuffer count = stack.callocInt(1);
-            NVDeviceDiagnosticCheckpoints.vkGetQueueCheckpointDataNV(queue, count, null);
-            int checkpointCount = Math.min(count.get(0), MAX_FAULT_RECORDS);
-            if (checkpointCount == 0) {
-                CausticaMod.LOGGER.error("NVIDIA checkpoints for {} queue 0x{}: <none>", label,
-                        Long.toUnsignedString(queue.address(), 16));
-                return;
-            }
-            VkCheckpointDataNV.Buffer checkpoints = VkCheckpointDataNV.calloc(checkpointCount, stack);
-            for (int i = 0; i < checkpointCount; i++) {
-                checkpoints.get(i).sType$Default();
-            }
-            count.put(0, checkpointCount);
-            NVDeviceDiagnosticCheckpoints.vkGetQueueCheckpointDataNV(queue, count, checkpoints);
-            CausticaMod.LOGGER.error("NVIDIA checkpoints for {} queue 0x{} ({}):", label,
-                    Long.toUnsignedString(queue.address(), 16), count.get(0));
-            for (int i = 0; i < Math.min(checkpointCount, count.get(0)); i++) {
-                VkCheckpointDataNV checkpoint = checkpoints.get(i);
-                long marker = checkpoint.pCheckpointMarker();
-                CausticaMod.LOGGER.error("  stage={} (0x{}), marker=0x{}",
-                        pipelineStage(checkpoint.stage()), Integer.toUnsignedString(checkpoint.stage(), 16),
-                        Long.toUnsignedString(marker, 16));
-            }
-        } catch (Throwable t) {
-            CausticaMod.LOGGER.error("Failed to retrieve NVIDIA checkpoints for " + label, t);
-        }
-    }
-
     private static String resolveBuffer(long address) {
         var entry = BUFFERS.floorEntry(address);
         if (entry != null && entry.getValue().contains(address)) {
@@ -482,17 +398,6 @@ public final class VulkanDiagnostics {
             VkPhysicalDeviceFeatures2 features = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(fault.address());
             VK12.vkGetPhysicalDeviceFeatures2(physicalDevice.vkPhysicalDevice(), features);
             return new FaultSupport(fault.deviceFault(), fault.deviceFaultVendorBinary());
-        }
-    }
-
-    private static boolean supportsNvDiagnostics(VulkanPhysicalDevice physicalDevice) {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkPhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics =
-                    VkPhysicalDeviceDiagnosticsConfigFeaturesNV.calloc(stack).sType$Default();
-            VkPhysicalDeviceFeatures2 features = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default()
-                    .pNext(diagnostics.address());
-            VK12.vkGetPhysicalDeviceFeatures2(physicalDevice.vkPhysicalDevice(), features);
-            return diagnostics.diagnosticsConfig();
         }
     }
 

@@ -2266,7 +2266,7 @@ public final class RtTerrain {
 
             // Emissive: vanilla block light level (0..15) -> 0..1, stashed in the free normal.w slot.
             q.emission = state != null ? state.getLightEmission() / 15f : 0f;
-            // Heuristic PBR material (roughness, metalness) for the GGX BRDF / DLSS-RR guides.
+            // Heuristic PBR material (roughness, metalness) for the GGX BRDF and reconstruction guides.
             q.rough = RtMaterials.roughness(state);
             q.metal = RtMaterials.metalness(state);
             TextureAtlasSprite sprite = quad.materialInfo().sprite();

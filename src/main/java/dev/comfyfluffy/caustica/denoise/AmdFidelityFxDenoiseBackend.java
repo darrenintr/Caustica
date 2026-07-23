@@ -161,6 +161,14 @@ public final class AmdFidelityFxDenoiseBackend implements CausticaDenoiseBackend
         }
 
         // 3) Bilateral residual: three edge-aware passes into mid, copy back to outColor.
+        //    Toggleable via caustica.rt.denoise.amdFidelityFxResidual so the controlled
+        //    diagnostic (FFX output alone) can be A/B tested against the full chain. The
+        //    default is true to preserve the verified architecture; false skips stage 3
+        //    and labels the path as "firefly→ffx" only.
+        if (!dev.comfyfluffy.caustica.CausticaConfig.Rt.Denoise.AMD_FIDELITY_FX_RESIDUAL.value()) {
+            lastPath = "firefly→ffx";
+            return true;
+        }
         try {
             if (residual.dispatch(stack, cmd, outColor, inNormal, inDepth, inMotion,
                     mvScaleX, mvScaleY, mid)) {
