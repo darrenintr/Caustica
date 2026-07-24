@@ -2,8 +2,11 @@ package dev.comfyfluffy.caustica.rt.pipeline;
 
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
+import org.lwjgl.vulkan.KHRAccelerationStructure;
+import org.lwjgl.vulkan.KHRRayTracingPipeline;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VkCommandBuffer;
+import org.lwjgl.vulkan.VkMemoryBarrier;
 import org.lwjgl.vulkan.VkDescriptorImageInfo;
 import org.lwjgl.vulkan.VkDescriptorPoolCreateInfo;
 import org.lwjgl.vulkan.VkDescriptorPoolSize;
@@ -666,6 +669,20 @@ public final class RtPipeline {
             if (pushConstants != null && pushConstantSize > 0) {
                 VK10.vkCmdPushConstants(cmd, pipelineLayout, pushConstantStages, 0, pushConstants);
             }
+            // RADV (Mesa 26.x) on RDNA 3: the BLAS writes are in the GPU's L2 when the SBT
+            // (host-cached system-RAM) and the BLAS-input buffers (also host-cached) are read by the
+            // RT shader pipe. Without an ACCELERATION_STRUCTURE_BUILD -> RAY_TRACING_SHADER barrier the
+            // shader can dereference a stale BDA through the SBT and fault at a ~4 GiB offset in the
+            // doorbell region (the SQC (data) fault from the 2026-07-24 GPUVM report). Make the BLAS
+            // writes visible to the ray-trace shader stage before vkCmdTraceRaysKHR runs.
+            VkMemoryBarrier.Buffer mem = VkMemoryBarrier.calloc(1, stack)
+                    .sType$Default()
+                    .srcAccessMask(KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
+                    .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT);
+            VK10.vkCmdPipelineBarrier(cmd,
+                    KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                    KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    0, mem, null, null);
             VkStridedDeviceAddressRegionKHR raygen = VkStridedDeviceAddressRegionKHR.calloc(stack)
                     .deviceAddress(sbt.deviceAddress).stride(sbtStride).size(sbtStride);
             VkStridedDeviceAddressRegionKHR miss = VkStridedDeviceAddressRegionKHR.calloc(stack)

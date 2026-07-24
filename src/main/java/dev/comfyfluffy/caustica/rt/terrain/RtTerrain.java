@@ -51,7 +51,11 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.util.ARGB;
 import org.joml.Vector3fc;
+import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
+import org.lwjgl.vulkan.KHRAccelerationStructure;
+import org.lwjgl.vulkan.VK10;
+import org.lwjgl.vulkan.VkMemoryBarrier;
 
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -1598,12 +1602,31 @@ public final class RtTerrain {
         for (PreparedSection ps : prepared) {
             blasBuilds.add(ps.blas());
         }
-        // AMD drivers can lose the device while a terrain BLAS batch is submitted asynchronously. The
-        // failure is commonly observed when streaming toward water, but the trigger is the new section
-        // build rather than the water shader itself. Keep the build and publication on one completed
-        // graphics-queue submission until the terrain resource/queue ownership path is hardened; NRD and
-        // TAAU remain enabled because this only changes terrain upload scheduling.
-        ctx.submitSync(cmd -> RtAccel.recordBlasBuilds(ctx, cmd, blasBuilds));
+        // RADV (Mesa 26.x) lands BLAS input buffers on a HOST_CACHED system-RAM heap (memory type 5
+        // in the boot dump). The host writes via memXxxBuffer.put are made visible to the device by
+        // HOST_COHERENT semantics, but the BLAS build (vkCmdBuildAccelerationStructuresKHR) executes on
+        // the GPU's compute pipe and reads the indices/positions through BDAs. On RDNA 3 the SQC data
+        // path doesn't always see the freshly-written data on the first BLAS read of a batch, and the
+        // BLAS dereferences a stale (or zero-initialised) index, jumping ~4 GiB past the buffer base and
+        // faulting as a GPUVM READ_INVALID in the doorbell region (SQC fault, PERMISSION_FAULTS=3).
+        //
+        // The textbook fix is a HOST -> ACCELERATION_STRUCTURE_BUILD memory barrier: it tells the
+        // command stream to wait for every prior host write (across the persistent mappings VMA keeps
+        // open on the host-cached heap) before the BLAS build reads it. This is the same dependency the
+        // // std140/SSBO upload paths already use for non-RT compute shaders; we just route it to the
+        // // AS pipeline stage explicitly.
+        ctx.submitSync(cmd -> {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkMemoryBarrier.Buffer mem = VkMemoryBarrier.calloc(1, stack).sType$Default()
+                        .srcAccessMask(VK10.VK_ACCESS_HOST_WRITE_BIT)
+                        .dstAccessMask(KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+                VK10.vkCmdPipelineBarrier(cmd,
+                        VK10.VK_PIPELINE_STAGE_HOST_BIT,
+                        KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                        0, mem, null, null);
+            }
+            RtAccel.recordBlasBuilds(ctx, cmd, blasBuilds);
+        });
         RtAccel.freeBlasScratch(blasBuilds);
         applyBuildChanges(ctx, prepared, removed, rebase, rbx, rby, rbz);
     }
