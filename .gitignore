@@ -13,3 +13,21 @@ __pycache__/
 .claude/
 .firecrawl/
 dist/
+
+# IDE / editor scratch
+.vscode/
+*.swp
+*.swo
+*~
+
+# config/ holds local user runtime configs (not redistributable)
+/config/
+
+# historic scratch scripts/logs (kept off-disk intentionally)
+*.log
+*.log.*
+build-native-now.sh
+build-simple.bat
+build-windows.bat
+build-windows-natives.bat
+install-vulkan-helper.bat
