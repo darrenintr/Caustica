@@ -11,6 +11,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.OptionalInt;
 
 /** Loads the platform NRD shim and owns the REBLUR context. */
@@ -375,7 +376,10 @@ public final class NrdRuntime {
         try (InputStream in = NrdRuntime.class.getResourceAsStream(platform.resourcePath())) {
             if (in != null) {
                 byte[] bytes = in.readAllBytes();
-                if (!Files.isRegularFile(target) || Files.size(target) != bytes.length) {
+                // Native rebuilds commonly keep the same byte length. A size-only cache check
+                // silently reused the previous shim, so Java changes shipped while the NRD motion
+                // fix did not. Compare the actual content before loading the extracted library.
+                if (!Files.isRegularFile(target) || !Arrays.equals(Files.readAllBytes(target), bytes)) {
                     Files.write(target, bytes);
                     if (!platform.windows()) target.toFile().setExecutable(true);
                 }

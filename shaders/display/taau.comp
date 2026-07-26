@@ -261,12 +261,23 @@ void main() {
     // the same as the guide buffer's UV space since both are [0, 1]).
     vec2 tileOffsetGuide = texture(jitterGuide, currentUV).rg - 0.5; // [-0.5, +0.5] render px
 
-    // ---- 1. Current frame upsample (3x3 median + RCAS edge-aware) ----
-    // The 3x3 median removes single-pixel HDR fireflies from SPP=1 path tracing
-    // *before* they enter TAAU's temporal history (one firefly out of 9
-    // neighbours can't dominate). The RCAS then sharpens around the median
-    // for edge-aware upsampling. Together: no fireflies + sharp render.
-    vec3 currColor = rcasMedianColor(currentUV, srcSize, pc.sharpness * 1.2);
+    // ---- 1. Current frame upsample ----
+    // Composite already runs firefly_kill + NRD before TAAU. An always-on 3x3 median
+    // here re-blurs every denoised texel (the "blur as fuck" symptom on grass/snow).
+    // Use bilinear for spatial upsample; optional light edge sharpen only.
+    // Outlier fireflies that slip past NRD are still rejected in the history path below.
+    vec3 currColor = bilinearColor(currentUV, srcSize);
+    if (pc.sharpness > 1e-4) {
+        // Cheap unsharp from 4-neighbour ring — far less destructive than full 3x3 median.
+        vec2 s = 1.0 / srcSize;
+        vec3 ring = (
+            bilinearColor(currentUV + vec2( s.x, 0.0), srcSize) +
+            bilinearColor(currentUV + vec2(-s.x, 0.0), srcSize) +
+            bilinearColor(currentUV + vec2(0.0,  s.y), srcSize) +
+            bilinearColor(currentUV + vec2(0.0, -s.y), srcSize)
+        ) * 0.25;
+        currColor = mix(currColor, currColor + (currColor - ring), clamp(pc.sharpness * 0.6, 0.0, 0.6));
+    }
 
     float currDepth = bilinearDepth(currentUV, srcSize);
     vec3 currNormal = bilinearNormal(currentUV, srcSize);
@@ -396,12 +407,12 @@ void main() {
         }
     }
 
-    // ---- 5. YCoCg blend with motion-adaptive + roughness-adaptive alpha ----
-    // Roughness-adaptive: matte surfaces trust the current frame more (direct
-    // /indirect blend doesn't benefit from temporal reuse as much); glossy
-    // surfaces lock to history harder (mirror reflections shouldn't flicker).
+    // ---- 5. YCoCg blend with motion-adaptive alpha ----
+    // Do NOT halve alpha on matte surfaces: after NRD the plate is already smooth,
+    // and mix(alpha, alpha*0.5, rough=1) → 0.27 current / 0.73 history is pure milk.
+    // Keep mild glossy bias only (glossy still wants a bit more history for AA).
     float motionAlpha = clamp(mvLen / 0.10, 0.0, 1.0);
-    float baseAlpha = mix(pc.alpha, pc.alpha * 0.5, clamp(currRough, 0.0, 1.0));
+    float baseAlpha = mix(pc.alpha, min(1.0, pc.alpha * 1.1), clamp(1.0 - currRough, 0.0, 1.0));
     float effectiveAlpha = mix(baseAlpha, 1.0, motionAlpha);
 
     vec3 outRgb;

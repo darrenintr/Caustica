@@ -250,6 +250,15 @@ void main() {
     float hitRough = isDielectricInterface ? max(rough, 0.08) : rough;
     float nHitDiff = sky ? 0.0 : normHitDist(diffuseHit, viewZ, isDielectricInterface ? 0.5 : 1.0);
     float nHitSpec = sky ? 0.0 : normHitDist(specularHit, viewZ, hitRough);
+    // Real capture: when rgen left hitDist=0 (primary-NEE-only pixels), nHit* became 0 and
+    // REBLUR effectively skipped spatial/temporal filtering — denoise dispatch returned ok but
+    // the plate still looked raw. Floor surface hit-distance so REBLUR always has a kernel.
+    if (!sky) {
+        if (nHitDiff < 0.05) nHitDiff = max(nHitDiff, 0.12);
+        if (nHitSpec < 0.05 && max(Spnrd.r, max(Spnrd.g, Spnrd.b)) > 1e-4) {
+            nHitSpec = max(nHitSpec, 0.10);
+        }
+    }
 
     imageStore(gNrdDiffuse, pix, vec4(linearToYCoCg(Dnrd), nHitDiff));
     imageStore(gNrdSpecular, pix, vec4(linearToYCoCg(Spnrd), nHitSpec));

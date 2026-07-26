@@ -49,6 +49,11 @@ public final class RtBuffer {
         }
     }
 
+    /** VMA allocator that owns this allocation — for diagnostics / flush helpers. */
+    public long vma() {
+        return vma;
+    }
+
     /** Flush the entire mapped range so device reads see host writes on non-coherent memory. */
     public void flush() {
         flush(0L, size);

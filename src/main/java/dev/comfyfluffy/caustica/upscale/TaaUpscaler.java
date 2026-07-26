@@ -142,12 +142,14 @@ public final class TaaUpscaler implements Upscaler {
     }
 
     private float renderScaleForQuality(int quality) {
+        // Higher quality = higher render scale. Old mapping had QUALITY(1)=0.67 below
+        // BALANCED(2)=0.75, which made the "quality" preset blurrier than balanced.
         return switch (quality) {
-            case 0 -> 1.00f;
-            case 1 -> 0.67f;
-            case 2 -> 0.75f;
-            case 3 -> 0.50f;
-            default -> 0.40f;
+            case 0 -> 1.00f; // NATIVE — TAA only, no spatial downscale
+            case 1 -> 0.85f; // QUALITY
+            case 2 -> 0.75f; // BALANCED
+            case 3 -> 0.58f; // PERFORMANCE
+            default -> 0.45f; // ULTRA PERFORMANCE
         };
     }
 
@@ -232,19 +234,24 @@ public final class TaaUpscaler implements Upscaler {
             // MV passed in is in render pixels; we want delta in display UV: mv / dstSize.
             push.putFloat(16, 1.0f / displayWidth);
             push.putFloat(20, 1.0f / displayHeight);
+            // Composite feeds NRD/FFX-denoised beauty into TAAU. A second heavy temporal pass
+            // (old alpha≈0.55, matte rough→0.27 current) milks the plate. Prefer current frame:
+            // near-native = mild AA only; downscaled = slightly more history for upsample noise.
+            float scale = (float) renderWidth / (float) Math.max(1, displayWidth);
             float baseAlpha = CausticaConfig.Rt.Composite.TEMPORAL_ALPHA.value();
-            float alpha = historyInitialized ? baseAlpha : 1.0f; // first frame: no blend
+            float taauAlpha = scale >= 0.95f
+                    ? Math.max(baseAlpha, 0.88f)
+                    : Math.max(baseAlpha, 0.72f);
+            float alpha = historyInitialized ? taauAlpha : 1.0f; // first frame: no blend
             push.putFloat(24, alpha);
             push.putFloat(28, CausticaConfig.Rt.Composite.TEMPORAL_DISOCCLUSION.value());
             float sharpness = CausticaConfig.Rt.Upscaler.SHARPEN.value()
                     ? CausticaConfig.Rt.Upscaler.SHARPNESS.value() : 0.0f;
-            // 0..0.5 Catmull-Rom bias. The shader further modulates per-pixel by roughness:
-            // matte (rough>=0.4) gets sharpened=0 to avoid amplifying path-tracer noise,
-            // glossy gets full sharpness.
-            push.putFloat(32, sharpness * 0.5f);
-            // varianceClipGamma: 1.0 = textbook, 1.5 = more conservative (less ghost, slightly more blur).
-            // We use 1.3 as a balanced default; the shader tightens to 0.7*gamma on glossy surfaces.
-            push.putFloat(36, 1.3f);
+            // Full sharpness range for the upsample kernel (shader multiplies; was *0.5 which
+            // halved user sharpness on top of RCAS post-pass already running).
+            push.putFloat(32, sharpness);
+            // varianceClipGamma: lower = tighter clip = less history bleed / less milk.
+            push.putFloat(36, 1.0f);
             push.putInt(40, historyInitialized ? 1 : 0);
             push.putInt(44, 0);
             // Signed render-pixel offset applied to the primary ray. taau.comp subtracts it

@@ -336,8 +336,13 @@ public final class RtPipeline {
 
             // Stages: raygen, one miss per rmiss entry, the closest-hit, then (optionally) the any-hit.
             // Groups are raygen + N miss + the hit records selected by traceRayEXT's SBT offset/stride.
+            // ALWAYS allocate the full terrain/entity hit-group table (SBT_HIT_GROUP_COUNT), even when
+            // any-hit is disabled: terrain BLASes expose 4 fixed geometries (solid/cutout/translucent/
+            // water) and instance SBT offsets assume that layout. Shrinking to 1 hit group while the
+            // BLAS still has geometryIndex>0 makes the RT hardware read past the SBT and GPUVM-fault
+            // (the fixed SQC READ_INVALID we saw on RADV once the first terrain section published).
             int missCount = rmiss.length;
-            int hitGroupCount = hasAhit ? RtAccel.SBT_HIT_GROUP_COUNT : 1;
+            int hitGroupCount = RtAccel.SBT_HIT_GROUP_COUNT;
             int groupCount = 1 + missCount + hitGroupCount;
             int hitGroupIdx = 1 + missCount;
             int chitStage = 1 + missCount;
@@ -414,21 +419,41 @@ public final class RtPipeline {
                 throw new UnsupportedOperationException("SBT stride " + stride + " exceeds maxShaderGroupStride "
                         + Integer.toUnsignedLong(ctx.maxShaderGroupStride()));
             }
-            RtBuffer sbt = ctx.createAlignedBuffer(stride * groupCount,
-                    VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR, true,
-                    label + " shader binding table", ctx.shaderGroupBaseAlignment());
-            for (int g = 0; g < groupCount; g++) {
-                MemoryUtil.memCopy(MemoryUtil.memAddress(handles) + (long) g * handleSize, sbt.mapped + g * stride, handleSize);
+            // SBT is read by the RT hardware on every vkCmdTraceRaysKHR. On RADV/NAVI33 a host-visible
+            // SBT (HOST_CACHED or BAR) is the buffer nearest the fixed GPUVM fault address in every crash
+            // report, so keep the live SBT purely device-local and fill it via a one-shot staging copy.
+            long sbtBytes = stride * groupCount;
+            ByteBuffer packed = MemoryUtil.memAlloc((int) sbtBytes);
+            try {
+                MemoryUtil.memSet(packed, 0);
+                for (int g = 0; g < groupCount; g++) {
+                    MemoryUtil.memCopy(MemoryUtil.memAddress(handles) + (long) g * handleSize,
+                            MemoryUtil.memAddress(packed) + g * stride, handleSize);
+                }
+                RtBuffer sbt = ctx.uploadDeviceLocal(sbtBytes,
+                        VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR,
+                        MemoryUtil.memAddress(packed), (int) sbtBytes,
+                        label + " shader binding table",
+                        ctx.shaderGroupBaseAlignment());
+                return new RtPipeline(ctx, dsl, pool, sets, layout, pipeline, sbt, stride, missCount, hitGroupCount,
+                        pushConstantSize, pcStages, firstExtraBinding,
+                        bindlessLayout, bindlessPool, bindlessSets, bindlessTextures,
+                        specBinding, normalBinding, skyBinding);
+            } finally {
+                MemoryUtil.memFree(packed);
             }
-            sbt.flush();
-            return new RtPipeline(ctx, dsl, pool, sets, layout, pipeline, sbt, stride, missCount, hitGroupCount, pushConstantSize, pcStages, firstExtraBinding,
-                    bindlessLayout, bindlessPool, bindlessSets, bindlessTextures,
-                    specBinding, normalBinding, skyBinding);
         }
     }
 
     private static boolean hitGroupUsesAnyHit(int relativeHitGroup) {
         if (relativeHitGroup < RtAccel.SBT_ENTITY_OFFSET) {
+            // RADV terrain uses a single non-opaque geometry (geometryIndex always 0), so every
+            // primary/shadow hit lands on hit-group 0 / SBT_SHADOW solid slots. Those slots must
+            // carry any-hit so cutout alpha + translucent/water shadow pass-through still run;
+            // world.rahit classifies the real material from prim flags when geometryIndex==0.
+            if (dev.comfyfluffy.caustica.rt.RtDeviceBringup.isRadv()) {
+                return true;
+            }
             int rayType = relativeHitGroup / RtAccel.TERRAIN_BUCKETS;
             int bucket = relativeHitGroup % RtAccel.TERRAIN_BUCKETS;
             if (rayType == RtAccel.SBT_RAY_RADIANCE) {
@@ -669,18 +694,23 @@ public final class RtPipeline {
             if (pushConstants != null && pushConstantSize > 0) {
                 VK10.vkCmdPushConstants(cmd, pipelineLayout, pushConstantStages, 0, pushConstants);
             }
-            // RADV (Mesa 26.x) on RDNA 3: the BLAS writes are in the GPU's L2 when the SBT
-            // (host-cached system-RAM) and the BLAS-input buffers (also host-cached) are read by the
-            // RT shader pipe. Without an ACCELERATION_STRUCTURE_BUILD -> RAY_TRACING_SHADER barrier the
-            // shader can dereference a stale BDA through the SBT and fault at a ~4 GiB offset in the
-            // doorbell region (the SQC (data) fault from the 2026-07-24 GPUVM report). Make the BLAS
-            // writes visible to the ray-trace shader stage before vkCmdTraceRaysKHR runs.
-            VkMemoryBarrier.Buffer mem = VkMemoryBarrier.calloc(1, stack)
-                    .sType$Default()
+            // 1) Host-written RT inputs (SBT if ever host-visible, section table BDAs, entity geom
+            //    tables, push-constant buffers) must be visible to the ray-trace pipe.
+            // 2) Freshly-built AS storage must be visible before vkCmdTraceRaysKHR.
+            // RADV has repeatedly GPUVM-faulted at a fixed doorbell-region address with
+            // next='…shader binding table' when either of these is missing.
+            VkMemoryBarrier.Buffer mem = VkMemoryBarrier.calloc(2, stack);
+            mem.get(0).sType$Default()
+                    .srcAccessMask(VK10.VK_ACCESS_HOST_WRITE_BIT)
+                    .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT
+                            | KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+            mem.get(1).sType$Default()
                     .srcAccessMask(KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
-                    .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT);
+                    .dstAccessMask(KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                            | VK10.VK_ACCESS_SHADER_READ_BIT);
             VK10.vkCmdPipelineBarrier(cmd,
-                    KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                    VK10.VK_PIPELINE_STAGE_HOST_BIT
+                            | KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                     KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
                     0, mem, null, null);
             VkStridedDeviceAddressRegionKHR raygen = VkStridedDeviceAddressRegionKHR.calloc(stack)

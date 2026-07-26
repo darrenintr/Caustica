@@ -307,6 +307,18 @@ public final class RtAccel {
                 opacityMicromap.freeBuildInputs();
             }
         }
+
+        public int maxVertex() {
+            return maxVertex;
+        }
+
+        public int triangleCount() {
+            return triangleCount;
+        }
+
+        public String label() {
+            return label;
+        }
     }
 
     /** Terrain material buckets. Geometry indices are fixed and double as SBT material record indices. */
@@ -352,10 +364,26 @@ public final class RtAccel {
      * holds triangle counts in {@link #TERRAIN_BUCKETS} order: solid, cutout, translucent, water. All
      * geometries reference the same packed vertex/index buffers; zero-triangle buckets are kept so
      * {@code gl_GeometryIndexEXT} remains a stable material/SBT index in the shaders.
+     *
+     * <p>On Mesa RADV, multi-geometry BLAS + hit-shader BDA chains hard-recover the device (fixed SQC
+     * GPUVM fault). Fall back to a single non-opaque geometry covering all triangles so geometryIndex
+     * stays 0 and the SBT offset stays within the first hit record. Material classification then relies
+     * on prim data (tint.w / flags) rather than gl_GeometryIndexEXT.
      */
     public static PreparedBlas prepareTerrainBlas(RtContext ctx, RtBuffer positions, int vertexCount,
                                                   RtBuffer indices, int[] bucketTris, OpacityMicromapInput opacityMicromapInput,
                                                   String label) {
+        if (RtDeviceBringup.isRadv()) {
+            int totalTris = 0;
+            for (int t : bucketTris) {
+                totalTris += t;
+            }
+            // Single non-opaque geometry on RADV: multi-geom BLAS hard-recovered the device, but full
+            // closest-hit + any-hit are stable once geometryIndex stays 0. Non-opaque lets cutout alpha
+            // (world.rahit) run; material class still comes from prim tint.w / mat flags.
+            return prepareTrianglesBlas(ctx, positions, vertexCount, indices, totalTris * 3, false,
+                    labelOr(label, "terrain BLAS") + " (radv single-geom)");
+        }
         VkDevice vk = ctx.vk();
         String debugLabel = labelOr(label, "terrain BLAS");
         try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -626,8 +654,11 @@ public final class RtAccel {
                 .flags(buildFlags(false))
                 .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR).geometryCount(geom.capacity()).pGeometries(geom);
         java.nio.IntBuffer maxPrims = stack.mallocInt(geom.capacity());
+        // Size-query only: claim at least 1 prim per fixed bucket so RADV's AS size path stays
+        // non-degenerate when a section has empty cutout/water slots. Actual build ranges still use
+        // the real zero counts from terrainBuildRanges.
         for (int tris : bucketTris) {
-            maxPrims.put(tris);
+            maxPrims.put(Math.max(1, tris));
         }
         maxPrims.flip();
         VkAccelerationStructureBuildSizesInfoKHR sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
@@ -655,14 +686,19 @@ public final class RtAccel {
     /** A build-ready TLAS view over a {@link TlasRing} slot's resources (the ring owns and frees them). */
     public static final class PreparedTlas {
         public final RtAccel accel;
-        private final RtBuffer instanceBuffer;
+        /** Host-mapped staging written by {@link #prepareTlas}; copied to {@link #deviceInstances} at record time. */
+        private final RtBuffer hostInstances;
+        /** Pure device-local instance buffer the AS builder reads. */
+        private final RtBuffer deviceInstances;
         private final RtBuffer scratch;
         private final int instanceCount;
         private final String label;
 
-        private PreparedTlas(RtAccel accel, RtBuffer instanceBuffer, RtBuffer scratch, int instanceCount, String label) {
+        private PreparedTlas(RtAccel accel, RtBuffer hostInstances, RtBuffer deviceInstances, RtBuffer scratch,
+                             int instanceCount, String label) {
             this.accel = accel;
-            this.instanceBuffer = instanceBuffer;
+            this.hostInstances = hostInstances;
+            this.deviceInstances = deviceInstances;
             this.scratch = scratch;
             this.instanceCount = instanceCount;
             this.label = label;
@@ -687,13 +723,17 @@ public final class RtAccel {
 
         private static final class Slot {
             RtAccel accel;
-            RtBuffer instanceBuffer;
+            /** Host-mapped staging for CPU instance packing. */
+            RtBuffer hostInstances;
+            /** Pure device-local instance buffer the AS builder actually reads (RADV-safe). */
+            RtBuffer deviceInstances;
             RtBuffer scratch;
             int capacity;
 
             void destroy() {
                 accel.destroy();
-                instanceBuffer.destroy();
+                hostInstances.destroy();
+                deviceInstances.destroy();
                 scratch.destroy();
             }
         }
@@ -710,9 +750,9 @@ public final class RtAccel {
     }
 
     /**
-     * Fill the next ring slot's instance buffer and return it as a build-ready TLAS (the slot's AS is
-     * rebuilt in place — BUILD mode overwrites). Do NOT call {@link PreparedTlas#destroyAll} on the
-     * result: the ring owns the resources.
+     * Fill the next ring slot's <em>host</em> instance buffer and return a build-ready TLAS view.
+     * The caller must {@link #recordTlasBuild} which copies host → device-local before the AS build —
+     * RADV GPUVM-faults when the builder follows BDAs into host-visible instance memory.
      */
     public static PreparedTlas prepareTlas(RtContext ctx, List<Instance> instances, TlasRing ring) {
         int count = instances.size();
@@ -730,11 +770,11 @@ public final class RtAccel {
 
         // Pack via LWJGL struct accessors so native ABI/bitfields stay correct, without per-instance
         // MemoryStack pressure that overflows once section counts climb into the hundreds.
-        writeTlasInstances(instances, slot.instanceBuffer.mapped, 0);
+        writeTlasInstances(instances, slot.hostInstances.mapped, 0);
         if (count > 0) {
-            slot.instanceBuffer.flush(0L, (long) count * VkAccelerationStructureInstanceKHR.SIZEOF);
+            slot.hostInstances.flush(0L, (long) count * VkAccelerationStructureInstanceKHR.SIZEOF);
         }
-        return new PreparedTlas(slot.accel, slot.instanceBuffer, slot.scratch, count,
+        return new PreparedTlas(slot.accel, slot.hostInstances, slot.deviceInstances, slot.scratch, count,
                 "frame TLAS " + count + " instances");
     }
 
@@ -757,19 +797,26 @@ public final class RtAccel {
         }
     }
 
-    /** Create one ring slot sized for {@code capacity} instances (instance buffer + AS + backing + scratch). */
+    /** Create one ring slot sized for {@code capacity} instances (host+device instance buffers + AS + scratch). */
     private static TlasRing.Slot createTlasSlot(RtContext ctx, int capacity) {
         VkDevice vk = ctx.vk();
         String label = "TLAS ring slot (" + capacity + " instance capacity)";
         TlasRing.Slot slot = new TlasRing.Slot();
         slot.capacity = capacity;
-        slot.instanceBuffer = ctx.createAlignedBuffer((long) VkAccelerationStructureInstanceKHR.SIZEOF * capacity,
-                org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true,
-                label + " instance buffer", TLAS_INSTANCE_ADDRESS_ALIGNMENT);
+        long instanceBytes = (long) VkAccelerationStructureInstanceKHR.SIZEOF * capacity;
+        // Host staging: CPU packs here. Device buffer: pure VRAM AS build input (RADV requires this).
+        slot.hostInstances = ctx.createAlignedBuffer(instanceBytes,
+                VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
+                label + " instance staging", TLAS_INSTANCE_ADDRESS_ALIGNMENT);
+        slot.deviceInstances = ctx.createAlignedBuffer(instanceBytes,
+                org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+                        | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                false,
+                label + " instance device", TLAS_INSTANCE_ADDRESS_ALIGNMENT);
         try (MemoryStack stack = MemoryStack.stackPush()) {
             // Size the AS + scratch for the slot CAPACITY: build sizes are monotonic in instance count, so
             // every per-frame build with count ≤ capacity fits the same backing/scratch.
-            VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, slot.instanceBuffer.deviceAddress);
+            VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, slot.deviceInstances.deviceAddress);
             VkAccelerationStructureBuildSizesInfoKHR sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
             vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                     build.get(0), stack.ints(capacity), sizes);
@@ -829,7 +876,32 @@ public final class RtAccel {
 
     private static void recordTlasBuildRaw(RtContext ctx, VkCommandBuffer cmd, PreparedTlas tlas) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, tlas.instanceBuffer.deviceAddress);
+            if (tlas.instanceCount > 0) {
+                // Host staging → pure device-local before the AS builder reads instance BDAs. RADV
+                // hard-recovers when the builder follows host-visible instance memory (even BAR).
+                long bytes = (long) tlas.instanceCount * VkAccelerationStructureInstanceKHR.SIZEOF;
+                org.lwjgl.vulkan.VkBufferCopy.Buffer region = org.lwjgl.vulkan.VkBufferCopy.calloc(1, stack)
+                        .srcOffset(0L).dstOffset(0L).size(bytes);
+                VK10.vkCmdCopyBuffer(cmd, tlas.hostInstances.handle, tlas.deviceInstances.handle, region);
+                org.lwjgl.vulkan.VkBufferMemoryBarrier.Buffer barrier =
+                        org.lwjgl.vulkan.VkBufferMemoryBarrier.calloc(1, stack).sType$Default()
+                                .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                                .dstAccessMask(org.lwjgl.vulkan.KHRAccelerationStructure
+                                        .VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                                        | VK10.VK_ACCESS_SHADER_READ_BIT)
+                                .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                                .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                                .buffer(tlas.deviceInstances.handle)
+                                .offset(0L)
+                                .size(bytes);
+                VK10.vkCmdPipelineBarrier(cmd,
+                        VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        org.lwjgl.vulkan.KHRAccelerationStructure
+                                .VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                        0, null, barrier, null);
+            }
+            VkAccelerationStructureBuildGeometryInfoKHR.Buffer build =
+                    tlasBuildInfo(stack, tlas.deviceInstances.deviceAddress);
             build.get(0).dstAccelerationStructure(tlas.accel.handle);
             build.get(0).scratchData().deviceAddress(scratchAddress(ctx, tlas.scratch));
             VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack);

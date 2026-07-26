@@ -55,6 +55,17 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     // unconditionally. The ffx field/usage lines below are commented out but kept
     // for reference in case the upstream FFX issues are fixed and a future flag re-enables.
     // private final OfficialFfxDenoiseBackend ffx = new OfficialFfxDenoiseBackend();
+    // Live capture (2026-07-25): NRD REBLUR dispatch returned ok but outdoor snow/grass still
+    // looked raw-SPP. Residual bilateral after compose is a pure-SPIR-V filter on the final
+    // beauty plate — if this still looks noisy, the present path is broken; if it cleans up,
+    // NRD was not sufficiently filtering the remodulated plate.
+    // Spatial-only (not temporal residual): temporal residual needs bilateral_temporal.comp.spv
+    // and its ensureSized was throwing into Hybrid.ensureSized, killing the whole denoise path
+    // (live: "missing SPIR-V" → composite failed → looked like denoise off).
+    private final BilateralDenoiseBackend residual = BilateralDenoiseBackend.residualAfterNrd();
+    /** Ping-pong target for residual bilateral (cannot filter in-place). */
+    private RtImage residualMid;
+    private boolean residualReady;
     /** When true, skip FFX prepass and feed raw S/R into prepare (config denoise=NRD). */
     private final boolean nrdOnly;
     /**
@@ -215,6 +226,13 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         // v0.6: FFX disabled. NRD-only path always marks itself ready; the hybrid mode
         // (nrdOnly=false) used to chain FFX for shadow+reflection prepass, but that's been
         // bypassed too -- we just run NRD on the raw inputs.
+        try {
+            residual.init(vkDevice, vkPhysicalDevice);
+            residualReady = CausticaConfig.Rt.Denoise.NRD_RESIDUAL_BILATERAL.value();
+        } catch (Throwable t) {
+            residualReady = false;
+            CausticaMod.LOGGER.warn("NRD residual bilateral init failed; NRD compose only", t);
+        }
         ready = true;
         transparentDenoiser.init();
     }
@@ -307,15 +325,22 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
             jitterYPrev = jitterY;
         }
 
-        // Camera-relative world (origin = eye): NRD wants pure orthogonal worldToView so its
-        // InvertOrtho path stays valid. Camera translation lives in screen-space MVs (rgen),
-        // NOT as a fake translation on worldToViewPrev — that poisoned disocclusion and made
-        // REBLUR reject history every frame → full SPP firefly grain.
+        // Caustica's traced positions are relative to the current camera. Keep the current
+        // matrix as a pure rotation, but express the current camera-relative origin in the
+        // previous frame: R_prev * T(currentCamera - previousCamera). The shared gMotion image
+        // contains full camera motion for TAAU, so the native NRD path deliberately ignores it
+        // and lets these matrices perform static-scene camera reprojection.
         viewRotation.get(worldToView);
         projection.get(viewToClip);
         if (viewRotationPrev != null) {
-            viewRotationPrev.get(worldToViewPrev);
-        } else if (!haveCamera) {
+            new Matrix4f(viewRotationPrev)
+                    .translate(camDeltaX, camDeltaY, camDeltaZ)
+                    .get(worldToViewPrev);
+        } else if (haveCamera) {
+            new Matrix4f().set(worldToViewPrev)
+                    .translate(camDeltaX, camDeltaY, camDeltaZ)
+                    .get(worldToViewPrev);
+        } else {
             System.arraycopy(worldToView, 0, worldToViewPrev, 0, 16);
         }
         if (projectionPrev != null) {
@@ -410,6 +435,14 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
             }
         }
         if (this.width == width && this.height == height && beautyRawCopy != null && nrdDiffuse != null) {
+            if (residualReady) {
+                try {
+                    residual.ensureSized(width, height);
+                } catch (Throwable t) {
+                    residualReady = false;
+                    CausticaMod.LOGGER.warn("NRD residual bilateral ensureSized failed; NRD compose only", t);
+                }
+            }
             ready = true;
             return;
         }
@@ -418,6 +451,11 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         // (YCoCg + normHitDist / signed normal).
         beautyRawCopy = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "hybrid beauty raw");
         ffxPlate = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "hybrid ffx plate");
+        // NRD compose writes RGBA16F; the residual bilateral pass and copy-back must use the
+        // identical format. B10G11R11 and RGBA16F have incompatible 4-byte/8-byte texels;
+        // binding one as the other and copying between them is invalid and can appear as a half-frame seam.
+        residualMid = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                "hybrid residual mid");
         nrdDiffuse = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid nrd diffuse");
         nrdSpecular = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "hybrid nrd specular");
         // Pre-warp targets (v0.6.8+, option b for per-tile jitter): same format as nrdDiffuse/nrdSpecular,
@@ -444,6 +482,14 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         nrdHardReset = true;
         ready = true;
         transparentDenoiser.ensureSized(width, height);
+        if (residualReady) {
+            try {
+                residual.ensureSized(width, height);
+            } catch (Throwable t) {
+                residualReady = false;
+                CausticaMod.LOGGER.warn("NRD residual bilateral ensureSized failed; NRD compose only", t);
+            }
+        }
         // Create NRD context when native is present
         try {
             long dev = ctx.vk().address();
@@ -783,20 +829,40 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                 if (!lastComposeOk) {
                     throw new IllegalStateException("NRD compose pipeline unavailable");
                 }
+                // Residual bilateral on the composed beauty. Cannot filter in-place (ping-pong);
+                // write mid then copy back. Failure never kills NRD compose.
+                lastPathLabel = nrdOnly ? "nrd" : "ffx→nrd";
+                if (residualReady && residualMid != null
+                        && CausticaConfig.Rt.Denoise.NRD_RESIDUAL_BILATERAL.value()) {
+                    try {
+                        residual.ensureSized(width, height);
+                        if (residual.dispatch(stack, cmd, outColor, inNormal, inDepth, inMotion,
+                                mvScaleX, mvScaleY, residualMid)) {
+                            copyImage(stack, cmd, residualMid, outColor);
+                            barrier(stack, cmd, outColor.image);
+                            lastPathLabel = nrdOnly ? "nrd→bilateral" : "ffx→nrd→bilateral";
+                        }
+                    } catch (Throwable rt) {
+                        residualReady = false;
+                        CausticaMod.LOGGER.warn("NRD residual bilateral failed; keeping compose plate", rt);
+                    }
+                }
                 nrdHardReset = false;
                 nrdFrameIndex++;
                 nrdOk = true;
                 lastNrdOk = true;
-                lastPathLabel = nrdOnly ? "nrd" : "ffx→nrd";
                 if (!nrdRanLogged) {
                     nrdRanLogged = true;
                     String label = useRelax ? "RELAX" : "REBLUR";
                     if (nrdOnly) {
                         CausticaMod.LOGGER.info(
-                                "Denoise: NRD " + label + " HQ (no FFX prepass; no beauty TAA)");
+                                "Denoise: NRD " + label
+                                        + (CausticaConfig.Rt.Denoise.NRD_RESIDUAL_BILATERAL.value()
+                                                ? " + residual bilateral" : " quality mode")
+                                        + " (no FFX; no beauty TAA)");
                     } else {
                         CausticaMod.LOGGER.info(
-                                "Hybrid denoise: FFX prepass + NRD " + label + " HQ");
+                                "Hybrid denoise: FFX prepass + NRD " + label + " + residual bilateral");
                     }
                 }
             } catch (Throwable t) {
@@ -843,6 +909,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         // if (!nrdOnly) { ffx.destroy(); }
         NrdRuntime.INSTANCE.destroy();
         transparentDenoiser.destroy();
+        residual.destroy();
         RtContext ctx = RtContext.get();
         destroyImages();
         if (ctx != null) {
@@ -921,6 +988,10 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         if (ffxPlate != null) {
             ffxPlate.destroy();
             ffxPlate = null;
+        }
+        if (residualMid != null) {
+            residualMid.destroy();
+            residualMid = null;
         }
         if (nrdDiffuse != null) {
             nrdDiffuse.destroy();

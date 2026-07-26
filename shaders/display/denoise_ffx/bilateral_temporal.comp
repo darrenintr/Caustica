@@ -17,7 +17,7 @@
 //   3  inNormal      rgba16f         (oct-decoded normal in rgb, depth in a; this shader
 //                                     only needs rgb)
 //   4  inDepth       r32f            (current pixel's deviceZ; reverse-Z infinite)
-//   5  inMotion      rg16f           (per-pixel UV-space MV, prev-cur; in [-1,1])
+//   5  inMotion      rgba16f         (per-pixel UV-space MV, prev-cur; in [-1,1])
 //   6  inHistoryDepth r32f           (previous frame's deviceZ, packed alongside history
 //                                     by the host; we don't currently bind this —
 //                                     the depth check uses inDepth at prevCoord instead,
@@ -42,7 +42,7 @@ layout(set = 0, binding = 1, r11f_g11f_b10f) readonly  uniform image2D inHistory
 layout(set = 0, binding = 2, r8)            readonly  uniform image2D inCounter;
 layout(set = 0, binding = 3, rgba16f)       readonly  uniform image2D inNormal;
 layout(set = 0, binding = 4, r32f)          readonly  uniform image2D inDepth;
-layout(set = 0, binding = 5, rg16f)         readonly  uniform image2D inMotion;
+layout(set = 0, binding = 5, rgba16f)       readonly  uniform image2D inMotion;
 layout(set = 0, binding = 7, r11f_g11f_b10f) writeonly uniform image2D outColor;
 layout(set = 0, binding = 8, r8)            writeonly uniform image2D outCounter;
 

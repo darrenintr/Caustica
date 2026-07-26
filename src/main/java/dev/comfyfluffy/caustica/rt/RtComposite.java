@@ -89,7 +89,7 @@ public final class RtComposite {
 
     // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80) + debugView(@88) + frameIndex(@92)
     // + prevViewProj(@96) + camDelta(@160) + spp(@172) + jitter(@176) + entityTableAddr(@184)
-    // + flags(@192): bit 0 = camera submerged, bit 1 = PBR BRDF enabled, bit 4 = water waves
+    // + flags(@192): bit 0 = camera submerged, bit 1 = PBR BRDF enabled, bit 4 = water waves, bit 5 = tile jitter
     // + maxBounces(@196) + maxRayDistance(@200)
     // + dynamic sky (16-byte aligned vec4s): sunDir+dayFactor(@208) + lightDir(@224) + lightRadiance(@240)
     // + sky rewrite: moonDir+moonPhase(@256) + celestialAxis+starAngle(@272) + sunUv(@288) + moonUv(@304)
@@ -140,7 +140,9 @@ public final class RtComposite {
     private static final boolean ENABLE_VRS = false;
     private static final boolean ENABLE_ASYNC_COMPUTE = false;
     private static final boolean ENABLE_DRS = false;
-    private static final boolean ENABLE_ADAPTIVE_SPP = false;
+    // Adaptive SPP: path tracer spends extra samples on transparent/water/emissive-adjacent pixels.
+    // Hard-disabled during RADV isolation; re-enabled now that the RT path is stable.
+    private static final boolean ENABLE_ADAPTIVE_SPP = true;
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
     // the composite frame counter has advanced this far past it (so no in-flight frame still reads it).
@@ -151,11 +153,15 @@ public final class RtComposite {
     }
 
     private static int spp() {
-        return 1;
+        // Honour config. Hardcoded 1 during GPUVM isolation left every pixel as a single Monte-Carlo
+        // sample → SPP=1 fireflies that NRD cannot fully erase. Cap at 4 for interactive pacing.
+        return Math.min(4, Math.max(1, CausticaConfig.Rt.Composite.SPP.value()));
     }
 
     private static int maxBounces() {
-        return 2;
+        // Config default is 4; isolation hard-capped at 2 which cut GI/spec tails but also left
+        // single-bounce sun NEE as the only energy path (more visible firefly grain on snow/grass).
+        return Math.min(6, Math.max(1, CausticaConfig.Rt.Composite.MAX_BOUNCES.value()));
     }
 
     private static float maxRayDistance() {
@@ -266,11 +272,13 @@ public final class RtComposite {
     private int bindlessTextureCapacity;
     // True after the LabPBR atlases have been resolved/bound for the currently alive world pipeline.
     private boolean materialBindingsReady;
-    // World push data (256 B) lives in a host-visible BDA ring; only the 8-byte slot address is pushed
-    // inline (the portable minimum push-constant budget is otherwise exhausted by the world push struct).
-    // One slot per in-flight frame, cycled per frame so an in-flight slot is never overwritten.
+    // World push data lives in a dual host/device BDA ring; only the 8-byte *device* slot address is
+    // pushed inline (the portable minimum push-constant budget is otherwise exhausted by the world push
+    // struct). CPU writes the host slot, the frame command buffer copies host → pure device-local before
+    // trace (RADV GPUVM-faults when raygen follows a host-visible push BDA). One slot per in-flight frame.
     private static final int PUSH_RING = 6;
-    private RtBuffer[] pushRing;
+    private RtBuffer[] pushHostRing;
+    private RtBuffer[] pushDeviceRing;
     private int pushSlot;
     private RtDisplayPipeline displayPipeline;
     /** FidelityFX CAS-style sharpen after upscale (display-res). */
@@ -859,15 +867,28 @@ public final class RtComposite {
                 CausticaMod.LOGGER.warn("Clamping RT bindless texture capacity from {} to {} for device descriptor limits",
                         requestedBindlessCapacity, bindlessTextureCapacity);
             }
+            // Full multi-geometry SBT table is always allocated (hitGroupCount fixed). Full closest-hit +
+            // any-hit restored after stub/minimal isolation: AS/SBT/trace and full chit BDA loads are
+            // stable on RADV with single-geom BLAS. FSR2 remains forced OFF separately.
             worldPipeline = RtPipeline.create(ctx, RtDeviceBringup.worldRaygenShader(),
                     new String[]{"world.rmiss.spv", "shadow.rmiss.spv"}, RtDeviceBringup.worldClosestHitShader(), "world.rahit.spv",
                     WORLD_PUSH_CONST_SIZE, true, GUIDE_COUNT, bindlessTextureCapacity, true, true);
+            if (RtDeviceBringup.isRadv()) {
+                CausticaMod.LOGGER.info("RADV path: closest-hit={}, any-hit=world.rahit.spv, single-geom BLAS",
+                        RtDeviceBringup.worldClosestHitShader());
+            }
             // Per-frame push data lives in this BDA ring; the pipeline only pushes its address.
-            if (pushRing == null) {
-                pushRing = new RtBuffer[PUSH_RING];
+            if (pushHostRing == null) {
+                pushHostRing = new RtBuffer[PUSH_RING];
+                pushDeviceRing = new RtBuffer[PUSH_RING];
                 for (int i = 0; i < PUSH_RING; i++) {
-                    pushRing[i] = ctx.createBuffer(WORLD_PUSH_SIZE,
-                            VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "rt world push " + i);
+                    // Host staging: CPU packs WorldPush here. Device: pure VRAM BDA raygen actually reads.
+                    // WorldPush is buffer_reference_align=16 — the device slot BDA must itself be 16B-aligned.
+                    pushHostRing[i] = ctx.createBuffer(WORLD_PUSH_SIZE,
+                            VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "rt world push host " + i);
+                    pushDeviceRing[i] = ctx.createBdaBuffer(WORLD_PUSH_SIZE,
+                            VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            false, "rt world push device " + i);
                 }
             }
             if (output != null) {
@@ -1428,8 +1449,9 @@ public final class RtComposite {
             // Write this frame's push data into the next BDA ring slot (cycled so an in-flight slot is
             // never overwritten). The std430 WorldPush layout matches these byte offsets exactly.
             pushSlot = (pushSlot + 1) % PUSH_RING;
-            RtBuffer pushBuf = pushRing[pushSlot];
-            ByteBuffer push = MemoryUtil.memByteBuffer(pushBuf.mapped, WORLD_PUSH_SIZE);
+            RtBuffer pushHost = pushHostRing[pushSlot];
+            RtBuffer pushDevice = pushDeviceRing[pushSlot];
+            ByteBuffer push = MemoryUtil.memByteBuffer(pushHost.mapped, WORLD_PUSH_SIZE);
             frameInvViewProj.set(frameProjection).mul(frameViewRotation).invert().get(0, push);
             mvCurProjView.get(352, push); // forward camera-relative view-projection: HW depth guide + water MV
             push.putFloat(64, (float) (camX - terrain.blockX));
@@ -1471,6 +1493,12 @@ public final class RtComposite {
             // transparent / water / emissive-adjacent pixels and leaves sky at SPP 1.
             if (ENABLE_ADAPTIVE_SPP && CausticaConfig.Rt.Composite.ADAPTIVE_SPP.value()) {
                 flags |= 0b1000;
+            }
+            // bit 5 = opt-in tile-coalesced jitter. It improves traversal coherence on some GPUs,
+            // but the quantized pattern is extra temporal work and is visibly noisy when convergence
+            // is still warming up. Quality defaults to off; use the config for a performance A/B test.
+            if (CausticaConfig.Rt.Composite.TILE_JITTER.value()) {
+                flags |= 0b100000;
             }
             push.putInt(192, flags);
             push.putInt(196, maxBounces());
@@ -1608,96 +1636,136 @@ public final class RtComposite {
             push.putFloat(hybridOffset + 8, CausticaConfig.Rt.Hybrid.LIGHTFIELD_THRESHOLD.value());
             push.putFloat(hybridOffset + 12, 0.0f);
 
-            // Build the entity BLAS this frame, then the TLAS that references them (+ the already-built
-            // terrain BLAS), then the trace — each separated by a barrier. The frame TLAS is retired
-            // KEEP_FRAMES later (entity meshes/BLAS are retired by RtEntities on the same horizon).
-            if (!fe.blas().isEmpty()) {
-                try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.blasRecord")) {
-                    RtAccel.recordBlasBuilds(ctx, cmd, fe.blas());
-                }
-                VulkanCommandEncoder.memoryBarrier(cmd, stack); // entity BLAS writes visible to the TLAS build
+            // Flush host push staging, then copy into pure device-local VRAM before raygen reads it.
+            // RADV GPUVM-faults at a fixed doorbell VA when WorldPushRef follows a host-visible BDA
+            // (observed next='rt world push N').
+            pushHost.flush();
+            {
+                org.lwjgl.vulkan.VkBufferCopy.Buffer region = org.lwjgl.vulkan.VkBufferCopy.calloc(1, stack)
+                        .srcOffset(0L).dstOffset(0L).size(WORLD_PUSH_SIZE);
+                VK10.vkCmdCopyBuffer(cmd, pushHost.handle, pushDevice.handle, region);
+                org.lwjgl.vulkan.VkBufferMemoryBarrier.Buffer barrier =
+                        org.lwjgl.vulkan.VkBufferMemoryBarrier.calloc(1, stack).sType$Default()
+                                .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                                .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT)
+                                .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                                .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                                .buffer(pushDevice.handle)
+                                .offset(0L)
+                                .size(WORLD_PUSH_SIZE);
+                VK10.vkCmdPipelineBarrier(cmd,
+                        VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        0, null, barrier, null);
             }
-            RtAccel.PreparedTlas frameTlas;
-            try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.prepareTlas")) {
-                frameTlas = RtAccel.prepareTlas(ctx, fe.instances(), tlasRing);
-            }
-            active.setTlas(frameTlas.accel.handle);
-            currentTlasHandle = frameTlas.accel.handle;
-            // setTlas advances both descriptor rings to a long-unused slot. Upload newly registered
-            // bindless textures only after that advance, so ordinary (non-update-after-bind) descriptor
-            // writes cannot race an older submitted frame. Parallel LabPBR atlas views remain stable.
-            RtMaterialSystem.INSTANCE.flushBeforeTrace(active, atlasSampler(ctx));
-            try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.recordTlas")) {
-                RtAccel.recordTlasBuild(ctx, cmd, frameTlas);
-            }
-            VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
+            // Section table is also dual host/device; hit shaders follow tableAddr every hit.
+            terrain.recordSectionTableUpload(cmd);
 
-            // Initialize VRS on first use (lazy init)
-            if (ENABLE_VRS && vrs == null && RtDeviceBringup.vrsEnabled()) {
-                try {
-                    vrs = new RtVariableRateShading(ctx);
-                    CausticaMod.LOGGER.info("Variable Rate Shading lazy initialized");
-                } catch (Exception e) {
-                    CausticaMod.LOGGER.error("Failed to lazy init VRS", e);
-                }
-            }
-
-            // Generate shading rate before raygen (if VRS enabled and resources created)
-            if (vrs != null && gDepth != null && gAlbedo != null) {
-                try {
-                    // Create/resize VRS resources if needed
-                    if (vrs.getShadingRateImageView() == 0L) {
-                        vrs.createResources(renderW, renderH);
+            // Skip the whole AS build + trace while the world still has zero TLAS instances (initial
+            // stream window). Empty TLAS + full-screen trace on Mesa 26.1/NAVI33 is the sequence that
+            // hard-recovers the device; the fault is only reported on the next submitSync (terrain upload).
+            boolean hasTraceGeometry = !fe.instances().isEmpty();
+            if (hasTraceGeometry) {
+                // Build the entity BLAS this frame, then the TLAS that references them (+ the already-built
+                // terrain BLAS), then the trace — each separated by a barrier. The frame TLAS is retired
+                // KEEP_FRAMES later (entity meshes/BLAS are retired by RtEntities on the same horizon).
+                if (!fe.blas().isEmpty()) {
+                    // Entity mesh buffers are still host-mapped; make those puts visible before the BLAS build.
+                    RtContext.hostWriteBarrier(cmd,
+                            org.lwjgl.vulkan.KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                            org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                                    | org.lwjgl.vulkan.VK10.VK_ACCESS_SHADER_READ_BIT);
+                    try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.blasRecord")) {
+                        RtAccel.recordBlasBuilds(ctx, cmd, fe.blas());
                     }
-                    // Generate shading rate from depth and albedo
-                    vrs.generateShadingRate(cmd, gDepth, gAlbedo, renderW, renderH);
-                } catch (Exception e) {
-                    CausticaMod.LOGGER.error("VRS generation failed", e);
+                    VulkanCommandEncoder.memoryBarrier(cmd, stack); // entity BLAS writes visible to the TLAS build
                 }
+                RtAccel.PreparedTlas frameTlas;
+                try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.prepareTlas")) {
+                    frameTlas = RtAccel.prepareTlas(ctx, fe.instances(), tlasRing);
+                }
+                // prepareTlas packs host staging; recordTlasBuild copies host → device-local then builds.
+                // Still emit a HOST barrier so the staging flush is ordered before the transfer.
+                RtContext.hostWriteBarrier(cmd,
+                        VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK10.VK_ACCESS_TRANSFER_READ_BIT);
+                active.setTlas(frameTlas.accel.handle);
+                currentTlasHandle = frameTlas.accel.handle;
+                // setTlas advances both descriptor rings to a long-unused slot. Upload newly registered
+                // bindless textures only after that advance, so ordinary (non-update-after-bind) descriptor
+                // writes cannot race an older submitted frame. Parallel LabPBR atlas views remain stable.
+                RtMaterialSystem.INSTANCE.flushBeforeTrace(active, atlasSampler(ctx));
+                try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.recordTlas")) {
+                    RtAccel.recordTlasBuild(ctx, cmd, frameTlas);
+                }
+                VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
+
+                // Initialize VRS on first use (lazy init)
+                if (ENABLE_VRS && vrs == null && RtDeviceBringup.vrsEnabled()) {
+                    try {
+                        vrs = new RtVariableRateShading(ctx);
+                        CausticaMod.LOGGER.info("Variable Rate Shading lazy initialized");
+                    } catch (Exception e) {
+                        CausticaMod.LOGGER.error("Failed to lazy init VRS", e);
+                    }
+                }
+
+                // Generate shading rate before raygen (if VRS enabled and resources created)
+                if (vrs != null && gDepth != null && gAlbedo != null) {
+                    try {
+                        // Create/resize VRS resources if needed
+                        if (vrs.getShadingRateImageView() == 0L) {
+                            vrs.createResources(renderW, renderH);
+                        }
+                        // Generate shading rate from depth and albedo
+                        vrs.generateShadingRate(cmd, gDepth, gAlbedo, renderW, renderH);
+                    } catch (Exception e) {
+                        CausticaMod.LOGGER.error("VRS generation failed", e);
+                    }
+                }
+
+                ByteBuffer pushAddr = stack.malloc(WORLD_PUSH_CONST_SIZE)
+                        .putLong(0, pushDevice.deviceAddress)
+                        .putLong(8, terrain.tableAddress())
+                        .putLong(16, fe.geomTableAddr())
+                        .putInt(24, (int) frameCounter);
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world trace");
+                     RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.trace")) {
+                    if (active == null) {
+                        System.err.println("[Caustica RT] ALARM: active pipeline is null in recordFrame");
+                    } else if (renderW <= 0 || renderH <= 0) {
+                        System.err.println("[Caustica RT] ALARM: trace dispatched with zero size " + renderW + "x" + renderH);
+                    }
+                    active.trace(cmd, renderW, renderH, pushAddr);
+                    if (dbgCount <= 5 || dbgCount % 60 == 0) {
+                        System.err.println("[Caustica RT] trace dispatched #" + dbgCount + " size=" + renderW + "x" + renderH
+                                + " instances=" + fe.instances().size());
+                    }
+                }
+                VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to denoise + upscaler reads
+            } else if (dbgCount <= 5 || dbgCount % 60 == 0) {
+                System.err.println("[Caustica RT] skip trace: zero TLAS instances (waiting for terrain residency)");
             }
 
-            ByteBuffer pushAddr = stack.malloc(WORLD_PUSH_CONST_SIZE)
-                    .putLong(0, pushBuf.deviceAddress)
-                    .putLong(8, terrain.tableAddress())
-                    .putLong(16, fe.geomTableAddr())
-                    .putInt(24, (int) frameCounter);
-            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world trace");
-                 RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.trace")) {
-                if (active == null) {
-                    System.err.println("[Caustica RT] ALARM: active pipeline is null in recordFrame");
-                } else if (renderW <= 0 || renderH <= 0) {
-                    System.err.println("[Caustica RT] ALARM: trace dispatched with zero size " + renderW + "x" + renderH);
+            // Firefly-kill pre-pass (always, before any denoise). The shader only replaces the centre when
+            // it is a >4× outlier vs EVERY neighbour — isolated SPP=1 spikes die; real emissives that
+            // light 2+ neighbour texels pass through. Without this, NRD-only gets raw single-sample
+            // HDR spikes and REBLUR leaves them as white grit on snow/grass (the screenshot case).
+            RtImage beautyForDenoise = output;
+            if (fireflyKilled != null && output != null && fireflyKill.isReady()) {
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "firefly kill");
+                     RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.firefly")) {
+                    fireflyKill.dispatch(cmd.address(), ctx, output, fireflyKilled);
                 }
-                active.trace(cmd, renderW, renderH, pushAddr);
-                if (dbgCount <= 5 || dbgCount % 60 == 0) {
-                    System.err.println("[Caustica RT] trace dispatched #" + dbgCount + " size=" + renderW + "x" + renderH);
-                }
+                VulkanCommandEncoder.memoryBarrier(cmd, stack);
+                beautyForDenoise = fireflyKilled;
             }
-            VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to denoise + upscaler reads
-
-            // Firefly-kill pass: disabled by default (v0.6 revert). The 3x3 median outlier rejection
-            // was correctly killing *isolated* bright pixels (real SPP=1 fireflies) but it ALSO
-            // killed legitimate light-source contributions in enclosed rooms: a single bright
-            // pixel from a sea-lantern NEE hit is statistically indistinguishable from a firefly
-            // (centre > 4x all 8 neighbours) so the pass clobbered the light contribution, and
-            // the rest of the room (which depends on that contribution for GI propagation) went
-            // dark. Disabled by default -- can be re-enabled via a future `firefly_kill.enabled`
-            // config flag once the discrimination heuristic improves (likely needs a depth/normal
-            // guard around the median). Per-denoiser backends (e.g. AmdFidelityFxDenoiseBackend)
-            // can opt in to running firefly_kill as their pre-pass step inside dispatch().
-            //
-            // (Kept the dispatch point + image allocation + pipeline alive in case the future
-            // flag lands; just not invoked here.)
-            //if (fireflyKilled != null && output != null && fireflyKill.isReady()) {
-            //    try (...) { fireflyKill.dispatch(cmd.address(), ctx, output, fireflyKilled); }
-            //    VulkanCommandEncoder.memoryBarrier(cmd, stack);
-            //}
 
             // --- Playable stack: Official FFX (shadow+reflection) THEN beauty TAA ---
             // Order matters: denoise cleans noisy shadow/spec layers; TAA stabilizes residual GI/sky.
             lastDenoiseOn = false;
             lastDenoisePath = "off";
-            RtImage beautyAfterDenoise = output;
+            RtImage beautyAfterDenoise = beautyForDenoise;
             int beautyAfterDenoiseFormat = RtContext.HDR_RADIANCE_FORMAT;
             CausticaDenoiseBackend backend = null;
             if (playablePath && caustica$denoiseEnabled() && denoisedColor != null) {
@@ -1813,7 +1881,7 @@ public final class RtComposite {
                                 ? plateBridge.denoiseOutputColor()
                                 : denoisedColor;
                         boolean denoiseSucceeded = backend.dispatch(stack, cmd,
-                                plateBridge.adaptToDenoise(cmd, output), gNormal, gDepth, gMotion,
+                                plateBridge.adaptToDenoise(cmd, beautyForDenoise), gNormal, gDepth, gMotion,
                                 1.0f / Math.max(1, renderW), 1.0f / Math.max(1, renderH),
                                 denoiseTarget);
 
@@ -1826,7 +1894,7 @@ public final class RtComposite {
                             beautyAfterDenoise = plateBridge.finalizeDenoise(cmd, denoiseTarget);
                             beautyAfterDenoiseFormat = plateProfile.denoiseOutputFormat;
                         } else {
-                            beautyAfterDenoise = output;
+                            beautyAfterDenoise = beautyForDenoise;
                             beautyAfterDenoiseFormat = RtContext.HDR_RADIANCE_FORMAT;
                         }
                         lastDenoisePath = backend.name();
@@ -1859,11 +1927,11 @@ public final class RtComposite {
                             }
                         }
                     } catch (Throwable t) {
-                        CausticaMod.LOGGER.warn("Denoise backend '{}' threw; raw beauty this frame", backend.name(), t);
+                        CausticaMod.LOGGER.warn("Denoise backend '{}' threw; firefly-killed beauty this frame", backend.name(), t);
                         try { DenoiseBackendSelector.invalidate(); } catch (Throwable t2) { }
                         lastDenoiseOn = false;
                         lastDenoisePath = "off";
-                        beautyAfterDenoise = output;
+                        beautyAfterDenoise = beautyForDenoise;
                         beautyAfterDenoiseFormat = RtContext.HDR_RADIANCE_FORMAT;
                         // Clear reactive guides so FSR2 doesn't reuse the last
                         // healthy frame's NRD outputs against this frame's raw beauty.
@@ -1915,7 +1983,14 @@ public final class RtComposite {
             }
 
             int upscalerQuality = activeUpscalerQuality(activeUpscaler);
-            if (temporalUpscale && activeUpscaler.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH,
+            // NRD/FFX already own temporal history on the beauty plate. Stacking TAAU's second
+            // temporal accumulator on top (with its own de-jitter + variance clip) makes static
+            // terrain twinkle/flash — the screenshot "grass/snow flicker" case. Only run a temporal
+            // upscaler after denoise when we still need spatial scale-up (render < display).
+            boolean needSpatialUpscale = renderW < displayW - 1 || renderH < displayH - 1;
+            boolean runTemporalUpscaler = temporalUpscale
+                    && (!denoiseWillRun || needSpatialUpscale);
+            if (runTemporalUpscaler && activeUpscaler.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH,
                     upscalerQuality, 0)) {
                 // FSR2/XeSS: upscale the *denoised* plate (Radiance denoise → temporal upscale).
                 // Denoising does not undo the primary-ray sample position: depth, motion and
@@ -1929,9 +2004,15 @@ public final class RtComposite {
                 // reads from (x + jitterX).  This is the OPPOSITE effect of camera jitter, so the
                 // camera-equivalent jitter for all temporal upscalers is (-jitterX, -jitterY).
                 // TAAU is the exception: its shader knows the raw ray offset in render pixels.
+                //
+                // After NRD, the plate is already temporally resolved; feeding the raw ray jitter
+                // into TAAU's currentUV = dstUV - jitter re-introduces sub-pixel swim. Zero it.
                 float fsrJx;
                 float fsrJy;
-                if (activeUpscaler.expectsRawRenderJitter()) {
+                if (denoiseWillRun) {
+                    fsrJx = 0.0f;
+                    fsrJy = 0.0f;
+                } else if (activeUpscaler.expectsRawRenderJitter()) {
                     fsrJx = jitterX;
                     fsrJy = jitterY;
                 } else {
@@ -1953,8 +2034,10 @@ public final class RtComposite {
                             "Upscaler output validation failed — falling back to 1:1 blit until the provider recovers");
                 }
             }
-            lastUpscalerPath = temporalUpscale && rrDone;
-            lastUpscalerOk = !temporalUpscale || rrDone;
+            // Use the actual decision (runTemporalUpscaler), not mere capability (temporalUpscale).
+            // After NRD at native res we intentionally skip TAAU — report that as blit, not "ran".
+            lastUpscalerPath = runTemporalUpscaler && rrDone;
+            lastUpscalerOk = !runTemporalUpscaler || rrDone;
             lastUpscalerRc = lastUpscalerOk ? 0 : -1;
 
             if (!rrDone) {
@@ -1965,6 +2048,32 @@ public final class RtComposite {
                 }
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // rrOutput visible to exposure histogram
+
+            // Real-time pipeline flow capture (not code inference): log what actually ran this frame.
+            // Every 60 frames after the first few — answers "did firefly/NRD/TAAU execute?" from live state.
+            if (dbgCount <= 8 || dbgCount % 60 == 0) {
+                String plateName = temporalAccumRan ? "temporalAccum"
+                        : (beautyAfterDenoise == beautyForDenoise
+                        ? (beautyForDenoise != output ? "fireflyKilled" : "rawOutput")
+                        : "denoiseOut");
+                System.err.println("[Caustica PIPE] #" + dbgCount
+                        + " spp=" + spp()
+                        + " bounces=" + maxBounces()
+                        + " render=" + renderW + "x" + renderH
+                        + " display=" + displayW + "x" + displayH
+                        + " firefly=" + (beautyForDenoise != output)
+                        + " denoiseOn=" + lastDenoiseOn
+                        + " denoisePath=" + lastDenoisePath
+                        + " nrdPrep=" + lastNrdPrepareOk
+                        + " nrdDisp=" + lastNrdDispatchOk
+                        + " nrdComp=" + lastNrdComposeOk
+                        + " plate=" + plateName
+                        + " needSpatialUp=" + needSpatialUpscale
+                        + " runTaaU=" + runTemporalUpscaler
+                        + " taaUdone=" + rrDone
+                        + " upscalerPath=" + lastUpscalerPath
+                        + " instances=" + (hasTraceGeometry ? fe.instances().size() : 0));
+            }
 
             // Optional renderer CAS polish after upscale. Providers that already apply their
             // configured sharpening advertise that capability so the compositor does not double-filter.
@@ -2341,13 +2450,21 @@ public final class RtComposite {
         }
         bindlessTextureCapacity = 0;
         materialBindingsReady = false;
-        if (pushRing != null) {
-            for (RtBuffer b : pushRing) {
+        if (pushHostRing != null) {
+            for (RtBuffer b : pushHostRing) {
                 if (b != null) {
                     b.destroy();
                 }
             }
-            pushRing = null;
+            pushHostRing = null;
+        }
+        if (pushDeviceRing != null) {
+            for (RtBuffer b : pushDeviceRing) {
+                if (b != null) {
+                    b.destroy();
+                }
+            }
+            pushDeviceRing = null;
         }
         if (atlasSampler != 0L) {
             RtContext ctx = RtContext.currentOrNull();

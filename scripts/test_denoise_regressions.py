@@ -100,6 +100,22 @@ def test_ffx_p0_official_alignment_assets() -> None:
     assert "return false;" not in method_body(backend, "public boolean isReady()")
 
 
+def test_raygen_preserves_official_ffx_unshadowed_direct_guide() -> None:
+    """NRD compose may ignore direct after folding it into gDiffuse, but FFX still needs the guide."""
+    raygen = read("shaders/world/world.rgen")
+    main = method_body(raygen, "void main()")
+    assert "imageStore(gUnshadowedDirect, pix, vec4(max(frameUnshadowedDirect" in main, (
+        "world.rgen must preserve raw unshadowed primary direct for the explicit Official FFX backend"
+    )
+    assert "imageStore(gUnshadowedDirect, pix, vec4(0.0" not in main, (
+        "zeroing gUnshadowedDirect disables Official FFX shadow-delta composition"
+    )
+    compose = method_body(read("shaders/display/denoise_ffx/nrd_compose_beauty.comp"), "void main()")
+    assert "imageLoad(gUnshadowedDirect" not in compose, (
+        "NRD compose must not re-add raw primary direct after it has been folded into gDiffuse"
+    )
+
+
 def test_amd_fidelityfx_preset_skips_nrd_and_pairs_fsr() -> None:
     """REPLACED 2026-07-20 (commit 1): the AMD FidelityFX FFX-only path is dead
     (the 2.x modular loader we bundle has no denoiser effect provider, see
@@ -180,8 +196,8 @@ def test_denoise_rt_composite_owns_dispatch_via_selector() -> None:
     assert "DenoiseBackendSelector.current(" in src, (
         "RtComposite recordFrame must dispatch through DenoiseBackendSelector.current(...)"
     )
-    assert "plateBridge.adaptToDenoise(cmd, output)" in src, (
-        "RtComposite must route raw RT beauty through the shared format bridge before denoise"
+    assert "plateBridge.adaptToDenoise(cmd, beautyForDenoise)" in src, (
+        "RtComposite must route the selected raw/firefly-filtered RT beauty through the shared format bridge before denoise"
     )
     assert "RtImage denoiseTarget = plateBridge.denoiseOutputColor()" in src, (
         "RtComposite must let Hybrid compose directly into the bridge-owned RGBA16F target"
@@ -262,6 +278,53 @@ def test_world_rgen_motion_vector_uses_half_render_pixel_units() -> None:
         "world.rgen writes gMotion as the reprojection delta in half-render-pixel units. Both FFx and NRD "
         "consume the same convention: the denoise shader treats mv * motionVectorScale as the UV delta."
     )
+
+
+def test_nrd_camera_relative_reprojection_uses_previous_origin_shift() -> None:
+    src = read("src/main/java/dev/comfyfluffy/caustica/denoise/HybridFfxNrdBackend.java")
+    body = method_body(src, "public void setCameraFrame(Matrix4fc viewRotation")
+    assert "new Matrix4f(viewRotationPrev)" in body, (
+        "NRD previous world-to-view must start from the previous camera rotation"
+    )
+    assert ".translate(camDeltaX, camDeltaY, camDeltaZ)" in body, (
+        "camera-relative rendering must shift current-frame points into the previous camera origin"
+    )
+    assert body.index("new Matrix4f(viewRotationPrev)") < body.index(
+        ".translate(camDeltaX, camDeltaY, camDeltaZ)"
+    ), "worldToViewPrev must be R_prev * T(cameraDelta), not an unshifted rotation"
+
+
+def test_nrd_native_cache_refreshes_same_size_rebuilds() -> None:
+    src = read("src/main/java/dev/comfyfluffy/caustica/nrd/NrdRuntime.java")
+    resolve = method_body(src, "private static Path resolve")
+    assert "Arrays.equals(Files.readAllBytes(target), bytes)" in resolve, (
+        "NRD extraction must compare content because rebuilt shims can keep the same byte length"
+    )
+    assert "Files.size(target) != bytes.length" not in resolve, (
+        "a size-only cache check can silently keep an old native NRD implementation"
+    )
+
+
+def test_nrd_does_not_double_apply_shared_full_camera_motion_vectors() -> None:
+    src = read("native/nrd/caustica_nrd_shim.cpp")
+    assert "static constexpr float NRD_STATIC_SCENE_MOTION_SCALE = 1.0e-20f;" in src
+    assert src.count(
+        "cs.motionVectorScale[0] = NRD_STATIC_SCENE_MOTION_SCALE;"
+    ) == 2, (
+        "both REBLUR and RELAX must effectively ignore gMotion while it contains full camera motion"
+    )
+    assert src.count(
+        "cs.motionVectorScale[1] = NRD_STATIC_SCENE_MOTION_SCALE;"
+    ) == 2
+    assert src.count("cs.motionVectorScale[2] = 0.0f;") == 2
+    assert "cs.motionVectorScale[0] = 0.0f;" not in src
+    assert "cs.motionVectorScale[1] = 0.0f;" not in src, (
+        "NRD 4.17 rejects exact-zero XY scale for screen-space motion vectors"
+    )
+    assert "cs.motionVectorScale[0] = 1.0f / float(c->width);" not in src, (
+        "screen-space camera motion plus matrix reprojection represents camera translation twice"
+    )
+    assert "cs.motionVectorScale[1] = 1.0f / float(c->height);" not in src
 
 
 def test_world_rgen_motion_vector_projects_same_hit_in_both_frames() -> None:
@@ -1298,6 +1361,19 @@ def test_hybrid_fsr_hdr_rgba16f_seam_and_pq_encode() -> None:
     assert "binding = 0, set = 0, rgba16f" in hist
     assert "binding = 2, rgba16f" in guard
 
+    bilateral = read("src/main/java/dev/comfyfluffy/caustica/denoise/BilateralDenoiseBackend.java")
+    residual_factory = method_body(bilateral, "public static BilateralDenoiseBackend residualAfterNrd")
+    assert "VK_FORMAT_R16G16B16A16_SFLOAT" in residual_factory
+    assert "bilateral_rgba16f.comp.spv" in residual_factory
+    assert "ctx.createStorageImage(width, height, colorFormat" in bilateral
+    assert "loadModule(ctx.vk(), stack, spatialShaderName)" in bilateral
+
+    hybrid_sizing = method_body(hybrid, "public void ensureSized")
+    assert "residualMid = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT" in hybrid_sizing
+    residual_shader = read("shaders/display/denoise_ffx/bilateral_rgba16f.comp")
+    assert "binding = 0, rgba16f" in residual_shader
+    assert "binding = 3, rgba16f" in residual_shader
+
     pq = read("shaders/display/sdr_present.comp")
     assert "BT709_TO_BT2020" in pq and "pqEncode" in pq
     assert "PQ_M1" in pq and "PQ_M2" in pq and "paperWhiteNits" in pq
@@ -1395,6 +1471,7 @@ if __name__ == "__main__":
     tests = [
         test_denoise_mode_enum_exposes_auto_ffx_nrd_off,
         test_ffx_p0_official_alignment_assets,
+        test_raygen_preserves_official_ffx_unshadowed_direct_guide,
         test_amd_fidelityfx_preset_skips_nrd_and_pairs_fsr,
         test_fsr2_declares_required_storage_format_feature_and_valid_depth_range,
         test_multi_dispatch_passes_do_not_mutate_one_descriptor_set,
@@ -1412,6 +1489,9 @@ if __name__ == "__main__":
         test_auto_denoise_is_independent_of_upscaler_provider,
         test_denoise_legacy_files_deleted,
         test_world_rgen_motion_vector_uses_half_render_pixel_units,
+        test_nrd_camera_relative_reprojection_uses_previous_origin_shift,
+        test_nrd_native_cache_refreshes_same_size_rebuilds,
+        test_nrd_does_not_double_apply_shared_full_camera_motion_vectors,
         test_world_rgen_motion_vector_projects_same_hit_in_both_frames,
         test_raygen_clamps_launch_to_bound_storage_image_extent,
         test_denoise_backends_all_implement_reset_history,

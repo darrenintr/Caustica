@@ -56,8 +56,8 @@ public final class CausticaConfig {
     public static void ensureRegistered() {
         @SuppressWarnings("unused")
         Object[] touch = {
-            Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Composite.MAX_RAY_DISTANCE, Rt.Composite.TEMPORAL_ACCUM, Rt.Composite.TEMPORAL_ALPHA, Rt.Composite.TEMPORAL_DISOCCLUSION, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Omm.ENABLED,
-            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.Denoise.MODE, Rt.Denoise.NRD_MAX_ACCUMULATED_FRAMES,
+            Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Composite.MAX_RAY_DISTANCE, Rt.Composite.TEMPORAL_ACCUM, Rt.Composite.TEMPORAL_ALPHA, Rt.Composite.TEMPORAL_DISOCCLUSION, Rt.Composite.TILE_JITTER, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Omm.ENABLED,
+            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.Denoise.MODE, Rt.Denoise.NRD_MAX_ACCUMULATED_FRAMES, Rt.Denoise.NRD_RESIDUAL_BILATERAL,
             Rt.Gi.ENABLED, Rt.Gi.CANDIDATES, Rt.Gi.MAX_M_TEMPORAL, Rt.Gi.MAX_M_SPATIAL, Rt.Gi.HEMI_SKY_SCALE, Rt.Gi.HEMI_GROUND_SCALE, Rt.Gi.LIGHTFIELD_BLEND,
             Rt.Hybrid.ENABLED, Rt.Hybrid.ROUGH_THRESHOLD, Rt.Hybrid.LIGHTFIELD_THRESHOLD,
             Rt.Exposure.MODE, Rt.FrameStats.ENABLED, Rt.DebugOverlay.ENABLED,
@@ -637,6 +637,12 @@ public final class CausticaConfig {
             // Off = use SPP for every pixel (legacy). On (default) = apply the heuristic above.
             public static final BooleanSetting ADAPTIVE_SPP =
                     bool("caustica.rt.adaptiveSpp", "composite.adaptive-spp", false);
+            // Per-tile stochastic jitter is a traversal-coherence optimization, not a quality feature.
+            // It adds a small spatially quantized sample pattern which the temporal denoiser must undo.
+            // Keep it opt-in so quality-first configurations match the integrated temporal approach used
+            // by modern RT denoisers; enable it only after measuring the performance gain on a target GPU.
+            public static final BooleanSetting TILE_JITTER =
+                    bool("caustica.rt.tileJitter", "composite.tile-jitter", false);
             // Secondary NEE: in addition to the primary directional light, fire one shadow ray at
             // the moon (when above the horizon and not at a too-thin phase) for every direct-light
             // bounce. Default on; cost = +1 shadow ray per primary hit. Trades a single-firefly risk
@@ -894,6 +900,12 @@ public final class CausticaConfig {
             public static final IntSetting NRD_MAX_ACCUMULATED_FRAMES =
                     clampedInt("caustica.rt.denoise.nrdMaxAccumulatedFrames",
                             "denoise.nrd-max-accumulated-frames", 32, 1, 63);
+            // Optional post-NRD spatial polish. NRD already performs temporal and spatial filtering;
+            // leaving this off avoids a second edge-aware pass preserving a quantized residual pattern.
+            // Enable for a strict spatial A/B comparison only.
+            public static final BooleanSetting NRD_RESIDUAL_BILATERAL =
+                    bool("caustica.rt.denoise.nrdResidualBilateral",
+                            "denoise.nrd-residual-bilateral", false);
 
             private Denoise() {
             }

@@ -44,14 +44,26 @@ public final class UpscalerSelector {
             }
             case TAAU -> candidate = TaaUpscaler.tryCreate();
             case FSR2 -> {
-                candidate = dev.comfyfluffy.caustica.fsr.Fsr2ClassicUpscaler.tryCreate();
-                if (candidate != null) {
-                    requestedReason = requested.key() + " → classic FSR2";
-                } else {
-                    LOGGER.warn("Classic FSR2 unavailable; falling back to TAAU");
+                // Mesa RADV + NAVI33: classic FSR2 native dispatch hard-recovers the device on the
+                // first real-geometry frame (fixed SQC GPUVM fault) even with pure device-local RT
+                // inputs and a full barrier before dispatch. TAAU uses the same RT plates via pure
+                // compute and is stable — prefer it until the FSR2 native path is fixed on RADV.
+                if (dev.comfyfluffy.caustica.rt.RtDeviceBringup.isRadv()) {
+                    LOGGER.warn("Classic FSR2 crashes on RADV/NAVI33 (GPUVM on first dispatch); using TAAU instead");
                     candidate = TaaUpscaler.tryCreate();
                     if (candidate != null) {
-                        requestedReason = requested.key() + " → TAAU fallback (no FSR2 native)";
+                        requestedReason = requested.key() + " → TAAU (RADV FSR2 workaround)";
+                    }
+                } else {
+                    candidate = dev.comfyfluffy.caustica.fsr.Fsr2ClassicUpscaler.tryCreate();
+                    if (candidate != null) {
+                        requestedReason = requested.key() + " → classic FSR2";
+                    } else {
+                        LOGGER.warn("Classic FSR2 unavailable; falling back to TAAU");
+                        candidate = TaaUpscaler.tryCreate();
+                        if (candidate != null) {
+                            requestedReason = requested.key() + " → TAAU fallback (no FSR2 native)";
+                        }
                     }
                 }
             }

@@ -124,6 +124,7 @@ public final class RtDeviceBringup {
     private static volatile boolean rtRequested;
     private static volatile SerBackend serBackend = SerBackend.NONE;
     private static volatile boolean positionFetchEnabled; // closest-hit position built-in + BLAS data-access flag
+    private static volatile boolean radvDriver; // Mesa RADV — needs several RT workarounds
     private static volatile boolean rayQueryEnabled; // inline TLAS queries in overlay fragment shaders
     private static volatile boolean ommEnabled; // VK_EXT_opacity_micromap actually enabled on the device
     private static volatile boolean vrsEnabled; // VK_KHR_fragment_shading_rate actually enabled on the device
@@ -169,7 +170,9 @@ public final class RtDeviceBringup {
     }
 
     /** Closest-hit variant selected at device creation. The fallback omits the optional position-fetch
-     * capability, uses base-LOD texture sampling, and keeps geometric normals instead of LabPBR _n. */
+     * capability, uses base-LOD texture sampling, and keeps geometric normals instead of LabPBR _n.
+     * RADV bisect: stub (no BDA) and minimal (section+prim only) both survive thousands of frames, so
+     * restore full closest-hit shading. any-hit/FSR2 remain isolation-gated elsewhere. */
     public static String worldClosestHitShader() {
         return positionFetchEnabled ? "world.rchit.spv" : "world_noposfetch.rchit.spv";
     }
@@ -181,6 +184,11 @@ public final class RtDeviceBringup {
     /** True if hit-triangle position fetch was enabled. */
     public static boolean positionFetchEnabled() {
         return positionFetchEnabled;
+    }
+
+    /** True when the active device is Mesa RADV (driver workarounds apply). */
+    public static boolean isRadv() {
+        return radvDriver;
     }
 
     /** True if inline ray queries were enabled for optional overlay occlusion. */
@@ -473,7 +481,14 @@ public final class RtDeviceBringup {
             features.add(serFeature());
         }
 
-        positionFetchEnabled = supportsPositionFetch(physicalDevice);
+        // RADV (Mesa 26.1 + NAVI33) hard-recovers with a fixed SQC GPUVM READ_INVALID when closest-hit
+        // uses gl_HitTriangleVertexPositionsEXT / ALLOW_DATA_ACCESS on freshly-built BLASes. Keep the
+        // portable no-posfetch shader on radv until that path is proven stable; other vendors keep
+        // position fetch when supported. Also force single-geometry terrain BLASes on radv.
+        String driverInfo = String.valueOf(physicalDevice.driverInfo()).toLowerCase(java.util.Locale.ROOT);
+        String deviceName = String.valueOf(physicalDevice.deviceName()).toLowerCase(java.util.Locale.ROOT);
+        radvDriver = driverInfo.contains("radv") || deviceName.contains("radv");
+        positionFetchEnabled = !radvDriver && supportsPositionFetch(physicalDevice);
         if (positionFetchEnabled) {
             features.add(positionFetchFeature());
         }

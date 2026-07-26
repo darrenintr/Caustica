@@ -350,14 +350,36 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
             RtImage fsrIn = plate.convertToUpscalerInput(cmd, color, inputColorFormat);
 
             // Optional reactive mask (motion+depth+normals+viewZ+disocclMix -> R32F).
-            // The bridge skips when any required image is null and returns false.
-            boolean reactiveRan = plate.computeReactiveMaskIfNeeded(
-                    cmd, motion, depth, normals, guideViewZ, guideDisocclusionMix);
+            // On RADV/NAVI33 the reactive compute + FSR2 v2 path hard-recovers the device on the
+            // first real-geometry frame (fixed SQC GPUVM fault). Skip reactive and use v1 only.
+            boolean reactiveRan = false;
+            if (!dev.comfyfluffy.caustica.rt.RtDeviceBringup.isRadv()) {
+                reactiveRan = plate.computeReactiveMaskIfNeeded(
+                        cmd, motion, depth, normals, guideViewZ, guideDisocclusionMix);
+            }
             RtImage fsrReactive = reactiveRan ? plate.reactiveMask() : null;
 
             // Pre-clear upscaler-output staging so a partial native write cannot leave NaN/black.
             plate.clearUpscalerOutput(cmd);
             RtImage fsrOut = plate.upscalerOutputColor();
+
+            // RADV: full barrier so RT/plate writes are visible before the native FSR2 dispatch
+            // samples color/depth/motion (same graphics queue; no implicit RT→compute sync).
+            if (dev.comfyfluffy.caustica.rt.RtDeviceBringup.isRadv()) {
+                try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
+                    org.lwjgl.vulkan.VkMemoryBarrier.Buffer mem =
+                            org.lwjgl.vulkan.VkMemoryBarrier.calloc(1, stack).sType$Default()
+                                    .srcAccessMask(org.lwjgl.vulkan.VK10.VK_ACCESS_SHADER_WRITE_BIT
+                                            | org.lwjgl.vulkan.VK10.VK_ACCESS_TRANSFER_WRITE_BIT
+                                            | org.lwjgl.vulkan.VK10.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                                    .dstAccessMask(org.lwjgl.vulkan.VK10.VK_ACCESS_SHADER_READ_BIT
+                                            | org.lwjgl.vulkan.VK10.VK_ACCESS_TRANSFER_READ_BIT);
+                    org.lwjgl.vulkan.VK10.vkCmdPipelineBarrier(cmd,
+                            org.lwjgl.vulkan.VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            org.lwjgl.vulkan.VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            0, mem, null, null);
+                }
+            }
 
             // ----- Native FSR2 dispatch (v1 without reactive, v2 with reactive) -----
             // FSR2's reverse-infinite transform derives its scale from min/max(cameraNear, cameraFar);

@@ -28,6 +28,10 @@
 
 #define NRD_ARRAYSIZE(x) (sizeof(x) / sizeof(*(x)))
 static constexpr uint32_t FALLBACK_DESCRIPTOR_VARIANTS = 8;
+// NRD 4.17 validates screen-space motionVectorScale.xy as nonzero. This tiny
+// scale makes the shared full-camera motion guide effectively zero while camera
+// reprojection remains driven by the current/previous matrices.
+static constexpr float NRD_STATIC_SCENE_MOTION_SCALE = 1.0e-20f;
 
 static const VkFormat g_NRDFormatToVkFormat[] = {
     VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT,
@@ -772,11 +776,16 @@ extern "C" int caustica_nrd_dispatch_v2(
     cs.accumulationMode = (reset || frame_index == 0)
         ? nrd::AccumulationMode::CLEAR_AND_RESTART
         : nrd::AccumulationMode::CONTINUE;
-    // 2.5D MV: xy in screen pixels (scale 1/res), z = prevViewZ - currViewZ from rgen using
-    // the same unjittered clip.w as gViewZ / prepare_nrd_inputs (no more unit mismatch).
-    cs.motionVectorScale[0] = 1.0f / float(c->width);
-    cs.motionVectorScale[1] = 1.0f / float(c->height);
-    cs.motionVectorScale[2] = 1.0f;
+    // gMotion is shared with TAAU and already contains full screen-space camera motion.
+    // NRD also receives current/previous camera matrices, including the camera-relative origin
+    // shift in worldToViewPrev. Applying gMotion here would represent camera translation twice
+    // and make REBLUR reject otherwise valid history. Treat the scene as static for NRD until a
+    // separate object-only motion guide is available (moving entities may ghost temporarily).
+    // NRD rejects an exact zero XY scale for screen-space motion, so use a
+    // nonzero value small enough to suppress this guide in practice.
+    cs.motionVectorScale[0] = NRD_STATIC_SCENE_MOTION_SCALE;
+    cs.motionVectorScale[1] = NRD_STATIC_SCENE_MOTION_SCALE;
+    cs.motionVectorScale[2] = 0.0f;
     cs.viewZScale = 1.0f;
     // Standard primary threshold plus an alternate selected by the application mix texture.
     // Primary threshold for opaque geometry; alternate (via mix texture) for water/glass/particles.
@@ -984,9 +993,11 @@ extern "C" int caustica_nrd_dispatch_relax_v2(
     cs.accumulationMode = (reset || frame_index == 0)
         ? nrd::AccumulationMode::CLEAR_AND_RESTART
         : nrd::AccumulationMode::CONTINUE;
-    cs.motionVectorScale[0] = 1.0f / float(c->width);
-    cs.motionVectorScale[1] = 1.0f / float(c->height);
-    cs.motionVectorScale[2] = 1.0f;
+    // Same static-scene convention as REBLUR above: camera motion comes from matrices,
+    // while the shared full-camera gMotion field is reserved for the TAAU path.
+    cs.motionVectorScale[0] = NRD_STATIC_SCENE_MOTION_SCALE;
+    cs.motionVectorScale[1] = NRD_STATIC_SCENE_MOTION_SCALE;
+    cs.motionVectorScale[2] = 0.0f;
     cs.viewZScale = 1.0f;
     cs.disocclusionThreshold = 0.025f;
     cs.disocclusionThresholdAlternate = 0.08f;

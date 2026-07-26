@@ -69,6 +69,10 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
     /** Sundial's empirical "5% of view distance" position-distance tolerance. */
     private final float positionDistanceThreshold;
     private final boolean temporalEnabled;
+    /** Storage-image format used by all bilateral color inputs, outputs, and ping-pong images. */
+    private final int colorFormat;
+    private final String spatialShaderName;
+    private final String temporalShaderName;
 
     private boolean ready;
     private int width;
@@ -108,6 +112,15 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
     public BilateralDenoiseBackend(int passes, float depthSigma, float normalSigma, float colorSigma,
                                    String label, boolean temporalEnabled,
                                    int maxAccumulatedFrames, float positionDistanceThreshold) {
+        this(passes, depthSigma, normalSigma, colorSigma, label, temporalEnabled,
+                maxAccumulatedFrames, positionDistanceThreshold, RtContext.HDR_RADIANCE_FORMAT,
+                "bilateral.comp.spv", "bilateral_temporal.comp.spv");
+    }
+
+    private BilateralDenoiseBackend(int passes, float depthSigma, float normalSigma, float colorSigma,
+                                    String label, boolean temporalEnabled,
+                                    int maxAccumulatedFrames, float positionDistanceThreshold,
+                                    int colorFormat, String spatialShaderName, String temporalShaderName) {
         this.passes = (passes < 1) ? 1 : (passes | 1); // force odd
         this.depthSigma = depthSigma;
         this.normalSigma = normalSigma;
@@ -116,6 +129,9 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
         this.temporalEnabled = temporalEnabled;
         this.maxAccumulatedFrames = Math.max(1, maxAccumulatedFrames);
         this.positionDistanceThreshold = Math.max(1e-4f, positionDistanceThreshold);
+        this.colorFormat = colorFormat;
+        this.spatialShaderName = spatialShaderName;
+        this.temporalShaderName = temporalShaderName;
     }
 
     /** Spatial-only constructor (back-compat: no temporal). */
@@ -126,7 +142,8 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
     /** Mild residual polish after REBLUR (ghost-safe spatial only). */
     public static BilateralDenoiseBackend residualAfterNrd() {
         return new BilateralDenoiseBackend(3, 0.035f, 0.14f, 0.85f, "nrd-residual-bilateral",
-                false, 20, 0.05f);
+                false, 20, 0.05f, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                "bilateral_rgba16f.comp.spv", "bilateral_temporal_rgba16f.comp.spv");
     }
 
     /**
@@ -136,7 +153,8 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
      */
     public static BilateralDenoiseBackend temporalResidualAfterNrd() {
         return new BilateralDenoiseBackend(3, 0.035f, 0.14f, 0.85f, "nrd-residual-bilateral-temporal",
-                true, 20, 0.05f);
+                true, 20, 0.05f, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                "bilateral_rgba16f.comp.spv", "bilateral_temporal_rgba16f.comp.spv");
     }
 
     @Override
@@ -172,11 +190,11 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
             temp.destroy();
             temp = null;
         }
-        temp = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "bilateral temp");
+        temp = ctx.createStorageImage(width, height, colorFormat, "bilateral temp");
         if (temporalEnabled) {
             if (temporalHistory != null) { temporalHistory.destroy(); temporalHistory = null; }
             if (temporalCounter != null) { temporalCounter.destroy(); temporalCounter = null; }
-            temporalHistory = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT,
+            temporalHistory = ctx.createStorageImage(width, height, colorFormat,
                     "bilateral temporal history");
             temporalCounter = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R8_UNORM,
                     "bilateral temporal counter");
@@ -437,7 +455,7 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
             check(VK10.vkCreatePipelineLayout(ctx.vk(), plci, null, p), "vkCreatePipelineLayout(bilateral)");
             layout = p.get(0);
 
-            long module = loadModule(ctx.vk(), stack, "bilateral.comp.spv");
+            long module = loadModule(ctx.vk(), stack, spatialShaderName);
             VkPipelineShaderStageCreateInfo stage = VkPipelineShaderStageCreateInfo.calloc(stack).sType$Default()
                     .stage(VK10.VK_SHADER_STAGE_COMPUTE_BIT).module(module).pName(stack.UTF8("main"));
             VkComputePipelineCreateInfo.Buffer cpci = VkComputePipelineCreateInfo.calloc(1, stack);
@@ -488,7 +506,7 @@ public final class BilateralDenoiseBackend implements CausticaDenoiseBackend {
                     "vkCreatePipelineLayout(bilateral temporal)");
             temporalLayout = p.get(0);
 
-            long module = loadModule(ctx.vk(), stack, "bilateral_temporal.comp.spv");
+            long module = loadModule(ctx.vk(), stack, temporalShaderName);
             VkPipelineShaderStageCreateInfo stage = VkPipelineShaderStageCreateInfo.calloc(stack).sType$Default()
                     .stage(VK10.VK_SHADER_STAGE_COMPUTE_BIT).module(module).pName(stack.UTF8("main"));
             VkComputePipelineCreateInfo.Buffer cpci = VkComputePipelineCreateInfo.calloc(1, stack);

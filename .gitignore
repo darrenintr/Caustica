@@ -10,3 +10,6 @@ out/
 third_party/
 bin/
 __pycache__/
+.claude/
+.firecrawl/
+dist/

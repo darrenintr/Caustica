@@ -243,17 +243,13 @@ const float LIGHTFIELD_BLOCK_WARM = 0.35;   // torch color warmth mix into block
 // Lowered from 4.0 to 3.0 to 2.2 for more aggressive firefly suppression (SPP=1 noise reduction).
 // Material-aware adaptive clamping (v0.5.4): smooth metals get higher threshold (6.0), rough diffuse
 // surfaces get stricter clamp (1.5), emissive-adjacent pixels get even tighter (×0.6).
-const float MAX_HDR_RADIANCE_BASE = 1.2;        // 2026-07-20: was 2.2 — tighten so SPP=2 single-bounce hot pixels (brdf·radiance at grazing reflection on white surfaces) are clipped before they become fireflies
-const float MAX_HDR_RADIANCE_SMOOTH_METAL = 2.5; // was 6.0 — mirror highlight ceiling; preserves visible chrome/gold reflections but no longer lets multi-bounce specular spikes ride into history
-const float MAX_HDR_RADIANCE_ROUGH = 0.8;         // was 1.5 — diffuse + slightly rough: tightest, since rough surfaces are the dominant firefly victim (lava blobs, sand in sunlight, water surfaces)
-const float EMISSIVE_CLAMP_SCALE = 0.4;           // was 0.6 — emissive-adjacent pixels (next to torches/lava/etc.) get the strictest clamp because that's where bounces collect the most energy
-// 2026-07-20: per-bounce radiance clamp + tighter Russian-roulette. Both target the fundamental
-// SPP=2 firefly sources at the path-tracer level rather than asking the denoise pipeline to undo
-// the damage downstream. MAX_BOUNCE_RADIANCE bounds the contribution of one bounce (any one
-// scattering, transmission, sky-, NEE-, or BSDF-event contribution). RR_Q_MIN/MAX tighten the
-// roulette so deeper paths with low throughput get terminated sooner and dominant-throughput
-// paths roll over rather than brightening past plausibility.
-const float MAX_BOUNCE_RADIANCE = 8.0;            // single-bounce contribution cap (was implicit, finite)
+const float MAX_HDR_RADIANCE_BASE = 1.0;        // 2026-07-25: was 1.2 — outdoor snow/grass SPP=1 still sparks through NRD
+const float MAX_HDR_RADIANCE_SMOOTH_METAL = 2.0; // was 2.5 — keep chrome readable, cut multi-bounce specular spikes harder
+const float MAX_HDR_RADIANCE_ROUGH = 0.65;        // was 0.8 — rough diffuse (snow, sand, leaves) is the firefly population
+const float EMISSIVE_CLAMP_SCALE = 0.35;          // was 0.4 — torch/lava-adjacent pixels: strictest
+// Per-bounce radiance clamp + tighter Russian-roulette. Bounds one bounce (NEE/BSDF/sky) so a single
+// lucky sun sample cannot dump 8× energy into the plate before the adaptive HDR clamp runs.
+const float MAX_BOUNCE_RADIANCE = 4.0;            // was 8.0 — outdoor noon NEE fireflies
 const float RR_Q_MIN = 0.05;                     // raise from 0.02 — start terminating borderline throughput earlier
 const float RR_Q_MAX = 0.95;                     // raise from 1.0  — kill dominant-throughput paths occasionally too
 const float SURF_BIAS = 0.005;  // offset secondary-ray origins along the normal (anti-acne)
@@ -2078,14 +2074,24 @@ PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) 
         }
 
         // Emissive surfaces (lava, glowstone, torches, ...) add radiance directly, colored by albedo.
-        // Block lights have no NEE, so emission is gathered by hitting emitters during the walk (counted
-        // at every vertex, no double counting). Small emitters are noisy, but temporal accumulation
-        // converges static views.
+        // Keep only a PRIMARY-visible emitter in the clear plate: that signal is deterministic and must
+        // retain texture detail. A secondary path that happens to hit a small emitter is a high-variance
+        // indirect-light sample; composing it through acc.emission bypasses NRD and produces the colored
+        // pin-prick grain seen around stained-glass/light-shaft scenes. Classify secondary emission by the
+        // lobe that reached it so REBLUR gets the sample instead (BetaRT/Remix likewise denoises indirect
+        // lighting separately rather than adding path-hit emission after the denoiser).
         float emission = payloadEmission();
         if (emission > 0.0) {
-            // Emissive is not modulated by the primary sun shadow mask.
             vec3 emitted = throughput * albedo * emission * EMISSIVE_STRENGTH;
-            acc.emission += emitted;
+            if (bounce == 0) {
+                acc.emission += emitted;
+            } else if (pathIsTransmission) {
+                acc.transmission += emitted;
+            } else if (pathIsSpecular) {
+                acc.specular += emitted;
+            } else {
+                acc.diffuseOther += emitted;
+            }
         }
 
         // NEE: direct light from the dominant celestial body (sun by day, moon by night) — Lambert diffuse
@@ -2364,10 +2370,13 @@ void main() {
     // camera motion. See TILE_JITTER_GUIDE_DESIGN.md for the math.
     ivec2 tilePix = pix >> 3;          // 8x8 tiles
     ivec2 inTile  = pix & ivec2(7);
-    vec2 tileJitter = vec2(
-        (float((tilePix.x * 73856093u ^ tilePix.y * 19349663u ^ pc.frameIndex * 83492791u) & 7u) - 3.5) / 8.0,
-        (float((tilePix.x * 15485863u ^ tilePix.y * 32452843u ^ pc.frameIndex * 49979687u) & 7u) - 3.5) / 8.0
-    ) * (1.0 / 8.0); // ±0.5 sub-pixel in tile-quantized steps
+    vec2 tileJitter = vec2(0.0);
+    if ((pc.flags & 32u) != 0u) {
+        tileJitter = vec2(
+            (float((tilePix.x * 73856093u ^ tilePix.y * 19349663u ^ pc.frameIndex * 83492791u) & 7u) - 3.5) / 8.0,
+            (float((tilePix.x * 15485863u ^ tilePix.y * 32452843u ^ pc.frameIndex * 49979687u) & 7u) - 3.5) / 8.0
+        ) * (1.0 / 8.0); // ±0.5 sub-pixel in tile-quantized steps
+    }
     // Mix per-pixel RR-required jitter with the tile-quantized bucket so adjacent tiles still sample
     // a different sub-pixel position every frame (RR keeps converging); the in-tile quantization
     // only coalesces rays inside a single warp.
@@ -2457,13 +2466,29 @@ void main() {
     frameShadow *= invSpp;
     frameHitDiff *= invSpp;
     frameHitSpec *= invSpp;
-    // Keep SIGMA's shadow signal and REBLUR's diffuse signal independent. The final compose is:
-    //   unshadowedDirect * sigmaShadow + reblur(diffuseOther) + reblur(specular) + clear terms.
-    // This avoids filtering already-shadowed radiance and applying visibility twice.
-    vec3 frameDiffuse = frameDiffuseOther;
-    vec3 frameRadiance = frameUnshadowedDirect * frameShadow + frameDiffuse
-            + frameSpecular + frameTransmission
+    // Fold every noisy diffuse-classified surface signal into the REBLUR diffuse channel:
+    //   * primary sun/moon NEE after visibility,
+    //   * indirect/GI,
+    //   * glass/water/SSS transmission.
+    // Transmission previously stayed in gTransmission and was added raw after NRD, which made colored
+    // glass and light-shaft scenes visibly speckled even while prepare/dispatch/compose all reported ok.
+    vec3 frameDirect = frameUnshadowedDirect * frameShadow;
+    vec3 frameDiffuse = frameDiffuseOther + frameDirect + frameTransmission;
+    vec3 frameRadiance = frameDiffuse
+            + frameSpecular
             + frameClearRadiance + frameEmission;
+
+    // NRD hit-distance must be >0 on surface pixels. Secondary-only hitDist stays 0 for pure
+    // primary-NEE outdoor frames → REBLUR gets normHitDist=0 and effectively does no spatial
+    // blur (looks like "denoiser not running" while dispatch still returns ok). Fall back to
+    // primary ray length (camera-relative hit).
+    float primaryHitT = length(gv_hitCamRel);
+    if (length(gv_normal) > 0.5) {
+        if (frameHitDiff < 1e-3) frameHitDiff = max(primaryHitT, 0.05);
+        if (frameHitSpec < 1e-3 && max(frameSpecular.r, max(frameSpecular.g, frameSpecular.b)) > 1e-4) {
+            frameHitSpec = max(primaryHitT, 0.05);
+        }
+    }
 
     // Hardware (non-linear, reversed-Z) depth for denoise/upscale/frame generation: project the camera-relative
     // primary hit through the forward view-projection and take ndc z/w — exactly the value a rasterizer
@@ -2617,9 +2642,12 @@ void main() {
     frameSpecular = min(frameSpecular, vec3(clampThreshold));
     imageStore(outImage, pix, vec4(frameRadiance, 1.0));
     imageStore(gShadowHit, pix, vec4(clamp(frameShadow, 0.0, 1.0), 0.0, 0.0, 0.0));
-    // rgb = unshadowed primary direct (FFX shadow re-weight); a = primary hitDist for NRD.
+    // rgb = secondary/GI + shadowed primary direct (into REBLUR); a = hitDist for NRD.
     imageStore(gDiffuse, pix, vec4(frameDiffuse, frameHitDiff));
     // rgb = specular; a = specular-path hitDist for NRD.
     imageStore(gReflection, pix, vec4(frameSpecular, frameHitSpec));
+    // Preserve the raw unshadowed primary-direct guide for the explicit Official FFX backend and
+    // debug view 9. The NRD compose shader intentionally ignores this buffer because primary NEE is
+    // already included in gDiffuse; retaining the guide here therefore cannot double-add NRD lighting.
     imageStore(gUnshadowedDirect, pix, vec4(max(frameUnshadowedDirect, vec3(0.0)), 1.0));
 }

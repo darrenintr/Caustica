@@ -55,6 +55,7 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.KHRAccelerationStructure;
 import org.lwjgl.vulkan.VK10;
+import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkMemoryBarrier;
 
 import java.util.ArrayList;
@@ -196,8 +197,13 @@ public final class RtTerrain {
     private static volatile boolean loggedMeshFailure; // first per-block/fluid meshing throw (swallowed below,
                                                        // so it never reaches the worker-task catch — log once)
     private Pending pending; // in-flight async geometry build, or null
-    private RtBuffer sectionTable;
+    /** Host-mapped staging for CPU section-table writes. */
+    private RtBuffer sectionTableHost;
+    /** Pure device-local table hit shaders read via BDA (RADV-safe). */
+    private RtBuffer sectionTableDevice;
     private int sectionTableCapacity;
+    /** True when host table has slots the device table has not yet received. */
+    private boolean sectionTableDirty;
     private int nextSectionSlot;
     private final LongArrayList freeSectionSlots = new LongArrayList();
     private final ArrayList<SectionGeom> sectionSlots = new ArrayList<>();
@@ -267,7 +273,39 @@ public final class RtTerrain {
 
     /** Section table device address: {@code {u64 primAddr, u64 uvAddr, u32 triBase[4]}} per section, indexed by gl_InstanceCustomIndexEXT. */
     public long tableAddress() {
-        return sectionTable.deviceAddress;
+        return sectionTableDevice.deviceAddress;
+    }
+
+    /**
+     * If the host section table was rewritten since the last flush, copy it into pure device-local
+     * VRAM on {@code cmd}. Hit shaders follow this BDA every hit; RADV GPUVM-faults when that BDA
+     * lands in host-visible memory.
+     */
+    public void recordSectionTableUpload(VkCommandBuffer cmd) {
+        if (!sectionTableDirty || sectionTableHost == null || sectionTableDevice == null || sectionTableCapacity <= 0) {
+            return;
+        }
+        long bytes = (long) sectionTableCapacity * SECTION_ENTRY_BYTES;
+        sectionTableHost.flush(0L, bytes);
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            org.lwjgl.vulkan.VkBufferCopy.Buffer region = org.lwjgl.vulkan.VkBufferCopy.calloc(1, stack)
+                    .srcOffset(0L).dstOffset(0L).size(bytes);
+            VK10.vkCmdCopyBuffer(cmd, sectionTableHost.handle, sectionTableDevice.handle, region);
+            org.lwjgl.vulkan.VkBufferMemoryBarrier.Buffer barrier =
+                    org.lwjgl.vulkan.VkBufferMemoryBarrier.calloc(1, stack).sType$Default()
+                            .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                            .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT)
+                            .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                            .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                            .buffer(sectionTableDevice.handle)
+                            .offset(0L)
+                            .size(bytes);
+            VK10.vkCmdPipelineBarrier(cmd,
+                    VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    0, null, barrier, null);
+        }
+        sectionTableDirty = false;
     }
 
     /** Per-tick residency update: window sync + dirty drain (plus the streaming fallback, see {@link #frame}). */
@@ -1055,29 +1093,44 @@ public final class RtTerrain {
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         String label = "terrain section " + sox + "," + soy + "," + soz;
-        // Terrain sections are long-lived and stream only as the residency window changes. Keep their
-        // resources as direct VMA allocations so an eviction returns the allocation to VMA instead of
-        // retaining the peak render-distance working set in the per-frame buffer cache.
-        RtBuffer positions = ctx.createBuffer((long) packed.positions().length * Float.BYTES, asInput, true,
-                label + " positions");
-        RtBuffer indices = ctx.createBuffer((long) packed.indices().length * Integer.BYTES, asInput | storage, true,
-                label + " indices");
-        RtBuffer uvs = ctx.createBuffer((long) packed.uvs().length * Float.BYTES, storage, true,
-                label + " uvs");
-        RtBuffer material = ctx.createBuffer((long) packed.material().length * Float.BYTES, storage, true,
-                label + " material");
-
+        // RADV (Mesa 26.1 + NAVI33) GPUVM-faults when the AS builder follows BDAs into host-visible memory
+        // — both HOST_CACHED GTT and host-visible BAR. Geometry must live in pure device-local VRAM.
+        // Staging copy + TRANSFER -> AS_BUILD barrier is done inside uploadDeviceLocal.
         resolveMaterials(packed.material(), packed.materialSprites());
-        MemoryUtil.memFloatBuffer(positions.mapped, packed.positions().length).put(packed.positions());
-        MemoryUtil.memIntBuffer(indices.mapped, packed.indices().length).put(packed.indices());
-        MemoryUtil.memFloatBuffer(uvs.mapped, packed.uvs().length).put(packed.uvs());
-        MemoryUtil.memFloatBuffer(material.mapped, packed.material().length).put(packed.material());
+        RtBuffer positions = uploadArray(ctx, packed.positions(), asInput, label + " positions");
+        RtBuffer indices = uploadArray(ctx, packed.indices(), asInput | storage, label + " indices");
+        RtBuffer uvs = uploadArray(ctx, packed.uvs(), storage, label + " uvs");
+        RtBuffer material = uploadArray(ctx, packed.material(), storage, label + " material");
 
         // Split BLAS: geom for each non-empty bucket — solid (OPAQUE, any-hit skipped), cutout (alpha test),
         // water (shadow passthrough). Build is deferred — the caller batches all sections into one submission.
         RtAccel.PreparedBlas blas = RtAccel.prepareTerrainBlas(ctx, positions, vertCount, indices, packed.bucketTris(), ommInput,
                 label + " BLAS");
         return new PreparedSection(key, positions, indices, uvs, material, blas, packed.triBase(), sox, soy, soz);
+    }
+
+    /** Upload a float array into a pure device-local buffer via staging. */
+    private static RtBuffer uploadArray(RtContext ctx, float[] data, int usage, String label) {
+        int bytes = data.length * Float.BYTES;
+        java.nio.FloatBuffer host = MemoryUtil.memAllocFloat(data.length);
+        try {
+            host.put(data).flip();
+            return ctx.uploadDeviceLocal(bytes, usage, MemoryUtil.memAddress(host), bytes, label);
+        } finally {
+            MemoryUtil.memFree(host);
+        }
+    }
+
+    /** Upload an int array into a pure device-local buffer via staging. */
+    private static RtBuffer uploadArray(RtContext ctx, int[] data, int usage, String label) {
+        int bytes = data.length * Integer.BYTES;
+        java.nio.IntBuffer host = MemoryUtil.memAllocInt(data.length);
+        try {
+            host.put(data).flip();
+            return ctx.uploadDeviceLocal(bytes, usage, MemoryUtil.memAddress(host), bytes, label);
+        } finally {
+            MemoryUtil.memFree(host);
+        }
     }
 
     /** Patch packed prim records' hasS/hasN lanes via render-thread material ingestion. */
@@ -1602,33 +1655,65 @@ public final class RtTerrain {
         for (PreparedSection ps : prepared) {
             blasBuilds.add(ps.blas());
         }
-        // RADV (Mesa 26.x) lands BLAS input buffers on a HOST_CACHED system-RAM heap (memory type 5
-        // in the boot dump). The host writes via memXxxBuffer.put are made visible to the device by
-        // HOST_COHERENT semantics, but the BLAS build (vkCmdBuildAccelerationStructuresKHR) executes on
-        // the GPU's compute pipe and reads the indices/positions through BDAs. On RDNA 3 the SQC data
-        // path doesn't always see the freshly-written data on the first BLAS read of a batch, and the
-        // BLAS dereferences a stale (or zero-initialised) index, jumping ~4 GiB past the buffer base and
-        // faulting as a GPUVM READ_INVALID in the doorbell region (SQC fault, PERMISSION_FAULTS=3).
-        //
-        // The textbook fix is a HOST -> ACCELERATION_STRUCTURE_BUILD memory barrier: it tells the
-        // command stream to wait for every prior host write (across the persistent mappings VMA keeps
-        // open on the host-cached heap) before the BLAS build reads it. This is the same dependency the
-        // // std140/SSBO upload paths already use for non-RT compute shaders; we just route it to the
-        // // AS pipeline stage explicitly.
+        // Geometry is already pure device-local (uploadDeviceLocal). Log the first batch so a remaining
+        // GPUVM fault can be attributed to a specific section's BDA / memType / triangle counts rather
+        // than the host-visible memory theory that preferredFlags already disproved.
+        if (!loggedFirstBlasBatch) {
+            loggedFirstBlasBatch = true;
+            logBlasBatchGeometry(ctx, prepared);
+        }
+        // Full-memory barrier into the AS-build stage: covers any prior transfer/host writes that may
+        // still be in flight on this queue (uploadDeviceLocal is sync, but TLAS/instance buffers and
+        // entity paths still use host-visible memory). After the build, also make AS_WRITE visible to
+        // later TLAS/trace stages — publish runs immediately and the next frame's TLAS may reference
+        // these BLASes without a same-queue AS_BUILD→RT barrier otherwise.
         ctx.submitSync(cmd -> {
             try (MemoryStack stack = MemoryStack.stackPush()) {
-                VkMemoryBarrier.Buffer mem = VkMemoryBarrier.calloc(1, stack).sType$Default()
-                        .srcAccessMask(VK10.VK_ACCESS_HOST_WRITE_BIT)
-                        .dstAccessMask(KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+                VkMemoryBarrier.Buffer pre = VkMemoryBarrier.calloc(1, stack).sType$Default()
+                        .srcAccessMask(VK10.VK_ACCESS_HOST_WRITE_BIT | VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                        .dstAccessMask(KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                                | VK10.VK_ACCESS_SHADER_READ_BIT);
                 VK10.vkCmdPipelineBarrier(cmd,
-                        VK10.VK_PIPELINE_STAGE_HOST_BIT,
+                        VK10.VK_PIPELINE_STAGE_HOST_BIT | VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
                         KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                        0, mem, null, null);
+                        0, pre, null, null);
             }
             RtAccel.recordBlasBuilds(ctx, cmd, blasBuilds);
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkMemoryBarrier.Buffer post = VkMemoryBarrier.calloc(1, stack).sType$Default()
+                        .srcAccessMask(KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
+                        .dstAccessMask(KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                                | VK10.VK_ACCESS_SHADER_READ_BIT);
+                VK10.vkCmdPipelineBarrier(cmd,
+                        KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                        KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+                                | org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        0, post, null, null);
+            }
         });
         RtAccel.freeBlasScratch(blasBuilds);
         applyBuildChanges(ctx, prepared, removed, rebase, rbx, rby, rbz);
+    }
+
+    private static volatile boolean loggedFirstBlasBatch;
+
+    private static void logBlasBatchGeometry(RtContext ctx, List<PreparedSection> prepared) {
+        CausticaMod.LOGGER.info("[radv-blas] first batch: {} section(s)", prepared.size());
+        int n = Math.min(prepared.size(), 4);
+        for (int i = 0; i < n; i++) {
+            PreparedSection ps = prepared.get(i);
+            RtAccel.PreparedBlas blas = ps.blas();
+            CausticaMod.LOGGER.info(
+                    "[radv-blas] #{} {} verts≈{} tris={} pos=0x{}/mem{} idx=0x{}/mem{} uv=0x{}/mem{} mat=0x{}/mem{} as=0x{}",
+                    i, blas.label(),
+                    (ps.positions().size / (3L * Float.BYTES)),
+                    blas.triangleCount(),
+                    Long.toUnsignedString(ps.positions().deviceAddress, 16), ctx.memoryTypeOf(ps.positions()),
+                    Long.toUnsignedString(ps.indices().deviceAddress, 16), ctx.memoryTypeOf(ps.indices()),
+                    Long.toUnsignedString(ps.uvs().deviceAddress, 16), ctx.memoryTypeOf(ps.uvs()),
+                    Long.toUnsignedString(ps.material().deviceAddress, 16), ctx.memoryTypeOf(ps.material()),
+                    Long.toUnsignedString(blas.accel.deviceAddress, 16));
+        }
     }
 
     /** Swap a completed async build in: retire old table + removed sections, publish the new instances/table. */
@@ -1641,7 +1726,7 @@ public final class RtTerrain {
     }
 
     private boolean shouldRebase(int rbx, int rby, int rbz) {
-        return !ready || sectionTable == null || staticInstances == null
+        return !ready || sectionTableHost == null || sectionTableDevice == null || staticInstances == null
                 || Math.abs(rbx - blockX) > rebaseDistanceBlocks()
                 || Math.abs(rby - blockY) > rebaseDistanceBlocks()
                 || Math.abs(rbz - blockZ) > rebaseDistanceBlocks();
@@ -1693,9 +1778,12 @@ public final class RtTerrain {
         }
 
         if (resident.isEmpty()) {
-            retire(freeAt, sectionTable, List.of());
-            sectionTable = null;
+            retire(freeAt, sectionTableHost, List.of());
+            retire(freeAt, sectionTableDevice, List.of());
+            sectionTableHost = null;
+            sectionTableDevice = null;
             sectionTableCapacity = 0;
+            sectionTableDirty = false;
             nextSectionSlot = 0;
             freeSectionSlots.clear();
             sectionSlots.clear();
@@ -1736,6 +1824,41 @@ public final class RtTerrain {
         }
         staticInstances = staticInstanceList;
         ready = true;
+        // Hit shaders immediately read sectionTableDevice via BDA. Publish host→device before the next
+        // frame's trace can run (RADV faults if the table is still zero/host-stale).
+        flushSectionTableNow(ctx);
+    }
+
+    /** Synchronously copy the host section table into pure device-local VRAM. */
+    private void flushSectionTableNow(RtContext ctx) {
+        if (!sectionTableDirty || sectionTableHost == null || sectionTableDevice == null || sectionTableCapacity <= 0) {
+            return;
+        }
+        long bytes = (long) sectionTableCapacity * SECTION_ENTRY_BYTES;
+        sectionTableHost.flush(0L, bytes);
+        RtBuffer host = sectionTableHost;
+        RtBuffer device = sectionTableDevice;
+        ctx.submitSync(cmd -> {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                org.lwjgl.vulkan.VkBufferCopy.Buffer region = org.lwjgl.vulkan.VkBufferCopy.calloc(1, stack)
+                        .srcOffset(0L).dstOffset(0L).size(bytes);
+                VK10.vkCmdCopyBuffer(cmd, host.handle, device.handle, region);
+                org.lwjgl.vulkan.VkBufferMemoryBarrier.Buffer barrier =
+                        org.lwjgl.vulkan.VkBufferMemoryBarrier.calloc(1, stack).sType$Default()
+                                .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                                .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT)
+                                .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                                .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                                .buffer(device.handle)
+                                .offset(0L)
+                                .size(bytes);
+                VK10.vkCmdPipelineBarrier(cmd,
+                        VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        0, null, barrier, null);
+            }
+        });
+        sectionTableDirty = false;
     }
 
     private int liveSlotCapacity(List<PreparedSection> prepared) {
@@ -1760,39 +1883,62 @@ public final class RtTerrain {
         while (capacity < minCapacity) {
             capacity <<= 1;
         }
-        int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        RtBuffer newTable = ctx.createBuffer((long) capacity * SECTION_ENTRY_BYTES, storage, true,
-                "terrain section table " + capacity + " slots");
-        RtBuffer oldTable = sectionTable;
+        long bytes = (long) capacity * SECTION_ENTRY_BYTES;
+        RtBuffer newHost = ctx.createBuffer(bytes, VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
+                "terrain section table host " + capacity + " slots");
+        // SectionTable is buffer_reference_align=8 in shaders, but Prim/UV BDAs stored inside require the
+        // table base itself to be 16B-aligned so SQC loads of Section.s[i] never split a 16B vector load.
+        RtBuffer newDevice = ctx.createBdaBuffer(bytes,
+                VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT, false,
+                "terrain section table device " + capacity + " slots");
+        RtBuffer oldHost = sectionTableHost;
+        RtBuffer oldDevice = sectionTableDevice;
         int oldCapacity = sectionTableCapacity;
-        sectionTable = newTable;
+        sectionTableHost = newHost;
+        sectionTableDevice = newDevice;
         sectionTableCapacity = capacity;
-        if (oldTable != null && oldCapacity > 0) {
-            MemoryUtil.memCopy(oldTable.mapped, newTable.mapped, (long) oldCapacity * SECTION_ENTRY_BYTES);
+        if (oldHost != null && oldCapacity > 0) {
+            MemoryUtil.memCopy(oldHost.mapped, newHost.mapped, (long) oldCapacity * SECTION_ENTRY_BYTES);
         }
-        if (oldTable != null) {
-            retire(freeAt, oldTable, List.of());
+        sectionTableDirty = true;
+        if (oldHost != null) {
+            retire(freeAt, oldHost, List.of());
+        }
+        if (oldDevice != null) {
+            retire(freeAt, oldDevice, List.of());
         }
     }
 
     /**
-     * Establish a minimal, valid, zero-instance table so the terrain stays traceable (sky/entities only,
-     * {@link #ready} true) through transient no-resident-sections windows (world join, dimension change,
-     * a full residency evict) instead of forcing a null/not-ready gap. Only called once sectionTable is
-     * already null (old one already freed by the caller) — a plain allocation, not a growth/retire swap.
+     * Establish a minimal, valid, zero-instance table so the terrain stays addressable through
+     * transient no-resident-sections windows (world join, dimension change, a full residency evict).
+     * Only called once section tables are already null (old ones already freed by the caller).
+     *
+     * <p>Do <b>not</b> set {@link #ready} here on a never-ready manager: composite used to trace a
+     * full-screen empty TLAS for ~2s before the first section published, and on RADV/NAVI33 that
+     * sequence hard-recovers the device (fault reported later on the terrain upload submit). Ready
+     * flips only after the first non-empty publish in {@link #applyBuildChanges}.
      */
     private void ensureEmptyTableReady(RtContext ctx) {
-        if (sectionTable == null) {
+        if (sectionTableHost == null || sectionTableDevice == null) {
             int capacity = sectionTableInitialCapacity();
-            sectionTable = ctx.createBuffer((long) capacity * SECTION_ENTRY_BYTES,
-                    org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true,
-                    "terrain section table " + capacity + " slots (empty)");
+            long bytes = (long) capacity * SECTION_ENTRY_BYTES;
+            sectionTableHost = ctx.createBuffer(bytes, VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
+                    "terrain section table host " + capacity + " slots (empty)");
+            sectionTableDevice = ctx.createBdaBuffer(bytes,
+                    VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT, false,
+                    "terrain section table device " + capacity + " slots (empty)");
             sectionTableCapacity = capacity;
+            sectionTableDirty = true;
         }
         if (staticInstances == null) {
             staticInstances = staticInstanceList;
         }
-        ready = true;
+        // Keep ready if we were already streaming (transient empty after a full evict); otherwise stay
+        // not-ready until the first section is published so composite doesn't empty-trace.
+        if (ready) {
+            return;
+        }
     }
 
     private int allocateSectionSlot() {
@@ -1838,13 +1984,15 @@ public final class RtTerrain {
         // shader ever reads a terrain section's index buffer for shading; it's only needed for the BLAS
         // build, which reads g.indices directly. Dropping it keeps this record a clean 32-byte / 2-sector
         // fetch on the hottest per-hit load in the frame instead of the old 40-byte stride.
-        long base = sectionTable.mapped + (long) g.slot * SECTION_ENTRY_BYTES;
+        long base = sectionTableHost.mapped + (long) g.slot * SECTION_ENTRY_BYTES;
         MemoryUtil.memPutLong(base, g.material.deviceAddress);
         MemoryUtil.memPutLong(base + 8, g.uvs.deviceAddress);
         MemoryUtil.memPutInt(base + 16, g.triBase[0]);
         MemoryUtil.memPutInt(base + 20, g.triBase[1]);
         MemoryUtil.memPutInt(base + 24, g.triBase[2]);
         MemoryUtil.memPutInt(base + 28, g.triBase[3]);
+        // Host-mapped staging only; device copy happens in recordSectionTableUpload before trace.
+        sectionTableDirty = true;
     }
 
     private static RtAccel.Instance instanceFor(SectionGeom g, int rbx, int rby, int rbz) {
@@ -1920,12 +2068,13 @@ public final class RtTerrain {
         reextract.clear();
         queuedReextract.clear();
         windowValid = false;
-        if (pending == null && resident.isEmpty() && sectionTable == null && deferred.isEmpty()
+        if (pending == null && resident.isEmpty() && sectionTableHost == null && deferred.isEmpty()
                 && removed.isEmpty() && prepared.isEmpty()) {
             empty.clear();
             staticInstances = null;
             published.clear();
             sectionTableCapacity = 0;
+            sectionTableDirty = false;
             nextSectionSlot = 0;
             freeSectionSlots.clear();
             sectionSlots.clear();
@@ -1957,11 +2106,16 @@ public final class RtTerrain {
             d.free().run();
         }
         deferred.clear();
-        if (sectionTable != null) {
-            sectionTable.destroy();
-            sectionTable = null;
+        if (sectionTableHost != null) {
+            sectionTableHost.destroy();
+            sectionTableHost = null;
+        }
+        if (sectionTableDevice != null) {
+            sectionTableDevice.destroy();
+            sectionTableDevice = null;
         }
         sectionTableCapacity = 0;
+        sectionTableDirty = false;
         nextSectionSlot = 0;
         freeSectionSlots.clear();
         sectionSlots.clear();

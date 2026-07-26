@@ -201,6 +201,14 @@ public final class RtContext {
         return accelerationStructureScratchAlignment;
     }
 
+    /**
+     * Minimum device-address alignment for buffers that hit shaders / raygen load via
+     * {@code buffer_reference}. SPIR-V {@code buffer_reference_align = 16} (WorldPush, Prims) and
+     * the stricter AMD SQC path both require the base BDA itself to be 16B-aligned; VMA AUTO
+     * suballocation does not guarantee that without {@code vmaCreateBufferWithAlignment}.
+     */
+    public static final long BDA_REF_ALIGN = 16L;
+
     /** Create a VMA buffer; {@code SHADER_DEVICE_ADDRESS} is always added so it has a device address. */
     public RtBuffer createBuffer(long size, int usage, boolean hostVisible) {
         return createBuffer(size, usage, hostVisible, "buffer " + size + "B");
@@ -216,6 +224,15 @@ public final class RtContext {
         return createBuffer(size, usage, hostVisible, label, addressAlignment);
     }
 
+    /**
+     * Device-local (or host-visible) buffer whose device address is aligned for {@code buffer_reference}
+     * loads ({@link #BDA_REF_ALIGN}). Prefer this over {@link #createBuffer} for any buffer whose BDA is
+     * written into a section/entity table, WorldPush, or push-constant table address.
+     */
+    public RtBuffer createBdaBuffer(long size, int usage, boolean hostVisible, String label) {
+        return createAlignedBuffer(size, usage, hostVisible, label, BDA_REF_ALIGN);
+    }
+
     private RtBuffer createBuffer(long size, int usage, boolean hostVisible, String label, long addressAlignment) {
         if (addressAlignment < 0L
                 || (addressAlignment != 0L && (addressAlignment & (addressAlignment - 1L)) != 0L)) {
@@ -228,7 +245,10 @@ public final class RtContext {
                     .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE);
             VmaAllocationCreateInfo aci = VmaAllocationCreateInfo.calloc(stack).usage(Vma.VMA_MEMORY_USAGE_AUTO);
             if (hostVisible) {
-                aci.flags(Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT);
+                // Sequential-write + mapped is the common path for one-shot staging uploads. AS build-input
+                // geometry is intentionally NOT left host-visible on RADV — see {@link #uploadDeviceLocal}.
+                aci.flags(Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+                        | Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT);
             }
             LongBuffer pBuf = stack.mallocLong(1);
             PointerBuffer pAlloc = stack.mallocPointer(1);
@@ -250,6 +270,95 @@ public final class RtContext {
             }
             return new RtBuffer(vma, handle, pAlloc.get(0), address, hostVisible ? info.pMappedData() : 0L,
                     size, usage, hostVisible, label);
+        }
+    }
+
+    /**
+     * Create a pure device-local buffer and fill it from a host pointer via a one-shot staging copy.
+     * Used for acceleration-structure geometry inputs on RADV: the AS builder GPUVM-faults while following
+     * BDAs into host-visible memory (HOST_CACHED GTT <em>and</em> BAR) on Mesa 26.1 + NAVI33, so geometry
+     * must live in non-host-visible VRAM before {@code vkCmdBuildAccelerationStructuresKHR}.
+     */
+    public RtBuffer uploadDeviceLocal(long size, int usage, long hostPtr, int hostBytes, String label) {
+        // Default to buffer_reference-safe alignment: terrain prim/uv/pos and SBT consumers all load via BDA.
+        return uploadDeviceLocal(size, usage, hostPtr, hostBytes, label, BDA_REF_ALIGN);
+    }
+
+    public RtBuffer uploadDeviceLocal(long size, int usage, long hostPtr, int hostBytes, String label,
+                                      long addressAlignment) {
+        if (hostBytes < 0 || (long) hostBytes > size) {
+            throw new IllegalArgumentException(label + " host payload " + hostBytes + "B exceeds buffer " + size + "B");
+        }
+        if (hostBytes > 0 && hostPtr == 0L) {
+            throw new IllegalArgumentException(label + " host pointer is null");
+        }
+        int deviceUsage = usage | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        // addressAlignment <= 0 falls back to BDA_REF_ALIGN so accidental 0 never reintroduces unaligned BDAs.
+        long align = addressAlignment > 0L ? addressAlignment : BDA_REF_ALIGN;
+        RtBuffer device = createAlignedBuffer(size, deviceUsage, false, label, align);
+        if (hostBytes == 0) {
+            return device;
+        }
+        RtBuffer staging = createBuffer(hostBytes, VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, label + " staging");
+        try {
+            org.lwjgl.system.MemoryUtil.memCopy(hostPtr, staging.mapped, hostBytes);
+            staging.flush();
+            submitSync(cmd -> {
+                try (MemoryStack stack = MemoryStack.stackPush()) {
+                    org.lwjgl.vulkan.VkBufferCopy.Buffer region = org.lwjgl.vulkan.VkBufferCopy.calloc(1, stack)
+                            .srcOffset(0L).dstOffset(0L).size(hostBytes);
+                    VK10.vkCmdCopyBuffer(cmd, staging.handle, device.handle, region);
+                    // Make the transfer write visible to AS builds and shader / SBT reads of this BDA.
+                    org.lwjgl.vulkan.VkBufferMemoryBarrier.Buffer barrier =
+                            org.lwjgl.vulkan.VkBufferMemoryBarrier.calloc(1, stack).sType$Default()
+                                    .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                                    .dstAccessMask(org.lwjgl.vulkan.KHRAccelerationStructure
+                                            .VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                                            | VK10.VK_ACCESS_SHADER_READ_BIT
+                                            | VK10.VK_ACCESS_TRANSFER_READ_BIT)
+                                    .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                                    .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                                    .buffer(device.handle)
+                                    .offset(0L)
+                                    .size(hostBytes);
+                    VK10.vkCmdPipelineBarrier(cmd,
+                            VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            org.lwjgl.vulkan.KHRAccelerationStructure
+                                    .VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+                                    | org.lwjgl.vulkan.KHRRayTracingPipeline
+                                    .VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                            0, null, barrier, null);
+                }
+            });
+        } finally {
+            staging.destroy();
+        }
+        return device;
+    }
+
+    /** VMA memory type index of an allocation (for RADV diagnostics). */
+    public int memoryTypeOf(RtBuffer buffer) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VmaAllocationInfo info = VmaAllocationInfo.calloc(stack);
+            Vma.vmaGetAllocationInfo(vma, buffer.allocation, info);
+            return info.memoryType();
+        }
+    }
+
+    /**
+     * Make prior host writes (persistent-mapped buffers, SBT, TLAS instances, section table) visible
+     * to a later GPU stage. RADV does not always insert this for HOST_COHERENT memory on the RT pipe.
+     */
+    public static void hostWriteBarrier(org.lwjgl.vulkan.VkCommandBuffer cmd, int dstStageMask, int dstAccessMask) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            org.lwjgl.vulkan.VkMemoryBarrier.Buffer mem = org.lwjgl.vulkan.VkMemoryBarrier.calloc(1, stack)
+                    .sType$Default()
+                    .srcAccessMask(VK10.VK_ACCESS_HOST_WRITE_BIT)
+                    .dstAccessMask(dstAccessMask);
+            VK10.vkCmdPipelineBarrier(cmd,
+                    VK10.VK_PIPELINE_STAGE_HOST_BIT,
+                    dstStageMask,
+                    0, mem, null, null);
         }
     }
 
