@@ -64,52 +64,92 @@ jobs:
 
       # Install a minimal Vulkan SDK on Windows so :compileShaders can call
       # glslangValidator + spirv-val. The Linux side pulls a SDK tarball from LunarG; on
-      # Windows the only reliable source of those binaries is the SDK installer — but
-      # pulling the 162MB installer and running /S silently has proven to be flaky and
-      # slow in the CI env. Faster path: clone the upstream repos and cmake-build just
-      # the executables we need (`glslangValidator`, `spirv-val`). Both are small and
-      # build in well under a minute on the windows-2022 runner.
-      - name: Install minimal Vulkan SDK (glslangValidator + spirv-val from source)
+      # Windows the same approach using `/S` to silently run the Inno-Setup-based
+      # installer hangs in the CI env (Start-Process -Wait blocks on the inner
+      # elevation dialog). Workaround: drive the Inno Setup "extract to directory"
+      # command-line so we never actually launch the GUI installer. The installer
+      # exposes `/extract:<dir>` which lays the included MSI / cab / iss files on disk
+      # without writing to Program Files, and then we can pull Bin\glslangValidator.exe
+      # + Bin\spirv-val.exe out of the unpacked payload directly.
+      - name: Install LunarG Vulkan SDK via Inno-Setup /extract (no installer run)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $buildRoot = Join-Path $env:RUNNER_TEMP 'caustica-shader-tools'
-          if (Test-Path $buildRoot) { Remove-Item -Recurse -Force $buildRoot }
-          New-Item -ItemType Directory -Path $buildRoot | Out-Null
+          $version = '1.3.290.0'
+          $work    = Join-Path $env:RUNNER_TEMP "caustica-vulkan-sdk-$version"
+          if (Test-Path $work) { Remove-Item -Recurse -Force $work }
+          New-Item -ItemType Directory -Path $work | Out-Null
+          $installer = Join-Path $work "VulkanSDK-$version-Installer.exe"
+          $unpacked  = Join-Path $work 'unpacked'
 
-          Write-Host "Cloning glslang @ vulkan-sdk-1.3.290.0 (pinned)..."
-          git clone --depth 1 --branch vulkan-sdk-1.3.290.0 https://github.com/KhronosGroup/glslang.git (Join-Path $buildRoot 'glslang') 2>&1 | Select-Object -Last 3
-          Write-Host "Cloning SPIRV-Tools @ v2025.5 ..."
-          git clone --depth 1 --branch v2025.5 https://github.com/KhronosGroup/SPIRV-Tools.git (Join-Path $buildRoot 'SPIRV-Tools') 2>&1 | Select-Object -Last 3
-          Write-Host "Cloning SPIRV-Headers (dep)..."
-          git clone --depth 1 --branch vulkan-sdk-1.3.290.0 https://github.com/KhronosGroup/SPIRV-Headers.git (Join-Path $buildRoot 'glslang\External\spirv-tools') 2>&1 | Select-Object -Last 3
+          Write-Host "Downloading LunarG Vulkan SDK $version installer ..."
+          Invoke-WebRequest -UseBasicParsing -OutFile $installer `
+              "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
+          $size = (Get-Item $installer).Length
+          if ($size -lt 10MB) { throw "installer looks too small ($size bytes)" }
+          Write-Host "  ok ($size bytes)"
 
-          Write-Host "Configuring SPIRV-Tools ..."
-          $spirvBuild = Join-Path $buildRoot 'SPIRV-Tools-build'
-          cmake -S (Join-Path $buildRoot 'SPIRV-Tools') -B $spirvBuild -G Ninja `
-                -DCMAKE_BUILD_TYPE=Release -DSPIRV_WERROR=OFF -DSPIRV_SKIP_TESTS=ON 2>&1 | Select-Object -Last 5
-          Write-Host "Building SPIRV-Tools (spirv-val only) ..."
-          cmake --build $spirvBuild --target spirv-val --config Release 2>&1 | Select-Object -Last 5
+          Write-Host "Running Inno Setup /extract into $unpacked ..."
+          $proc = Start-Process -FilePath $installer -ArgumentList "/extract:`"$unpacked`"" -PassThru -Wait -NoNewWindow
+          if ($proc.ExitCode -ne 0) { throw "inno /extract exited $($proc.ExitCode)" }
 
-          Write-Host "Configuring glslang (bundled SPIRV-Tools via External/spirv-tools) ..."
-          $glslangBuild = Join-Path $buildRoot 'glslang-build'
-          cmake -S (Join-Path $buildRoot 'glslang') -B $glslangBuild -G Ninja `
-                -DCMAKE_BUILD_TYPE=Release -DGLSLANG_TESTS=OFF -DENABLE_OPT=OFF -DENABLE_HLSL=OFF `
-                -DENABLE_GLSLANG_BINARIES=ON 2>&1 | Select-Object -Last 5
-          Write-Host "Building glslang standalone ..."
-          cmake --build $glslangBuild --target glslang --config Release 2>&1 | Select-Object -Last 5
-          Write-Host "Listing glslang targets ..."
-          cmake --build $glslangBuild --target help 2>&1 | Select-String 'glslang' | Select-Object -First 5
+          $payload = Get-ChildItem -Path $unpacked -Recurse -Include '*.msi','*.exe','*.7z','*.zip' |
+              Where-Object { $_.Name -notmatch 'Installer\.exe$' }
+          Write-Host "Payload candidates: $($payload.Count)"
 
+          # Find a Bin/glslangValidator.exe inside the extracted payload. The installer
+          # extracts itself as an Inno-Setup folder of MSIs; we msiexec /a the top one
+          # to a temp dir (admin install — extracts without committing to Program Files
+          # or running its own services).
+          $binDir = $null
+          foreach ($c in $payload) {
+              $probe = Join-Path $work 'probe'
+              if (Test-Path $probe) { Remove-Item -Recurse -Force $probe }
+              New-Item -ItemType Directory -Path $probe | Out-Null
+              switch ($c.Extension.ToLower()) {
+                  '.msi' {
+                      $p = Start-Process -FilePath 'msiexec.exe' `
+                          -ArgumentList "/a `"$($c.FullName)`" /qn TARGETDIR=`"$probe`"" `
+                          -PassThru -Wait -NoNewWindow
+                      if ($p.ExitCode -ne 0) { continue }
+                  }
+                  '.7z' {
+                      $sz = 'C:\Program Files\7-Zip\7z.exe'
+                      if (Test-Path $sz) { & $sz x $c.FullName "-o$probe" -y | Out-Null }
+                  }
+                  '.zip' {
+                      Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+                      try { [System.IO.Compression.ZipFile]::ExtractToDirectory($c.FullName, $probe) }
+                      catch { continue }
+                  }
+                  '.exe' {
+                      # try the same /extract trick on the inner exe
+                      $p = Start-Process -FilePath $c.FullName -ArgumentList "/extract:`"$probe`"" `
+                          -PassThru -Wait -NoNewWindow
+                      if ($p.ExitCode -ne 0) { continue }
+                  }
+              }
+              $hit = Get-ChildItem -Path $probe -Recurse -Filter 'glslangValidator.exe' -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+              if ($hit) { $binDir = $hit.DirectoryName; break }
+          }
+
+          if (-not $binDir) {
+              Get-ChildItem -Path $unpacked -Recurse | Select-Object FullName,Length | Format-Table -AutoSize | Out-String | Write-Host
+              throw "glslangValidator.exe not found in any extracted payload"
+          }
+
+          Write-Host "Bin directory located: $binDir"
           $vulkanBin = Join-Path $env:VULKAN_SDK 'Bin'
           if (-not (Test-Path $vulkanBin)) { New-Item -ItemType Directory -Path $vulkanBin | Out-Null }
-          Copy-Item (Join-Path $spirvBuild 'tools\spirv-val.exe')         (Join-Path $vulkanBin 'spirv-val.exe')         -Force
-          Copy-Item (Join-Path $glslangBuild 'StandAlone\glslangValidator.exe') (Join-Path $vulkanBin 'glslangValidator.exe') -Force
-          Copy-Item (Join-Path $glslangBuild 'StandAlone\glslang.exe')          (Join-Path $vulkanBin 'glslang.exe')          -Force
+          foreach ($exe in 'glslangValidator.exe','glslang.exe','spirv-val.exe','spirv-opt.exe','spirv-dis.exe') {
+              $src = Join-Path $binDir $exe
+              if (Test-Path $src) { Copy-Item $src (Join-Path $vulkanBin $exe) -Force }
+          }
 
           foreach ($exe in 'glslangValidator.exe','spirv-val.exe') {
               $path = Join-Path $vulkanBin $exe
-              if (-not (Test-Path $path)) { throw "$exe missing at $path after build" }
+              if (-not (Test-Path $path)) { throw "$exe missing at $path" }
               & $path --version | Select-Object -First 1 | Write-Host
           }
 
