@@ -31,3 +31,19 @@ build-simple.bat
 build-windows.bat
 build-windows-natives.bat
 install-vulkan-helper.bat
+
+# Secrets / credentials — never commit tokens or private keys
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+*github_pat*
+*ghp_*
+*gho_*
+*ghs_*
+*ghu_*
+*ghr_*
+.env
+.env.*
+secrets/
