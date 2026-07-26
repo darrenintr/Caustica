@@ -36,14 +36,28 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Install Vulkan shader and native-build tools
+        env:
+          # Pinned matching build-nrd.yml / build-linux-x64.yml — Ubuntu's apt
+          # glslang-tools is too old for `GL_EXT_shader_invocation_reorder` in
+          # shaders/world/world.rgen.
+          VULKAN_SDK_VERSION: 1.4.350.0
+          VULKAN_SDK_SHA256: b65f068ab36263559da49d7cacd7e7b9df23824ca8b68ccc522a2b06f5725df2
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            glslang-tools spirv-tools \
             cmake ninja-build clang \
             libvulkan-dev
-          glslangValidator --version
-          spirv-val --version
+          archive="vulkansdk-linux-x86_64-${VULKAN_SDK_VERSION}.tar.xz"
+          url="https://sdk.lunarg.com/sdk/download/${VULKAN_SDK_VERSION}/linux/${archive}"
+          sdk_root="${RUNNER_TEMP}/vulkan-sdk/${VULKAN_SDK_VERSION}/x86_64"
+          curl --fail --location --retry 3 --output "${archive}" "${url}"
+          echo "${VULKAN_SDK_SHA256}  ${archive}" | sha256sum --check
+          mkdir -p "${RUNNER_TEMP}/vulkan-sdk"
+          tar -xf "${archive}" -C "${RUNNER_TEMP}/vulkan-sdk"
+          echo "VULKAN_SDK=${sdk_root}" >> "${GITHUB_ENV}"
+          echo "${sdk_root}/bin" >> "${GITHUB_PATH}"
+          "${sdk_root}/bin/glslangValidator" --version
+          "${sdk_root}/bin/spirv-val" --version
 
       - name: Build
         run: bash ./gradlew --no-daemon build

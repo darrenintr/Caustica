@@ -94,11 +94,13 @@ jobs:
           # Required Linux natives — see NrdRuntime / ffx_* shims. Missing any one of these
           # on the launched JAR is the failure mode a player hits at first tryUse(): the
           # loader falls back to "RT disabled" instead of the renderer.
+          # Note: libcaustica_native.so is the *optional* Phase-1 JNI scaffold (built by the
+          # :buildNative task on whichever host has the toolchain). It's intentionally not
+          # in this list — the production renderer is unaffected by its absence.
           expected=(
             caustica/natives/linux-x64/libnrd_caustica.so
             caustica/natives/linux-x64/libffx_denoiser_caustica.so
             caustica/natives/linux-x64/libffx_fsr2_caustica.so
-            caustica/natives/linux-x64/libcaustica_native.so
           )
           missing=()
           for entry in "${expected[@]}"; do

@@ -62,14 +62,40 @@ jobs:
         with:
           arch: x64
 
+      # Vulkan SDK pulled down by the action (Vulkan-Headers + Vulkan-Loader). Adding the
+      # `glslang` / `spirv-tools` components triggers an internal cmake configure error in
+      # this version of humbletim/setup-vulkan-sdk, so install glslangValidator / spirv-val
+      # directly via Chocolatey instead — they're published as a single package that
+      # drops both executables into $VULKAN_SDK/Bin (and onto PATH).
       - name: Setup Vulkan SDK
         uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
           vulkan-query-version: 1.4.350.0
-          # glslang + spirv-tools provide `glslangValidator.exe` / `spirv-val.exe`
-          # which :compileShaders invokes for every world.rgen / *.comp stage.
-          vulkan-components: Vulkan-Headers, Vulkan-Loader, glslang, spirv-tools
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
           vulkan-use-cache: true
+
+      - name: Install glslangValidator + spirv-val via Chocolatey
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Installing glslang (bundles glslangValidator.exe + spirv-val.exe)..."
+          choco install glslang -y --no-progress --source="'https://chocolatey.org/api/v2/'"
+          $vulkanBin = Join-Path $env:VULKAN_SDK 'Bin'
+          if (-not (Test-Path $vulkanBin)) { throw "VULKAN_SDK/Bin missing: $vulkanBin" }
+          $src = 'C:\Program Files\glslang\bin'
+          if (Test-Path $src) {
+              Get-ChildItem -Path $src -Filter '*.exe' | ForEach-Object {
+                  $dest = Join-Path $vulkanBin $_.Name
+                  Copy-Item -Path $_.FullName -Destination $dest -Force
+                  Write-Host "Copied $($_.Name) -> $dest"
+              }
+          }
+          $glslangExe = Join-Path $vulkanBin 'glslangValidator.exe'
+          $spirvExe   = Join-Path $vulkanBin 'spirv-val.exe'
+          if (-not (Test-Path $glslangExe)) { throw "glslangValidator.exe still missing at $glslangExe" }
+          if (-not (Test-Path $spirvExe))   { throw "spirv-val.exe still missing at $spirvExe" }
+          & $glslangExe --version | Select-Object -First 1
+          & $spirvExe --version | Select-Object -First 1
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
