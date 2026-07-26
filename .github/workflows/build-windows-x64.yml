@@ -62,64 +62,45 @@ jobs:
         with:
           arch: x64
 
-      # Vulkan SDK pulled down by the action (Vulkan-Headers + Vulkan-Loader). Adding the
-      # `glslang` / `spirv-tools` components triggers an internal cmake configure error in
-      # this version of humbletim/setup-vulkan-sdk, so install glslangValidator / spirv-val
-      # directly via Chocolatey instead — they're published as a single package that
-      # drops both executables into $VULKAN_SDK/Bin (and onto PATH).
-      - name: Setup Vulkan SDK
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
-        with:
-          vulkan-query-version: 1.4.350.0
-          vulkan-components: Vulkan-Headers, Vulkan-Loader
-          vulkan-use-cache: true
-
-      - name: Install glslangValidator + spirv-val (direct GitHub binaries)
+      # Pull a full Vulkan SDK directly from LunarG (the same vendor as the Linux tarball
+      # downloaded by build-nrd.yml). KhronosGroup/glslang's GitHub releases only ship
+      # Linux / macOS zips, not Windows, and SPIRV-Tools has no Windows artefacts at all;
+      # the only reliable source of `glslangValidator.exe` + `spirv-val.exe` on Windows is
+      # the Vulkan SDK installer. 1.3.290.0 is the latest URL-pattern LunarG keeps
+      # downloadable (1.4.x redirect 404 today). It ships glslang 13.x which already
+      # supports `--target-env vulkan1.2` plus the `GL_EXT_shader_invocation_reorder`
+      # extension Caustica uses in shaders/world/world.rgen.
+      #
+      # Silent install lands at the default C:\VulkanSDK\<version>\ which exports
+      # VULKAN_SDK + adds Bin\ to the env. That's the only SDK we need — no point running
+      # humbletim's partial install on top, so we just unset whatever it would have set
+      # and re-export the path LunarG produces.
+      - name: Install LunarG Vulkan SDK (silent) for glslangValidator + spirv-val
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $vulkanBin = Join-Path $env:VULKAN_SDK 'Bin'
-          if (-not (Test-Path $vulkanBin)) { throw "VULKAN_SDK/Bin missing: $vulkanBin" }
+          $version = '1.3.290.0'
+          $installRoot = Join-Path $env:ProgramFiles 'VulkanSDK'
+          $sdkRoot = Join-Path $installRoot $version
+          $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version-Installer.exe"
+          Write-Host "Downloading LunarG Vulkan SDK $version installer..."
+          Invoke-WebRequest -UseBasicParsing -OutFile $installer `
+              "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
+          if ((Get-Item $installer).Length -lt 10MB) { throw "installer looks too small ($((Get-Item $installer).Length) bytes)" }
 
-          # vcpkg on the Windows 2022 image operates in manifest mode and the
-          # Caustica repo doesn't ship a vcpkg.json, so `vcpkg install <pkg>`
-          # errors out with "Could not locate a manifest". Chocolatey's
-          # `glslang` package has been removed. Fetch the upstream binaries
-          # directly from their GitHub release zips and copy them into
-          # $VULKAN_SDK/Bin so the gradle resolveVulkanTool helper finds them
-          # via $VULKAN_SDK before the PATH fallback.
-          $work = Join-Path $env:RUNNER_TEMP 'caustica-shader-tools'
-          if (Test-Path $work) { Remove-Item -Recurse -Force $work }
-          New-Item -ItemType Directory -Path $work | Out-Null
-
-          Write-Host "Downloading glslang release zip..."
-          $glslangZip = Join-Path $work 'glslang.zip'
-          Invoke-WebRequest -UseBasicParsing -OutFile $glslangZip `
-              'https://github.com/KhronosGroup/glslang/releases/download/main-tot/glslang-main-windows-Release.zip'
-          Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
-          [System.IO.Compression.ZipFile]::ExtractToDirectory($glslangZip, (Join-Path $work 'glslang'))
-
-          Write-Host "Downloading SPIRV-Tools release zip..."
-          $spirvZip = Join-Path $work 'spirv-tools.zip'
-          Invoke-WebRequest -UseBasicParsing -OutFile $spirvZip `
-              'https://github.com/KhronosGroup/SPIRV-Tools/releases/download/main-tot/spirv-tools-main-windows-Release.zip'
-          [System.IO.Compression.ZipFile]::ExtractToDirectory($spirvZip, (Join-Path $work 'spirv-tools'))
-
-          Get-ChildItem -Path $work -Recurse -Filter 'glslangValidator.exe' | Select-Object -First 1 | ForEach-Object {
-              Copy-Item $_.FullName (Join-Path $vulkanBin 'glslangValidator.exe') -Force
-          }
-          Get-ChildItem -Path $work -Recurse -Filter 'glslang.exe' | Select-Object -First 1 | ForEach-Object {
-              Copy-Item $_.FullName (Join-Path $vulkanBin 'glslang.exe') -Force
-          }
-          Get-ChildItem -Path $work -Recurse -Filter 'spirv-val.exe' | Select-Object -First 1 | ForEach-Object {
-              Copy-Item $_.FullName (Join-Path $vulkanBin 'spirv-val.exe') -Force
+          Write-Host "Installing silently to $installRoot ..."
+          $proc = Start-Process -FilePath $installer -ArgumentList '/S' -PassThru -Wait -NoNewWindow
+          if ($proc.ExitCode -ne 0) { throw "Vulkan SDK installer exited with code $($proc.ExitCode)" }
+          if (-not (Test-Path (Join-Path $sdkRoot 'Bin\glslangValidator.exe'))) {
+              throw "glslangValidator.exe missing at $sdkRoot\Bin after install"
           }
 
-          foreach ($exe in 'glslangValidator.exe','spirv-val.exe') {
-              $path = Join-Path $vulkanBin $exe
-              if (-not (Test-Path $path)) { throw "$exe not produced after copy" }
-              & $path --version | Select-Object -First 1 | Write-Host
-          }
+          Write-Host "Pointing VULKAN_SDK at $sdkRoot for subsequent steps ..."
+          "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$sdkRoot\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+          & (Join-Path $sdkRoot 'Bin\glslangValidator.exe') --version | Select-Object -First 1
+          & (Join-Path $sdkRoot 'Bin\spirv-val.exe')         --version | Select-Object -First 1
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
