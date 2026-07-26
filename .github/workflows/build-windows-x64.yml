@@ -106,14 +106,8 @@ jobs:
 
           $binDir = $hit.DirectoryName
           Write-Host "Bin directory: $binDir"
-          $vulkanSdk = Join-Path (Split-Path $binDir -Parent) (Split-Path $binDir -Leaf)
-          $vulkanBin = $binDir
+          $vulkanSdk = Split-Path $binDir -Parent
           Write-Host "Promoting VULKAN_SDK to $vulkanSdk"
-
-          foreach ($exe in 'glslangValidator.exe','glslang.exe','spirv-val.exe','spirv-opt.exe','spirv-dis.exe') {
-              $src = Join-Path $binDir $exe
-              if (Test-Path $src) { Copy-Item $src (Join-Path $binDir $exe) -Force }
-          }
 
           foreach ($exe in 'glslangValidator.exe','spirv-val.exe') {
               $path = Join-Path $binDir $exe
@@ -122,7 +116,7 @@ jobs:
           }
 
           "VULKAN_SDK=$vulkanSdk" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "$vulkanBin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "$binDir" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
