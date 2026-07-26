@@ -91,14 +91,15 @@ jobs:
           Write-Host "Building SPIRV-Tools (spirv-val only) ..."
           cmake --build $spirvBuild --target spirv-val --config Release 2>&1 | Select-Object -Last 5
 
-          Write-Host "Configuring glslang (with external spirv-tools) ..."
+          Write-Host "Configuring glslang (bundled SPIRV-Tools via External/spirv-tools) ..."
           $glslangBuild = Join-Path $buildRoot 'glslang-build'
           cmake -S (Join-Path $buildRoot 'glslang') -B $glslangBuild -G Ninja `
                 -DCMAKE_BUILD_TYPE=Release -DGLSLANG_TESTS=OFF -DENABLE_OPT=OFF -DENABLE_HLSL=OFF `
-                -DENABLE_GLSLANG_BINARIES=ON `
-                -DSPIRV_TOOLS_LIBRARY=$spirvBuild -DSPIRV_INCLUDE_PATH=(Join-Path $buildRoot 'glslang\External\spirv-tools\include') 2>&1 | Select-Object -Last 5
-          Write-Host "Building glslangValidator ..."
-          cmake --build $glslangBuild --target glslangValidator --config Release 2>&1 | Select-Object -Last 5
+                -DENABLE_GLSLANG_BINARIES=ON 2>&1 | Select-Object -Last 5
+          Write-Host "Building glslang standalone ..."
+          cmake --build $glslangBuild --target glslang --config Release 2>&1 | Select-Object -Last 5
+          Write-Host "Listing glslang targets ..."
+          cmake --build $glslangBuild --target help 2>&1 | Select-String 'glslang' | Select-Object -First 5
 
           $vulkanBin = Join-Path $env:VULKAN_SDK 'Bin'
           if (-not (Test-Path $vulkanBin)) { New-Item -ItemType Directory -Path $vulkanBin | Out-Null }
