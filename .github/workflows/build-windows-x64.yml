@@ -74,28 +74,24 @@ jobs:
           vulkan-components: Vulkan-Headers, Vulkan-Loader
           vulkan-use-cache: true
 
-      - name: Install glslangValidator + spirv-val via Chocolatey
+      - name: Install glslang + SPIRV-Tools (glslangValidator, spirv-val)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Write-Host "Installing glslang (bundles glslangValidator.exe + spirv-val.exe)..."
-          choco install glslang -y --no-progress --source="'https://chocolatey.org/api/v2/'"
+          # Vcpkg ships current release builds of glslang and spirv-tools. The runner
+          # already has vcpkg on PATH under $env:VCPKG_ROOT.
+          & $env:VCPKG_ROOT\vcpkg.exe install glslang spirv-tools:x64-windows --triplet x64-windows 2>&1 | Select-Object -Last 20
+          $pkgRoot = Join-Path $env:VCPKG_ROOT 'installed\x64-windows\tools\glslang'
+          $spirvRoot = Join-Path $env:VCPKG_ROOT 'installed\x64-windows\tools\spirv-tools'
+          if (-not (Test-Path $pkgRoot))     { throw "glslang vcpkg install missing: $pkgRoot" }
+          if (-not (Test-Path $spirvRoot))   { throw "spirv-tools vcpkg install missing: $spirvRoot" }
           $vulkanBin = Join-Path $env:VULKAN_SDK 'Bin'
-          if (-not (Test-Path $vulkanBin)) { throw "VULKAN_SDK/Bin missing: $vulkanBin" }
-          $src = 'C:\Program Files\glslang\bin'
-          if (Test-Path $src) {
-              Get-ChildItem -Path $src -Filter '*.exe' | ForEach-Object {
-                  $dest = Join-Path $vulkanBin $_.Name
-                  Copy-Item -Path $_.FullName -Destination $dest -Force
-                  Write-Host "Copied $($_.Name) -> $dest"
-              }
-          }
-          $glslangExe = Join-Path $vulkanBin 'glslangValidator.exe'
-          $spirvExe   = Join-Path $vulkanBin 'spirv-val.exe'
-          if (-not (Test-Path $glslangExe)) { throw "glslangValidator.exe still missing at $glslangExe" }
-          if (-not (Test-Path $spirvExe))   { throw "spirv-val.exe still missing at $spirvExe" }
-          & $glslangExe --version | Select-Object -First 1
-          & $spirvExe --version | Select-Object -First 1
+          if (-not (Test-Path $vulkanBin))   { throw "VULKAN_SDK/Bin missing: $vulkanBin" }
+          Copy-Item -Path (Join-Path $pkgRoot 'glslangValidator.exe') -Destination (Join-Path $vulkanBin 'glslangValidator.exe') -Force
+          Copy-Item -Path (Join-Path $pkgRoot 'glslang.exe')          -Destination (Join-Path $vulkanBin 'glslang.exe') -Force
+          Copy-Item -Path (Join-Path $spirvRoot 'spirv-val.exe')       -Destination (Join-Path $vulkanBin 'spirv-val.exe') -Force
+          & (Join-Path $vulkanBin 'glslangValidator.exe') --version | Select-Object -First 1
+          & (Join-Path $vulkanBin 'spirv-val.exe')         --version | Select-Object -First 1
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
