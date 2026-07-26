@@ -5,10 +5,10 @@ import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtFrameStats;
+import dev.comfyfluffy.caustica.framegen.FrameGenSelector;
 import dev.comfyfluffy.caustica.rt.RtUiOverlay;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
-import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
-import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialSystem;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import dev.comfyfluffy.caustica.rt.terrain.RtWorkerPool;
 import net.fabricmc.api.ClientModInitializer;
@@ -58,11 +58,8 @@ public final class CausticaClient implements ClientModInitializer {
 					// until we're in a world with the block atlas loaded, or once already created.
 					RtComposite.INSTANCE.ensureResourcesReady(ctx);
 					RtTerrain.update(ctx);
-					// Log DLSS-FG availability once when frame generation is enabled (capability query only;
-					// the present-loop integration that consumes it is built separately).
-					if (dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.enabled()) {
-						dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.probeAvailabilityOnce();
-					}
+					// Capability probing is provider-owned and idempotent.
+					FrameGenSelector.probeAvailabilityOnce();
 				}
 			}
 		});
@@ -110,15 +107,11 @@ public final class CausticaClient implements ClientModInitializer {
 			RtEntities.INSTANCE.shutdown();
 		}
 		RtComposite.INSTANCE.destroy();
-		RtEntityTextures.INSTANCE.reset();
-		RtBlockMaterials.INSTANCE.destroy();
-		dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.destroy();
+		RtMaterialSystem.INSTANCE.destroy();
+		FrameGenSelector.shutdown();
 		if (ctx != null) {
 			dev.comfyfluffy.caustica.rt.RtFramePresenter.INSTANCE.destroy(ctx.device());
-			dev.comfyfluffy.caustica.rt.RtReflex.INSTANCE.destroy(ctx.device().vkDevice());
 		}
-		// Shut NGX down once, after every feature (RR + FG) has been released above.
-		dev.comfyfluffy.caustica.ngx.NgxRuntime.INSTANCE.shutdown();
 		if (ctx != null) {
 			ctx.destroy();
 		}

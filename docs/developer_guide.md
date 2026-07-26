@@ -1,84 +1,99 @@
 # Developer Guide
 
+## Toolchain
+
+The normal build requires:
+
+- JDK 25
+- `glslangValidator`
+- `spirv-val`
+- Git
+
+CMake, Ninja, and a C/C++ compiler are recommended. Gradle uses them to build
+Caustica's optional portable JNI bridge, but failure to build that bridge is a
+non-fatal fallback.
+
+No NGX, DLSS, or XeSS SDK is required for a normal build.
+
 ## Windows
 
-1. Install the Vulkan SDK from <https://vulkan.lunarg.com/sdk/home>.
-   The installer sets `VULKAN_SDK` automatically.
-2. Download the DLSS SDK from <https://github.com/NVIDIA/DLSS/releases>.
-   Extract it, then set `DLSS_SDK` to the folder you extracted.
-
-   To set it permanently for your Windows user account, run PowerShell with:
-
-   ```powershell
-   [Environment]::SetEnvironmentVariable("DLSS_SDK", "C:\path\to\dlss-sdk", "User")
-   ```
-
-   Restart your terminal after setting it. To set it only for the current
-   PowerShell session, use:
-
-   ```powershell
-   $env:DLSS_SDK = "C:\path\to\dlss-sdk"
-   ```
-
-3. Configure and build the native shim:
+1. Install a JDK 25 distribution and set `JAVA_HOME`.
+2. Install the LunarG Vulkan SDK. Its installer normally exposes
+   `glslangValidator` and `spirv-val` through `VULKAN_SDK`/`PATH`.
+3. Optionally install CMake and Ninja.
+4. Build or run the development client:
 
 ```powershell
-cmake -S native/ngx_shim -B build/cmake/ngx_shim/release -DCMAKE_BUILD_TYPE=Release
-cmake --build build/cmake/ngx_shim/release --config Release
-```
-
-4. Run the client:
-
-```powershell
-$env:JAVA_TOOL_OPTIONS = "-Xmx8G -XX:+UseCompactObjectHeaders -XX:+AlwaysPreTouch -XX:+UseStringDeduplication -XX:+UseZGC"
+.\gradlew.bat build
 .\gradlew.bat runClient --args="--renderDebugLabels --graphicsBackend VULKAN"
 ```
 
+To rebuild the pinned NRD native on Windows, use
+`scripts/build_nrd_windows.ps1` and follow the version/license requirements in
+that script. The regular Java/shader build does not rebuild NRD automatically.
+
 ## Linux
 
-Set `DLSS_SDK` and `VULKAN_SDK` before configuring CMake:
+Install Java 25, glslang, SPIR-V Tools, Vulkan headers/tools, CMake, and Ninja,
+then run:
 
 ```bash
-export DLSS_SDK=/path/to/dlss-sdk
-export VULKAN_SDK=/path/to/vulkan-sdk
+export JAVA_HOME=/path/to/jdk-25
+export PATH="$JAVA_HOME/bin:$PATH"
+bash ./gradlew build
 ```
 
-`DLSS_SDK` must contain the NGX headers and static library. `VULKAN_SDK` must
-contain Vulkan headers.
-
-Then configure and build the native shim:
-
-```bash
-cmake -S native/ngx_shim -B build/cmake/ngx_shim/release -DCMAKE_BUILD_TYPE=Release
-cmake --build build/cmake/ngx_shim/release
-```
-
-On NixOS, enter the development shell from `flake.nix` instead of setting up
-the toolchain by hand:
+On CachyOS/Arch, `scripts/cachyos/build.sh` installs the build packages and runs
+the same command. On NixOS:
 
 ```bash
 nix develop
-cmake -S native/ngx_shim -B build/cmake/ngx_shim/release -DCMAKE_BUILD_TYPE=Release
-cmake --build build/cmake/ngx_shim/release
+bash ./gradlew build
 ```
 
-## Native Bundling
-
-Gradle bundles NGX natives for the current host platform by default:
+Run a development client with:
 
 ```bash
-./gradlew build
+JAVA_TOOL_OPTIONS='-Xmx8G -Xss2M -XX:+UseCompactObjectHeaders -XX:+AlwaysPreTouch -XX:+UseStringDeduplication -XX:+UseZGC' \
+  bash ./gradlew runClient --args='--renderDebugLabels --graphicsBackend VULKAN'
 ```
 
-Release builds that already have both platform shims available can request a
-cross-platform native bundle:
+## Shader build
+
+`compileShaders` compiles `shaders/**` to generated SPIR-V and validates every
+module for Vulkan 1.4:
 
 ```bash
-./gradlew build -PngxPlatforms=windows-x64,linux-x64
+bash ./gradlew compileShaders
 ```
 
-Run the Vulkan RT/DLSS-RR client with:
+Generated files are placed under `build/generated/shaders/caustica/rt/` and are
+added to the main resources automatically. Do not hand-edit generated `.spv`
+files.
+
+## Optional native providers
+
+Optional providers own their loading and capability probes. Missing or
+incompatible native libraries must fail open to a portable implementation.
+Current rebuild helpers include:
 
 ```bash
-JAVA_TOOL_OPTIONS='-Xmx8G -XX:+UseCompactObjectHeaders -XX:+AlwaysPreTouch -XX:+UseStringDeduplication -XX:+UseZGC' nvidia-offload ./gradlew runClient --args='--renderDebugLabels --graphicsBackend VULKAN'
+bash scripts/build_fsr2_classic_linux.sh
+bash scripts/build_nrd_linux.sh
+```
+
+Review the scripts and the relevant third-party licenses before redistributing
+their outputs. Do not add GPU-vendor routing to renderer call sites; expose a
+provider-neutral capability on the denoise, upscaler, frame-generation, plate,
+or presentation interface instead.
+
+## Validation
+
+Before submitting renderer changes, run:
+
+```bash
+bash ./gradlew compileJava compileShaders
+python3 scripts/test_denoise_regressions.py
+git diff --check
+bash ./gradlew build
 ```

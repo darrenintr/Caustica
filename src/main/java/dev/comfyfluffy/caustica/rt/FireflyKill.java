@@ -33,6 +33,8 @@ public final class FireflyKill {
     private long pipeline;
     private long descriptorPool;
     private long descriptorSet;
+    private long boundInputView;
+    private long boundOutputView;
     private boolean ready;
     private int width;
     private int height;
@@ -123,19 +125,22 @@ public final class FireflyKill {
             return;
         }
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            // Bind descriptors.
-            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(2, stack);
-            VkDescriptorImageInfo.Buffer info0 = VkDescriptorImageInfo.calloc(1, stack);
-            info0.get(0).imageView(inRadiance.view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
-            writes.get(0).sType$Default().dstSet(descriptorSet).dstBinding(0)
-                    .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
-                    .pImageInfo(info0);
-            VkDescriptorImageInfo.Buffer info1 = VkDescriptorImageInfo.calloc(1, stack);
-            info1.get(0).imageView(outRadiance.view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
-            writes.get(1).sType$Default().dstSet(descriptorSet).dstBinding(1)
-                    .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
-                    .pImageInfo(info1);
-            VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
+            if (boundInputView != inRadiance.view || boundOutputView != outRadiance.view) {
+                VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(2, stack);
+                VkDescriptorImageInfo.Buffer info0 = VkDescriptorImageInfo.calloc(1, stack);
+                info0.get(0).imageView(inRadiance.view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+                writes.get(0).sType$Default().dstSet(descriptorSet).dstBinding(0)
+                        .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                        .pImageInfo(info0);
+                VkDescriptorImageInfo.Buffer info1 = VkDescriptorImageInfo.calloc(1, stack);
+                info1.get(0).imageView(outRadiance.view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+                writes.get(1).sType$Default().dstSet(descriptorSet).dstBinding(1)
+                        .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                        .pImageInfo(info1);
+                VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
+                boundInputView = inRadiance.view;
+                boundOutputView = outRadiance.view;
+            }
 
             VkCommandBuffer cb = new VkCommandBuffer(cmd, ctx.vk());
             VK10.vkCmdBindPipeline(cb, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
@@ -173,5 +178,7 @@ public final class FireflyKill {
         }
         width = 0;
         height = 0;
+        boundInputView = 0L;
+        boundOutputView = 0L;
     }
 }

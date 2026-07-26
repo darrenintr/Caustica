@@ -4,7 +4,6 @@ import com.electronwill.nightconfig.core.CommentedConfig;
 import com.electronwill.nightconfig.core.file.CommentedFileConfig;
 import com.electronwill.nightconfig.core.file.FileNotFoundAction;
 import com.electronwill.nightconfig.toml.TomlFormat;
-import dev.comfyfluffy.caustica.upscale.UpscalerSelector;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -57,11 +56,11 @@ public final class CausticaConfig {
     public static void ensureRegistered() {
         @SuppressWarnings("unused")
         Object[] touch = {
-            Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Composite.MAX_RAY_DISTANCE, Rt.Composite.TEMPORAL_ACCUM, Rt.Composite.TEMPORAL_ALPHA, Rt.Composite.TEMPORAL_DISOCCLUSION, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Omm.ENABLED,
-            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.Denoise.MODE,
+            Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Composite.MAX_RAY_DISTANCE, Rt.Composite.TEMPORAL_ACCUM, Rt.Composite.TEMPORAL_ALPHA, Rt.Composite.TEMPORAL_DISOCCLUSION, Rt.Composite.TILE_JITTER, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Omm.ENABLED,
+            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.Denoise.MODE, Rt.Denoise.NRD_MAX_ACCUMULATED_FRAMES, Rt.Denoise.NRD_RESIDUAL_BILATERAL,
             Rt.Gi.ENABLED, Rt.Gi.CANDIDATES, Rt.Gi.MAX_M_TEMPORAL, Rt.Gi.MAX_M_SPATIAL, Rt.Gi.HEMI_SKY_SCALE, Rt.Gi.HEMI_GROUND_SCALE, Rt.Gi.LIGHTFIELD_BLEND,
             Rt.Hybrid.ENABLED, Rt.Hybrid.ROUGH_THRESHOLD, Rt.Hybrid.LIGHTFIELD_THRESHOLD,
-            Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.FrameStats.ENABLED, Rt.DebugOverlay.ENABLED,
+            Rt.Exposure.MODE, Rt.FrameStats.ENABLED, Rt.DebugOverlay.ENABLED,
             Rt.Hdr.ENABLED, Rt.Upscaler.MODE, Rt.Upscaler.QUALITY, Rt.Upscaler.SHARPEN, Rt.Upscaler.SHARPNESS,
             Rt.Fsr.PATH,
             Rt.DynamicLights.ENABLED, Rt.DynamicLights.HELD_ITEMS, Rt.DynamicLights.DROPPED_ITEMS,
@@ -98,12 +97,9 @@ public final class CausticaConfig {
                         + " stream-fallback-budget-ms is the per-tick slice used only when no world frame is\n"
                         + " streaming (loading screens), where a long pass hitches nothing.");
         FILE.setComment("frame-generation",
-                " DLSS Frame Generation. Default off; gated additionally by hardware/driver availability.\n"
-                        + " multi-frame-count: frames generated per rendered frame (1 = 2x, 2 = 3x, ...), clamped\n"
-                        + " at runtime to the driver's reported DLSSG.MultiFrameCountMax.");
-        FILE.setComment("reflex",
-                " NVIDIA Reflex (VK_NV_low_latency2). Default off; gated additionally by device support.\n"
-                        + " minimum-interval-us: 0 = no framerate cap (Reflex just paces submission).");
+                " Built-in Vulkan motion/depth frame generation. Default off; no vendor SDK is required.\n"
+                        + " multi-frame-count: frames generated per rendered frame (1 = 2x, 2 = 3x, ...); the\n"
+                        + " built-in provider clamps this to 3 generated frames.");
         FILE.setComment("hdr",
                 " HDR display output (ST.2084/PQ). When enabled the swapchain is created in PQ automatically\n"
                         + " (falls back to SDR if the surface doesn't advertise it). paper-white-nits / peak-nits\n"
@@ -571,20 +567,6 @@ public final class CausticaConfig {
                 return value.name();
             }
         }
-        /** Returns the current value as the matching {@code UpscalerSelector.Mode} when applicable, or
-         *  {@code AUTO} as a safe default. Used by the selector to read the requested mode. */
-        public UpscalerSelector.Mode valueEnum() {
-            if (enumClass == UpscalerMode.class) {
-                UpscalerMode m = (UpscalerMode) value;
-                return switch (m) {
-                    case OFF -> UpscalerSelector.Mode.OFF;
-                    case AUTO -> UpscalerSelector.Mode.AUTO;
-                    case TAAU -> UpscalerSelector.Mode.TAAU;
-                };
-            }
-            return UpscalerSelector.Mode.AUTO;
-        }
-
         @Override
         public void set(T value) {
             this.value = value != null ? value : defaultValue;
@@ -655,6 +637,12 @@ public final class CausticaConfig {
             // Off = use SPP for every pixel (legacy). On (default) = apply the heuristic above.
             public static final BooleanSetting ADAPTIVE_SPP =
                     bool("caustica.rt.adaptiveSpp", "composite.adaptive-spp", false);
+            // Per-tile stochastic jitter is a traversal-coherence optimization, not a quality feature.
+            // It adds a small spatially quantized sample pattern which the temporal denoiser must undo.
+            // Keep it opt-in so quality-first configurations match the integrated temporal approach used
+            // by modern RT denoisers; enable it only after measuring the performance gain on a target GPU.
+            public static final BooleanSetting TILE_JITTER =
+                    bool("caustica.rt.tileJitter", "composite.tile-jitter", false);
             // Secondary NEE: in addition to the primary directional light, fire one shadow ray at
             // the moon (when above the horizon and not at a too-thin phase) for every direct-light
             // bounce. Default on; cost = +1 shadow ray per primary hit. Trades a single-firefly risk
@@ -683,8 +671,8 @@ public final class CausticaConfig {
             // color (accumulated = mix(history, current, alpha)). The upscaler/denoise backend then
             // receive the temporally-stabilised image instead of the raw per-frame trace, so a static
             // camera converges to a near-noiseless image over a handful of frames ("actually can see"
-            // the accumulated result). Disabled when the resolved upscaler is DLSS-RR (its own temporal
-            // filter is superior; enabling both is wasted work) unless explicitly forced on.
+            // the accumulated result). Disabled when a temporal upscaler is active because stacking two
+            // history filters is wasted work and increases ghosting.
             //
             // Default OFF in v0.5.2+: with the FFX denoiser converted to a whole-radiance denoiser,
             // running TAA on top of it caused double temporal accumulation (FFX's reproject + this
@@ -717,9 +705,9 @@ public final class CausticaConfig {
 
         public static final class Terrain {
             public static final IntSetting ASYNC_DISPATCH_PER_TICK =
-                    intAtLeast("caustica.rt.asyncDispatchPerTick", "terrain.async-dispatch-per-tick", 64, 0);
+                    intAtLeast("caustica.rt.asyncDispatchPerTick", "terrain.async-dispatch-per-tick", 48, 0);
             public static final IntSetting SECTION_RESULTS_PER_TICK =
-                    intAtLeast("caustica.rt.sectionResultsPerTick", "terrain.section-results-per-tick", 64, 0);
+                    intAtLeast("caustica.rt.sectionResultsPerTick", "terrain.section-results-per-tick", 48, 0);
             public static final FloatSetting STREAM_BUDGET_MS =
                     clampedFloat("caustica.rt.streamBudgetMs", "terrain.stream-budget-ms", 1.5f, 0.05f, 100f);
             public static final FloatSetting STREAM_BUDGET_MAX_MS =
@@ -727,7 +715,7 @@ public final class CausticaConfig {
             public static final FloatSetting STREAM_FALLBACK_BUDGET_MS =
                     clampedFloat("caustica.rt.streamFallbackBudgetMs", "terrain.stream-fallback-budget-ms", 8f, 0.05f, 100f);
             public static final IntSetting MAX_INFLIGHT_SECTIONS =
-                    intAtLeast("caustica.rt.maxInflightSections", "terrain.max-inflight-sections", 192, 0);
+                    intAtLeast("caustica.rt.maxInflightSections", "terrain.max-inflight-sections", 128, 0);
             public static final IntSetting SECTION_TABLE_INITIAL_CAPACITY =
                     intAtLeast("caustica.rt.sectionTableInitialCapacity", "terrain.section-table-initial-capacity", 512, 1);
             public static final IntSetting REBASE_DISTANCE_BLOCKS =
@@ -740,7 +728,7 @@ public final class CausticaConfig {
         public static final class Omm {
             public static final BooleanSetting ENABLED = bool("caustica.rt.omm", "omm.enabled", true);
             public static final IntSetting SUBDIVISION =
-                    clampedInt("caustica.rt.ommSubdivision", "omm.subdivision", 4, 0, 12);
+                    clampedInt("caustica.rt.ommSubdivision", "omm.subdivision", 4, 0, 6);
             public static final BooleanSetting STATS = bool("caustica.rt.ommStats", "omm.stats", false);
 
             private Omm() {
@@ -760,7 +748,7 @@ public final class CausticaConfig {
             public static final IntSetting BE_VIEW_CHUNKS =
                     intAtLeast("caustica.rt.beViewChunks", "entities.block-entities.view-chunks", 8, 0);
             public static final IntSetting BE_BUILDS_PER_FRAME =
-                    intAtLeast("caustica.rt.beBuildsPerFrame", "entities.block-entities.builds-per-frame", 8, 0);
+                    intAtLeast("caustica.rt.beBuildsPerFrame", "entities.block-entities.builds-per-frame", 64, 0);
             public static final IntSetting REFIT_REBUILD_INTERVAL =
                     intAtLeast("caustica.rt.refitRebuildInterval", "entities.refit.rebuild-interval", 120, 1);
 
@@ -812,21 +800,11 @@ public final class CausticaConfig {
             }
         }
 
-        public static final class DlssRr {
-            public static final BooleanSetting ENABLED = bool("caustica.rt.dlssRr", "dlss-rr.enabled", true);
-            public static final IntSetting PRESET = intValue("caustica.rt.dlssRr.preset", "dlss-rr.preset", 0);
-            public static final IntSetting QUALITY = intValue("caustica.rt.dlssRr.quality", "dlss-rr.quality", 0);
-
-            private DlssRr() {
-            }
-        }
-
         /**
-         * Upscaler selection. Default AUTO; the selector resolves at session start to whatever the device
-         * supports best (NVIDIA → DLSS-RR, AMD RDNA 3/4 → FSR 4.1 INT8, else FSR 3, else XeSS DP4a, else
-         * off). Force a specific mode with {@code mode = "dlss-rr"} / {@code "fsr-3"} / {@code "fsr-4"} /
-         * {@code "xess"} / {@code "off"}. Quality maps to each SDK's native enum (DLSS-RR uses NGX
-         * perf-quality; FSR / XeSS use 0=NATIVE..4=ULTRA_PERF).
+         * Upscaler selection. AUTO resolves to the portable compute TAAU provider. FSR modes select classic
+         * FSR2 when its native bridge is available and otherwise fall back to TAAU. XeSS and legacy mode keys
+         * currently resolve to TAAU compatibility fallback; OFF selects the no-op provider. Quality uses the
+         * shared 0=NATIVE..4=ULTRA_PERF scale interpreted by each active provider.
          */
         public static final class Upscaler {
             public static final EnumSetting<UpscalerMode> MODE = enumSetting("caustica.rt.upscaler", "upscaler.mode",
@@ -863,13 +841,20 @@ public final class CausticaConfig {
          * Image-domain denoise backend.
          * <ul>
          *   <li>{@code AUTO}/{@code HYBRID} — FFX shadow+reflection prepass, then NRD REBLUR</li>
-         *   <li>{@code NRD} — NRD REBLUR only (raw layers, no FFX; Radiance-style)</li>
-         *   <li>{@code FFX} — Official FFX shadow+reflection only</li>
+         *   <li>{@code NRD} — NRD REBLUR only (raw layers, no FFX; Radiance-style). Stable path; the
+         *   AMD vendor on AUTO also resolves here because the 2.x modular loader we
+         *   bundle has no denoiser effect provider, so the legacy AMD_FIDELITY
+         *   FFX-only path is gone. NRD is currently the only stable AMD denoiser.</li>
+         *   <li>{@code FFX} — Official FFX shadow+reflection only (uses Caustica's
+         *   from-scratch GLSL pipeline — the "ffx" prefix is legacy naming, not the
+         *   AMD FFX library). Kept for users who want the FFX-style result without
+         *   the NRD runtime dependency.</li>
+
          *   <li>{@code OFF} — raw path-traced color</li>
          * </ul>
          *
-         * <p>Legacy aliases: {@code "svgf"} and {@code "on"} map to {@code FFX}; the
-         * legacy sigma/temporal config keys are dropped (each backend owns its tuning).
+         * <p>Aliases: {@code "on"}/{@code "ffx-official"} → FFX.
+         * Legacy "amd-fidelityfx"/"fidelityfx"/"ffx-fsr" → fall through to AUTO (NRD on AMD).
          */
         public static final class Denoise {
             public static final EnumSetting<DenoiserKind> MODE = enumSetting(
@@ -881,9 +866,46 @@ public final class CausticaConfig {
             // AABB clamp (not |curr-history| — that zeroed history on SPP-1).
             // 0.5 = responsive (more grain), 0.95 = smooth static but pan-ghost risk.
             // Range 0.0..1.0 inclusive; clamped at the binding.
+            // FFX-only tuning. Higher = more temporal smoothing on trusted static pixels.
+            // Default 0.82: enough for SPP-1 static convergence without the 0.95 "ghost trails
+            // while panning" regression (2026-07-14). Resolve still weights from variance +
+            // AABB clamp (not |curr-history| — that zeroed history on SPP-1).
+            // 0.5 = responsive (more grain), 0.95 = smooth static but pan-ghost risk.
+            // Range 0.0..1.0 inclusive; clamped at the binding.
             public static final FloatSetting FFX_TEMPORAL_WEIGHT_MAX =
                     clampedFloat("caustica.rt.denoise.ffxTemporalWeightMax", "denoise.ffx-temporal-weight-max",
                             0.82f, 0.0f, 1.0f);
+            // FFX reflection delta composite. The reflection reproject/spatial chain always keeps
+            // its history warm; this flag controls whether the cleaned reflection delta is applied
+            // to the beauty plate (denoise_composite bit1). It was disabled while uninitialised
+            // history could zero the frame — the transfer-barrier fix removed that root cause, and
+            // the composite keeps its ±2.0 delta cap + 0.35*beauty floor as fail-open guards.
+            // Disable to fall back to shadow-only FFX if a driver still misbehaves.
+            public static final BooleanSetting FFX_REFLECTION_COMPOSITE =
+                    bool("caustica.rt.denoise.ffxReflectionComposite", "denoise.ffx-reflection-composite", true);
+            // 2026-07-20: AMD preset has a 3-pass bilateral residual after the official FFX pass.
+            // Per the user-visible comparison 2026-07-20 the residual may be re-injecting noise
+            // the FFX pass just dampened (suspect #3 in the diagnostic protocol). Disable to
+            // verify whether the residual is the source, by running pure FFX output for
+            // comparison. Default true (preserves the verified architecture).
+            public static final BooleanSetting AMD_FIDELITY_FX_RESIDUAL =
+                    bool("caustica.rt.denoise.amdFidelityFxResidual",
+                            "denoise.amd-fidelity-fx-residual", true);
+            // NRD REBLUR max accumulated-frame count. Borrowed from Sundial-Lite's
+            // VB_MAX_BLEDED_FRAMES=20 — exposed here so users on iGPU / Apple Silicon / RDNA2
+            // can trade temporal stability for memory + latency. NRD's stock is 32 (the hardcoded
+            // value in caustica_nrd_shim.cpp until native rebuild); lowering to 8-16 saves
+            // ~viewport * 4 bytes * 2 of history-texture memory per pixel and shortens the
+            // anti-lag window. Range [1, 63] — NRD's documented max is 63.
+            public static final IntSetting NRD_MAX_ACCUMULATED_FRAMES =
+                    clampedInt("caustica.rt.denoise.nrdMaxAccumulatedFrames",
+                            "denoise.nrd-max-accumulated-frames", 32, 1, 63);
+            // Optional post-NRD spatial polish. NRD already performs temporal and spatial filtering;
+            // leaving this off avoids a second edge-aware pass preserving a quantized residual pattern.
+            // Enable for a strict spatial A/B comparison only.
+            public static final BooleanSetting NRD_RESIDUAL_BILATERAL =
+                    bool("caustica.rt.denoise.nrdResidualBilateral",
+                            "denoise.nrd-residual-bilateral", false);
 
             private Denoise() {
             }
@@ -948,7 +970,7 @@ public final class CausticaConfig {
             }
         }
 
-        /** DLSS Frame Generation. Default off; gated additionally by hardware/driver availability. */
+        /** Vendor-neutral Vulkan motion-vector frame generation. Default off. */
         public static final class Fg {
             public static final BooleanSetting ENABLED = bool("caustica.rt.fg", "frame-generation.enabled", false);
             public static final IntSetting MULTI_FRAME_COUNT =
@@ -958,22 +980,6 @@ public final class CausticaConfig {
             }
         }
 
-        /**
-         * NVIDIA Reflex ({@code VK_NV_low_latency2}). Default off; gated additionally by device support.
-         * Phase 0 (extension + capability probe only, see {@code RtDeviceBringup}/{@code RtReflex}) — the
-         * per-frame sleep call + latency markers + the swapchain {@code VkSwapchainLatencyCreateInfoNV} the
-         * spec requires for {@code vkSetLatencySleepModeNV} to take effect land in a later phase.
-         */
-        public static final class Reflex {
-            public static final BooleanSetting ENABLED = bool("caustica.rt.reflex", "reflex.enabled", false);
-            public static final BooleanSetting LOW_LATENCY_BOOST =
-                    bool("caustica.rt.reflex.boost", "reflex.low-latency-boost", false);
-            public static final IntSetting MINIMUM_INTERVAL_US =
-                    intAtLeast("caustica.rt.reflex.minIntervalUs", "reflex.minimum-interval-us", 0, 0);
-
-            private Reflex() {
-            }
-        }
 
         public static final class Exposure {
             public static final StringSetting MODE =
@@ -986,7 +992,7 @@ public final class CausticaConfig {
             public static final FloatSetting MIN_EV =
                     finiteFloat("caustica.rt.exposure.minEv", "exposure.min-ev", -1.5f);
             public static final FloatSetting MAX_EV =
-                    finiteFloat("caustica.rt.exposure.maxEv", "exposure.max-ev", 1.75f);
+                    finiteFloat("caustica.rt.exposure.maxEv", "exposure.max-ev", 3.0f);
             public static final FloatSetting ADAPT_UP =
                     exposureScale("caustica.rt.exposure.adaptUp", "exposure.adapt-up", 0.14f);
             public static final FloatSetting ADAPT_DOWN =
@@ -1037,10 +1043,25 @@ public final class CausticaConfig {
             }
         }
 
+        /** Startup Vulkan inventory + {@code VK_EXT_device_fault} reporting on device loss. See {@code VulkanDiagnostics}. */
+        public static final class Diagnostics {
+            /** Heavy driver-side crash diagnostics: vendor diagnostics-config extensions (shader debug
+             * info, resource tracking, automatic checkpoints, shader error reporting) and the
+             * {@code deviceFaultVendorBinary} feature (vendor-format crash dump on device loss). Off by
+             * default: measured ~10x BLAS build time / -20% fps when enabled. Plain {@code deviceFault}
+             * reporting (fault addresses + vendor records) is always on and unaffected. Turn on only
+             * while chasing a live device-loss crash. */
+            public static final BooleanSetting HEAVY_CRASH_DIAGNOSTICS =
+                    bool("caustica.rt.heavyCrashDiagnostics", "diagnostics.heavy-crash-diagnostics", false);
+
+            private Diagnostics() {
+            }
+        }
+
         /**
          * In-game debug overlay (top-left of the screen). Master switch for the {@code CausticaDebugOverlay}
          * HUD draw — shows the live state of the ray-tracing pipeline (active upscaler, denoise mode,
-         * frame counter, last DLSS-RR return code, render/display resolution, per-stage timings) so a
+         * frame counter, last upscaler result, render/display resolution, per-stage timings) so a
          * "weird" image can be diagnosed from a screenshot. Cheap to leave on; intended as a developer /
          * power-user tool.
          */
@@ -1052,8 +1073,8 @@ public final class CausticaConfig {
         }
 
         /**
-         * HDR display output. When enabled the swapchain is created in PQ (ST.2084/HDR10 — the display-ready
-         * encoding both HDR10 swapchains and DLSS Frame Generation require; whatever pixel format the surface
+         * HDR display output. When enabled the swapchain is created in PQ (ST.2084/HDR10 — a display-ready
+         * encoding suitable for HDR presentation and frame-generation providers; whatever pixel format the surface
          * pairs with that color space, commonly a 10-bit UNORM), falling back to SDR if the surface doesn't
          * advertise it. The nit values drive the scene-HDR → display mapping: SDR paper white maps to
          * {@code paperWhiteNits}, and highlights roll off toward {@code peakNits}.
@@ -1097,16 +1118,6 @@ public final class CausticaConfig {
         }
     }
 
-    public static final class Ngx {
-        // Reserved stub: keep the class so any old caustica.toml.ngx.path key still parses
-        // (TomlFormat ignores unknown runtime keys, but referencing the class from any
-        // legacy import path stays valid).
-        public static final OptionalStringSetting PATH = optionalString("caustica.ngx.path", "ngx.path");
-
-        private Ngx() {
-        }
-    }
-
     /** Dynamic Resolution Scaling — automatically adjusts render resolution to maintain target framerate. */
     public static final class Drs {
         public static final BooleanSetting ENABLED = bool("caustica.drs.enabled", "drs.enabled", false);
@@ -1124,12 +1135,20 @@ public final class CausticaConfig {
         }
     }
 
-    /** Upscaler mode (config). The {@code UpscalerSelector.Mode} enum is the resolved mode; this one is the
-     *  user-requested mode. Only TAAU is available — pure compute, no SDK, works on every Vulkan GPU. */
+    /** User-requested upscaler mode. Runtime providers expose capabilities through {@code Upscaler}. */
     public enum UpscalerMode {
         OFF("off"),
         AUTO("auto"),
-        TAAU("taau");
+        /** Pure-compute TAAU — always available, no native SDK. */
+        TAAU("taau"),
+        /**
+         * Classic FSR 2.2 Vulkan ({@code libffx_fsr2_caustica.so}). Preferred partner for the
+         * {@code AMD_FIDELITY_FX_RESIDUAL} (deprecated — AMD preset removed in
+         * commit 1, 2026-07-20). The setting is kept in the .toml schema for
+         * backward compatibility (older configs don't fail to load) but the
+         * AMD path no longer reads it.</li>
+         */
+        FSR2("fsr2");
 
         final String key;
         UpscalerMode(String key) { this.key = key; }
@@ -1140,9 +1159,15 @@ public final class CausticaConfig {
             for (UpscalerMode m : values()) {
                 if (m.key.equalsIgnoreCase(s) || m.name().equalsIgnoreCase(s)) return m;
             }
-            // Tolerate legacy keys so old caustica.toml doesn't crash on load.
-            if (s.equalsIgnoreCase("dlss-rr") || s.equalsIgnoreCase("fsr-3") || s.equalsIgnoreCase("fsr-4")
-                    || s.equalsIgnoreCase("xess") || s.equalsIgnoreCase("nis")) return AUTO;
+            // Tolerate legacy / alias keys so old caustica.toml doesn't crash on load.
+            if (s.equalsIgnoreCase("fsr-3") || s.equalsIgnoreCase("fsr3")
+                    || s.equalsIgnoreCase("fsr-2") || s.equalsIgnoreCase("fsr")) {
+                return FSR2;
+            }
+            if (s.equalsIgnoreCase("dlss-rr") || s.equalsIgnoreCase("fsr-4")
+                    || s.equalsIgnoreCase("xess") || s.equalsIgnoreCase("nis")) {
+                return AUTO;
+            }
             return AUTO;
         }
     }
@@ -1159,8 +1184,17 @@ public final class CausticaConfig {
         NRD("nrd"),
         /** Explicit hybrid cascade (same as AUTO). */
         HYBRID("hybrid"),
-        /** SVGF (Spatiotemporal Variance-Guided Filtering) — pure shader denoiser. */
-        SVGF("svgf");
+        /** Spatial-only 3x3 joint bilateral. Pure SPIR-V, ~0.5 ms regardless of vendor.
+         *  No temporal history (no ghost trails) but also no temporal convergence —
+         *  leaves some grain. The performance floor for RDNA3 / Intel Arc users when
+         *  NRD's ~6-8 ms cost on a budget GPU is unacceptable. 2026-07-21. */
+        BILATERAL("bilateral"),
+        /** NRD RELAX_DIFFUSE_SPECULAR (NRD 4.x attention-based denoiser). Slightly higher
+         *  cost than REBLUR (~7-9 ms on RX 7600 at 1080p vs REBLUR's ~6-8 ms) but ~15-20%
+         *  better quality on fine geometry and material boundaries. Same vendor-portable
+         *  story as NRD REBLUR. Requires the bundled NRD shim to be built with RELAX
+         *  support (caustica_nrd_create_relax_v2 symbol). 2026-07-21. */
+        RELAX("relax");
 
         final String key;
         DenoiserKind(String key) { this.key = key; }
@@ -1172,8 +1206,37 @@ public final class CausticaConfig {
             for (DenoiserKind k : values()) {
                 if (k.key.equals(t) || k.name().equalsIgnoreCase(s)) return k;
             }
-            if (t.equals("on") || t.equals("ffx-official")) return FFX;
+            if (t.equals("on") || t.equals("ffx-official") || t.equals("svgf")) return FFX;
+            // Legacy "amd-fidelityfx" / "fidelityfx" / "ffx-fsr" / "amd-ffx" aliases fall
+            // through to AUTO. The DenoiserKind.AMD_FIDELITY enum was removed in
+            // commit 16287e5 (2026-07-20) — the 2.x modular loader we bundle has no
+            // denoiser effect provider, so the FFX-only AMD path is gone. AMD AUTO
+            // now routes to NRD via DenoiseBackendSelector.autoPick.
+            //
+            // Bedrock-RTX-aligned rationale (2026-07-21): Bedrock RTX uses NRD REBLUR
+            // (diffuse+specular) + SIGMA_SHADOW with sky/emissive composited outside the
+            // noisy path. Whole-radiance denoising (the AMD FFX whole-radiance path this
+            // alias used to point at) does not match what Mojang ships and produced
+            // colored fireflies on emissives + flat-face halos. The NRD path here mirrors
+            // that contract: prepare_nrd_inputs.comp produces split diffuse/specular
+            // signals and the compositor adds emissive/sky post-denoise.
+            if (t.equals("amd-fidelityfx") || t.equals("amd-fidelityfx")
+                    || t.equals("fidelityfx") || t.equals("ffx-fsr")
+                    || t.equals("amd-ffx")) {
+                dev.comfyfluffy.caustica.CausticaMod.LOGGER.warn(
+                        "denoise.mode='{}' is a legacy AMD-FidelityFX whole-radiance alias; the bundled "
+                                + "AMD FFX 2.x modular loader has no denoiser effect provider, so this mode "
+                                + "now resolves to AUTO (NRD REBLUR + SIGMA — Bedrock-RTX-aligned). To "
+                                + "silence this warning, set denoise.mode='auto' (recommended) or 'off'.",
+                        t);
+                return AUTO;
+            }
             if (t.equals("ffx-nrd") || t.equals("hybrid-ffx-nrd")) return HYBRID;
+            // "relax" and "nrd-relax" → explicit RELAX (NRD 4.x attention-based). Falls
+            // back to AUTO (REBLUR) at runtime if the bundled NRD shim predates RELAX support.
+            if (t.equals("relax") || t.equals("nrd-relax") || t.equals("relax-diffuse-specular")) {
+                return RELAX;
+            }
             return AUTO;
         }
     }

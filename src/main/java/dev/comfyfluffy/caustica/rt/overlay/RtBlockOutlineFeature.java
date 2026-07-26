@@ -36,8 +36,8 @@ import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 /**
  * The targeted block's wireframe outline: a real {@link VoxelShape} edge list (not just a full-cube
  * approximation), raster full-res post-upscale, occluded per-fragment via an inline {@code rayQueryEXT}
- * test against the world TLAS (see {@code block_outline.frag}) instead of a depth buffer — RT's own
- * {@code gDepth} is at DLSS-RR's internal render resolution, not this pass's full display resolution, and
+ * test against the world TLAS when supported; otherwise a descriptor-free shader keeps the outline visible (see {@code block_outline.frag}) instead of a depth buffer — RT's own
+ * {@code gDepth} is at the RT internal render resolution, not this pass's full display resolution, and
  * outline pixels need to sit exactly on the depth surface.
  *
  * <p>Reads {@code Minecraft.gameRenderer.gameRenderState().levelRenderState.blockOutlineRenderState}
@@ -96,9 +96,12 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
         if (terrain == null) {
             return false;
         }
-        long tlas = RtComposite.INSTANCE.currentTlasHandle();
-        if (tlas == 0L) {
-            return false;
+        long tlas = 0L;
+        if (RtDeviceBringup.rayQueryEnabled()) {
+            tlas = RtComposite.INSTANCE.currentTlasHandle();
+            if (tlas == 0L) {
+                return false;
+            }
         }
         var gameRenderState = Minecraft.getInstance().gameRenderer.gameRenderState();
         // Vanilla's own gate (GameRenderer.shouldRenderBlockOutline) is a *parameter* it computes right
@@ -152,10 +155,11 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
         float[] data = verts.toFloatArray();
         vbo = pool.acquireVertex(ctx, (long) data.length * Float.BYTES, "block outline vbo");
         MemoryUtil.memFloatBuffer(vbo.mapped, data.length).put(data);
+        vbo.flush(0L, (long) data.length * Float.BYTES);
 
         // Same P·V the RT plate used (camera-relative, jitter-free).
         viewProj.set(composite.currentViewProjection());
-        boundSet = accelSet.bind(ctx, tlas);
+        boundSet = RtDeviceBringup.rayQueryEnabled() ? accelSet.bind(ctx, tlas) : 0L;
         return true;
     }
 
@@ -193,21 +197,22 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
     private void ensureResources(RtContext ctx, int width, int height) {
         this.ctxRef = ctx;
         if (pipeline == null) {
-            accelSet = RtOverlayPipelines.accelStructureSet(ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "block outline");
-            pipeline = new RtOverlayPipelines.Spec("block_outline.vert.spv", "block_outline.frag.spv")
+            String fragmentShader = RtDeviceBringup.rayQueryEnabled()
+                    ? "block_outline.frag.spv" : "block_outline_no_ray_query.frag.spv";
+            RtOverlayPipelines.Spec outlineSpec = new RtOverlayPipelines.Spec("block_outline.vert.spv", fragmentShader)
                     .vertex(RtOverlayPipelines.VertexFormat.POSITION)
                     .topology(VK10.VK_PRIMITIVE_TOPOLOGY_LINE_LIST)
-                    // NONE (straight write), not ALPHA: ALPHA's blend factors (srcAlpha=ZERO, dstAlpha=ONE)
-                    // preserve the DESTINATION's alpha, which was fine composited straight onto opaque `main`
-                    // (only RGB mattered) but is wrong now that this pass writes into a transparent scratch
-                    // mask whose alpha IS the coverage signal the composite pass reads — ALPHA here would
-                    // leave every resolved pixel's alpha stuck at the clear value (0), invisible outline.
+                    // NONE (straight write), not ALPHA: the resolved mask's alpha is the coverage signal.
                     .blend(RtOverlayPipelines.Blend.NONE)
                     .attachment(RtWorldOverlay.TARGET_FORMAT)
                     .samples(RtDeviceBringup.overlayMsaaSamples())
-                    .push(PUSH_BYTES, VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT)
-                    .descriptorSetLayout(accelSet.layout)
-                    .build(ctx, "block outline");
+                    .push(PUSH_BYTES, VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT);
+            if (RtDeviceBringup.rayQueryEnabled()) {
+                accelSet = RtOverlayPipelines.accelStructureSet(
+                        ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "block outline");
+                outlineSpec.descriptorSetLayout(accelSet.layout);
+            }
+            pipeline = outlineSpec.build(ctx, "block outline");
             compositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "block outline composite");
             compositePipeline = new RtOverlayPipelines.Spec("overlay_fullscreen_triangle.vert.spv", "overlay_passthrough_composite.frag.spv")
                     .blend(RtOverlayPipelines.Blend.ALPHA)
@@ -238,11 +243,15 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctxRef, cmd, "block outline mask")) {
                 RtWorldOverlay.beginMsaaColorRendering(cmd, stack, msaaImage.view, resolvedMask.view, width, height);
                 VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
-                VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0,
-                        stack.longs(boundSet), null);
+                if (RtDeviceBringup.rayQueryEnabled()) {
+                    VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0,
+                            stack.longs(boundSet), null);
+                }
                 VK10.vkCmdBindVertexBuffers(cmd, 0, stack.longs(vbo.handle), stack.longs(0L));
                 float desiredWidthPx = LINE_WIDTH_PX_AT_REFERENCE * (height / REFERENCE_HEIGHT);
-                VK10.vkCmdSetLineWidth(cmd, Math.min(desiredWidthPx, RtDeviceBringup.maxLineWidth()));
+                float lineWidth = RtDeviceBringup.wideLinesEnabled()
+                        ? Math.min(desiredWidthPx, RtDeviceBringup.maxLineWidth()) : 1.0f;
+                VK10.vkCmdSetLineWidth(cmd, lineWidth);
                 ByteBuffer push = stack.malloc(PUSH_BYTES);
                 viewProj.get(0, push);
                 // Verts are already camera-relative (see prepare); camOffset is zero.

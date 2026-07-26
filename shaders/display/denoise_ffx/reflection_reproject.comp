@@ -1,23 +1,46 @@
-// FidelityFX Reflection Denoiser — temporal reproject (Caustica-hosted SPIR-V).
-// Lineage: AMD FFX Denoiser 1.2 reflections reproject (disocclusion, neighbourhood
-// clamp, thin-history variance boost). Operates on specular radiance only.
+// FidelityFX Reflection Denoiser — temporal reproject with depth hierarchy (Caustica-hosted).
+// Uses coarse depth mips for more stable disocclusion at grazing angles / large motion.
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(binding = 0, rgba16f) readonly  uniform image2D gReflection;  // raw specular
-layout(binding = 1, r32f)    readonly  uniform image2D gDepth;
+layout(binding = 0, rgba16f) readonly  uniform image2D gReflection;
+layout(binding = 1, r32f)    readonly  uniform image2D gDepth;       // mip0 full-res
 layout(binding = 2, rgba16f) readonly  uniform image2D gNormal;      // xyz normal, w roughness
-layout(binding = 3, rgba16f)  readonly  uniform image2D gMotion;      // prefer specular MV when bound
-layout(binding = 4, rgba16f) readonly  uniform image2D gHistory;     // rgb history, a = sample count
-layout(binding = 5, rgba16f) writeonly uniform image2D gOut;         // rgb reprojected, a = new count
+layout(binding = 3, rgba16f) readonly  uniform image2D gMotion;
+layout(binding = 4, rgba16f) readonly  uniform image2D gHistory;
+layout(binding = 5, rgba16f) writeonly uniform image2D gOut;
+// Depth hierarchy (half, quarter, eighth). May be 1x1 placeholders if unused.
+layout(binding = 6, r32f)    readonly  uniform image2D gDepthMip1;
+layout(binding = 7, r32f)    readonly  uniform image2D gDepthMip2;
+layout(binding = 8, r32f)    readonly  uniform image2D gDepthMip3;
 
 layout(push_constant) uniform Push {
     float invW;
     float invH;
     float depthThreshold;
-    float reset; // 1 = hard cut
+    float reset;
 } pc;
+
+float sampleDepthHierarchy(vec2 uv, float motionLenPx) {
+    // Larger motion / uncertainty → coarser mip (official uses full hierarchy).
+    float level = clamp(motionLenPx * 0.08, 0.0, 3.0);
+    ivec2 p0 = ivec2(uv * vec2(imageSize(gDepth)));
+    float d0 = imageLoad(gDepth, clamp(p0, ivec2(0), imageSize(gDepth) - 1)).r;
+    if (level < 0.5) return d0;
+
+    ivec2 p1 = ivec2(uv * vec2(imageSize(gDepthMip1)));
+    float d1 = imageLoad(gDepthMip1, clamp(p1, ivec2(0), max(imageSize(gDepthMip1) - 1, ivec2(0)))).r;
+    if (level < 1.5) return mix(d0, d1, clamp(level, 0.0, 1.0));
+
+    ivec2 p2 = ivec2(uv * vec2(imageSize(gDepthMip2)));
+    float d2 = imageLoad(gDepthMip2, clamp(p2, ivec2(0), max(imageSize(gDepthMip2) - 1, ivec2(0)))).r;
+    if (level < 2.5) return mix(d1, d2, clamp(level - 1.0, 0.0, 1.0));
+
+    ivec2 p3 = ivec2(uv * vec2(imageSize(gDepthMip3)));
+    float d3 = imageLoad(gDepthMip3, clamp(p3, ivec2(0), max(imageSize(gDepthMip3) - 1, ivec2(0)))).r;
+    return mix(d2, d3, clamp(level - 2.0, 0.0, 1.0));
+}
 
 void main() {
     ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
@@ -33,14 +56,15 @@ void main() {
     float rough = clamp(nPack.w, 0.0, 1.0);
 
     bool noSurface = (length(nPack.xyz) < 1e-4) || (curDepth <= 1e-6);
-    // Very rough diffuse-like: little specular energy — passthrough raw (often ~0).
     if (noSurface || pc.reset > 0.5 || rough > 0.95) {
         imageStore(gOut, pix, vec4(curSpec, 1.0));
         return;
     }
 
     vec2 motionPx = imageLoad(gMotion, pix).xy;
-    vec2 prevUv = (vec2(pix) + 0.5 - motionPx) * vec2(pc.invW, pc.invH);
+    float motionLen = length(motionPx);
+    // gMotion is previous - current in render pixels, so history is at current + motion.
+    vec2 prevUv = (vec2(pix) + 0.5 + motionPx) * vec2(pc.invW, pc.invH);
     bool offscreen = any(lessThan(prevUv, vec2(0.0))) || any(greaterThanEqual(prevUv, vec2(1.0)));
 
     vec3 histSpec = curSpec;
@@ -60,12 +84,18 @@ void main() {
         histSpec = mix(mix(h00.rgb, h10.rgb, f.x), mix(h01.rgb, h11.rgb, f.x), f.y);
         histCount = mix(mix(h00.a, h10.a, f.x), mix(h01.a, h11.a, f.x), f.y);
 
-        float histDepth = imageLoad(gDepth, c00).r;
-        float depthErr = abs(curDepth - histDepth) / max(curDepth, 1e-3);
+        // Full-res + hierarchy depth tests.
+        float histDepth0 = imageLoad(gDepth, c00).r;
+        float histDepthH = sampleDepthHierarchy(prevUv, motionLen);
+        float depthErr0 = abs(curDepth - histDepth0) / max(curDepth, 1e-3);
+        float depthErrH = abs(curDepth - histDepthH) / max(curDepth, 1e-3);
+        float depthErr = min(depthErr0, depthErrH);
+
         float ndv = abs(curN.z);
         float thresh = mix(pc.depthThreshold * 4.0, pc.depthThreshold, clamp(ndv, 0.0, 1.0));
-        // Glossy: tighter depth reject (ghosting is more visible).
-        thresh *= mix(0.5, 1.0, rough);
+        thresh *= mix(0.5, 1.0, rough); // glossy: tighter
+        // Large motion: slightly looser via hierarchy trust.
+        thresh *= mix(1.0, 1.35, clamp(motionLen * 0.02, 0.0, 1.0));
         if (depthErr > thresh) {
             histCount = 0.0;
             histSpec = curSpec;
@@ -77,29 +107,25 @@ void main() {
         }
     }
 
-    // 3x3 neighbourhood clamp in current specular (anti-ghost).
+    // 3x3 neighbourhood clamp (anti-ghost) with roughness-expanded box.
     vec3 nMin = curSpec;
     vec3 nMax = curSpec;
-    vec3 nSum = vec3(0.0);
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
-            ivec2 q = clamp(pix + ivec2(dx, dy), ivec2(0), size - 1);
-            vec3 s = imageLoad(gReflection, q).rgb;
+            vec3 s = imageLoad(gReflection, clamp(pix + ivec2(dx, dy), ivec2(0), size - 1)).rgb;
             nMin = min(nMin, s);
             nMax = max(nMax, s);
-            nSum += s;
         }
     }
-    // Expand box slightly on rough surfaces (more variance expected).
-    vec3 expand = vec3(0.05 + rough * 0.15);
+    float expand = mix(0.02, 0.12, rough);
     histSpec = clamp(histSpec, nMin - expand, nMax + expand);
 
     float alpha = histCount < 1.0 ? 1.0 : mix(0.25, 0.08, clamp(histCount / 16.0, 0.0, 1.0));
-    // Mirror-like: more temporal; rough glossy: more current.
-    alpha = mix(alpha * 0.7, min(alpha * 1.4, 0.9), rough);
+    // Mirror-like: more temporal trust; rough: more current.
+    alpha = mix(alpha, min(alpha + 0.1, 0.45), rough);
+
     vec3 outSpec = mix(histSpec, curSpec, alpha);
-    // Firefly squash on specular spikes.
-    outSpec = min(outSpec, vec3(32.0));
+    outSpec = min(max(outSpec, vec3(0.0)), vec3(32.0));
     float outCount = min(histCount + 1.0, 64.0);
-    imageStore(gOut, pix, vec4(max(outSpec, vec3(0.0)), outCount));
+    imageStore(gOut, pix, vec4(outSpec, outCount));
 }

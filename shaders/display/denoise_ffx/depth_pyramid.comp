@@ -1,0 +1,37 @@
+// Depth hierarchy builder for FidelityFX Reflection Denoiser (Caustica-hosted).
+// One mip step: 2x2 min-depth downsample (reversed-Z: min = farther / more conservative
+// for disocclusion tests when sampling coarser levels).
+// Official FFX uses SPD full mip chain; we build a short pyramid of half-res images.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, r32f) readonly  uniform image2D gSrc;
+layout(binding = 1, r32f) writeonly uniform image2D gDst;
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dstSize = imageSize(gDst);
+    if (dst.x >= dstSize.x || dst.y >= dstSize.y) {
+        return;
+    }
+    ivec2 srcSize = imageSize(gSrc);
+    ivec2 s0 = dst * 2;
+    // 2x2 (clamp edges)
+    float d00 = imageLoad(gSrc, clamp(s0 + ivec2(0, 0), ivec2(0), srcSize - 1)).r;
+    float d10 = imageLoad(gSrc, clamp(s0 + ivec2(1, 0), ivec2(0), srcSize - 1)).r;
+    float d01 = imageLoad(gSrc, clamp(s0 + ivec2(0, 1), ivec2(0), srcSize - 1)).r;
+    float d11 = imageLoad(gSrc, clamp(s0 + ivec2(1, 1), ivec2(0), srcSize - 1)).r;
+    // Min of valid depths. Treat ~0 as empty (sky) and prefer real surface depths.
+    float m = 1e30;
+    int n = 0;
+    float vals[4] = float[4](d00, d10, d01, d11);
+    for (int i = 0; i < 4; i++) {
+        if (vals[i] > 1e-6) {
+            m = min(m, vals[i]);
+            n++;
+        }
+    }
+    float outD = (n > 0) ? m : 0.0;
+    imageStore(gDst, dst, vec4(outD, 0.0, 0.0, 0.0));
+}

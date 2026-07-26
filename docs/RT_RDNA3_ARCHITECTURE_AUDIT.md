@@ -1,0 +1,96 @@
+# RT / RDNA 3 architecture audit
+
+## Decision
+
+Do not rewrite the renderer wholesale. The core is already based on cross-vendor Vulkan KHR ray tracing,
+has a no-SER shader variant, separates denoise/upscale backends, and has useful guide/split-lighting data.
+The highest-risk failures come from implicit resource and descriptor contracts, not from an NVIDIA-only
+ray-tracing algorithm. Replace those contracts incrementally, then profile the resulting RDNA 3 path.
+
+## Black-screen findings fixed in this change
+
+1. The new `B10G11R11` beauty chain uses `r11f_g11f_b10f` storage images, but device creation did not
+   enable `shaderStorageImageExtendedFormats`. Format capability is not enough; the feature must be enabled.
+2. `GUIDE_COUNT=23` occupies set 0 bindings 3 through 25, while the material sampler was also declared at
+   binding 25. Java creates material/sky bindings 26, 27, and 28. The shader ABI is now aligned to those values.
+3. FFX spatial ping-pong, its depth pyramid, and the bilateral residual repeatedly updated one descriptor set
+   after recording earlier dispatches. Descriptor contents are execution-time state, not snapshots. Distinct
+   binding tuples now use distinct sets and stable bindings are not rewritten every frame.
+4. Reverse-infinite FSR2 was dispatched with `cameraFar=0`. The bundled SDK still uses min/max of near/far
+   to derive its reverse-Z scale, so zero collapses that scale. The caller now supplies a positive far sentinel.
+5. The FSR blackout guard performed the same 4x4 global probe in every output invocation. It now performs a
+   two-load per-pixel fail-open, avoiding tens of millions of redundant image reads at 1080p.
+6. CAS recorded a sharpen dispatch, rewrote that dispatch's descriptor set, and then recorded a copy-back
+   dispatch. It now records one immutable binding tuple and performs an explicitly synchronized image copy.
+7. TAAU and the four-slot temporal accumulator rotated history images through one descriptor set. Each history
+   direction/state now owns a stable set, so a CPU frame cannot rewrite descriptors still used by RADV.
+8. Temporal-history initialization either omitted the clear entirely (TAAU) or omitted transfer-to-compute
+   visibility after the clear. Both histories are now zeroed and synchronized before their first shader use.
+
+## What should be refactored
+
+### P0: generate the shader/host ABI
+
+`RtComposite` owns 23 positional guide slots while `RtPipeline` separately derives following sampler bindings
+and GLSL repeats raw integers. The binding-25 collision demonstrates that comments/tests are not a sufficient
+ABI. Define one binding schema and generate both Java constants and a GLSL include. Add a validation test that
+checks descriptor type, stage mask, format, and binding for every resource.
+
+### P1: split the render graph out of `RtComposite`
+
+`RtComposite.java` is about 2,800 lines and records trace, denoise, upscale, exposure, display mapping, copies,
+HDR, frame generation, and overlays in one method/lifetime owner. Introduce explicit passes with declared
+inputs, outputs, queue, and access state. This makes barriers derivable and lets failures fall back at a pass
+boundary instead of corrupting the final plate.
+
+Suggested boundaries:
+
+`Trace -> Split lighting/guides -> Denoise -> Upscale -> Exposure -> Tone map -> Present`
+
+### P1: make descriptors frame-safe by construction
+
+The immediate FFX, CAS, TAAU, temporal-accumulation, transparent-material, hybrid-NRD, and firefly paths have
+been audited. Multi-pass/history directions use distinct sets; stable single-pass bindings are cached rather
+than rewritten every frame. Apply the same rule to new passes: prefer immutable per-size descriptor sets or a
+frames-in-flight ring. Do not depend on a driver copying descriptors during command recording.
+
+### P1: replace fragment VRS with an RT sample-budget map
+
+`RtVariableRateShading` generates a `VK_KHR_fragment_shading_rate` attachment, but the compositor records a
+ray-tracing dispatch rather than fragment shading and never attaches the image to dynamic rendering. The path
+is currently disabled, and enabling it would add compute work without reducing traced rays. Keep it disabled.
+If profiling shows coherent low-detail regions, replace it with a storage-image ray-budget map consumed by
+`world.rgen` to select ray count or reconstruction rate. Such a scheme needs temporal stability, edge-safe
+reconstruction, and an unbiased reference mode; fragment-VRS rate encodings are not an RT optimization.
+
+### P2: real async compute only after graph extraction
+
+The current compositor explicitly keeps denoise on the graphics queue; the `dispatchAsync` surface does not
+split submissions. Once pass dependencies are explicit, overlap denoise/upscale compute with independent
+graphics/streaming work using timeline semaphores. Adding a second queue before that would increase ownership
+and synchronization risk without proving overlap.
+
+### P2: enforce a portable Linux native ABI
+
+The bundled x86-64 FSR2 and denoiser ELF files export every symbol required by the Java FFM bindings and only
+depend on Vulkan plus the standard C/GCC runtimes. Their current symbol-version floor is nevertheless GLIBC
+2.38 (`__isoc23_strtoul`); FSR2 also imports APIs introduced in GLIBC 2.36 and earlier. This is suitable for
+the current NixOS/new-distro test target, but not Ubuntu 22.04 or an older Steam runtime. The denoiser native is
+only an optional probe—the SPIR-V denoiser remains active if it cannot load—but FSR2 needs its native library.
+For a generally distributable build, compile the natives in the oldest supported Linux sysroot/container and
+make CI reject ELF symbol versions newer than that declared baseline.
+
+### P2: profile-guided RDNA 3 specialization
+
+Keep the portable no-SER path as the baseline. Profile wave32/wave64 occupancy, register pressure in the
+2,600-line raygen shader, divergence at material/bounce branches, and bandwidth from reservoir/guide images.
+Only then add RDNA-specific shader variants (for example subgroup-size control or smaller reservoir formats).
+The packed HDR plate is a reasonable bandwidth optimization once its required feature is enabled; do not pack
+signed motion, normals, hit distance, or multi-field histories merely to reduce bytes.
+
+## Rewrite threshold
+
+A full rewrite becomes justified only if the pass graph cannot be extracted without changing observable
+rendering, or profiling shows the monolithic raygen design itself dominates RDNA 3 occupancy after descriptor,
+synchronization, and bandwidth fixes. Current evidence does not meet that threshold. The recommended course is
+an ABI/render-graph refactor that preserves the existing KHR tracer and replaces one pass boundary at a time.

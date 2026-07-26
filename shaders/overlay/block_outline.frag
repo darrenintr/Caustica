@@ -1,10 +1,12 @@
 #version 460
+#ifndef CAUSTICA_RAY_QUERY_NONE
 #extension GL_EXT_ray_query : require
+#endif
 
 // Per-fragment occlusion for the targeted block's wireframe edges: an inline rayQueryEXT test against the
 // same TLAS the primary trace uses, from the camera to this fragment's world position. Occluded pixels
 // (anything opaque in front of the edge, including the block's own near faces) are discarded — no depth
-// buffer involved, since RT's own gDepth is at DLSS-RR's internal render resolution, not this pass's
+// buffer involved, since RT's own gDepth is at the internal render resolution, not this pass's
 // full display resolution (see RtWorldOverlay).
 
 layout(push_constant) uniform Push {
@@ -13,7 +15,9 @@ layout(push_constant) uniform Push {
     vec4 color;       // 80, 16B
 } pc;
 
+#ifndef CAUSTICA_RAY_QUERY_NONE
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+#endif
 
 layout(location = 0) in vec3 vCamRel; // this fragment's position relative to the camera
 
@@ -36,6 +40,7 @@ void main() {
     vec3 dir = vCamRel / dist;
     float tMax = max(dist - 0.01, 0.001);
 
+#ifndef CAUSTICA_RAY_QUERY_NONE
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
             CULL_PRIMARY, pc.camOffset, 0.001, dir, tMax);
@@ -44,5 +49,6 @@ void main() {
     if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
         discard;
     }
+#endif
     outColor = pc.color;
 }

@@ -12,6 +12,7 @@ import org.lwjgl.util.vma.VmaAllocationInfo;
 import org.lwjgl.util.vma.VmaAllocatorCreateInfo;
 import org.lwjgl.util.vma.VmaVulkanFunctions;
 import org.lwjgl.vulkan.VK10;
+import org.lwjgl.vulkan.VK11;
 import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VkBufferCreateInfo;
 import org.lwjgl.vulkan.VkBufferDeviceAddressInfo;
@@ -21,14 +22,18 @@ import org.lwjgl.vulkan.VkCommandBufferBeginInfo;
 import org.lwjgl.vulkan.VkCommandPoolCreateInfo;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkFenceCreateInfo;
+import org.lwjgl.vulkan.VkFormatProperties;
 import org.lwjgl.vulkan.VkImageCreateInfo;
+import org.lwjgl.vulkan.VkImageFormatProperties;
 import org.lwjgl.vulkan.VkImageMemoryBarrier;
 import org.lwjgl.vulkan.VkImageViewCreateInfo;
 import org.lwjgl.vulkan.VkPhysicalDevice;
+import org.lwjgl.vulkan.VkPhysicalDeviceAccelerationStructurePropertiesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingPipelinePropertiesKHR;
 import org.lwjgl.vulkan.VkSubmitInfo;
 
+import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
 
@@ -52,15 +57,27 @@ public final class RtContext {
     private final VulkanQueue graphicsQueue;
     private final int shaderGroupHandleSize;
     private final int shaderGroupBaseAlignment;
+    private final int shaderGroupHandleAlignment;
+    private final int maxShaderGroupStride;
+    private final int accelerationStructureScratchAlignment;
+    private final long perStageCombinedImageSamplerLimit;
+    private final long descriptorSetCombinedImageSamplerLimit;
     private long commandPool;
 
-    private RtContext(VulkanDevice device, long vma, int handleSize, int baseAlign) {
+    private RtContext(VulkanDevice device, long vma, int handleSize, int baseAlign, int handleAlign,
+                      int maxSbtStride, int scratchAlign, long perStageCombinedImageSamplerLimit,
+                      long descriptorSetCombinedImageSamplerLimit) {
         this.device = device;
         this.vk = device.vkDevice();
         this.vma = vma;
         this.graphicsQueue = device.graphicsQueue();
         this.shaderGroupHandleSize = handleSize;
         this.shaderGroupBaseAlignment = baseAlign;
+        this.shaderGroupHandleAlignment = handleAlign;
+        this.maxShaderGroupStride = maxSbtStride;
+        this.accelerationStructureScratchAlignment = scratchAlign;
+        this.perStageCombinedImageSamplerLimit = perStageCombinedImageSamplerLimit;
+        this.descriptorSetCombinedImageSamplerLimit = descriptorSetCombinedImageSamplerLimit;
     }
 
     /** The RT context for the current Vulkan device, or null if RT/Vulkan isn't available. */
@@ -102,14 +119,44 @@ public final class RtContext {
             PointerBuffer pVma = stack.mallocPointer(1);
             check(Vma.vmaCreateAllocator(aci, pVma), "vmaCreateAllocator(RT)");
 
-            // RT pipeline limits for SBT layout.
+            // RT pipeline limits for SBT layout + AS scratch alignment + ordinary descriptor ceilings.
             VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps = VkPhysicalDeviceRayTracingPipelinePropertiesKHR
                     .calloc(stack).sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR);
+            VkPhysicalDeviceAccelerationStructurePropertiesKHR asProps =
+                    VkPhysicalDeviceAccelerationStructurePropertiesKHR.calloc(stack).sType$Default();
+            rtProps.pNext(asProps.address());
             VkPhysicalDeviceProperties2 props2 = VkPhysicalDeviceProperties2.calloc(stack).sType$Default().pNext(rtProps.address());
             VK12.vkGetPhysicalDeviceProperties2(phys, props2);
 
-            return new RtContext(device, pVma.get(0), rtProps.shaderGroupHandleSize(), rtProps.shaderGroupBaseAlignment());
+            var limits = props2.properties().limits();
+            long perStageCombinedImageSamplerLimit = minUnsigned(
+                    limits.maxPerStageDescriptorSamplers(),
+                    limits.maxPerStageDescriptorSampledImages());
+            long descriptorSetCombinedImageSamplerLimit = minUnsigned(
+                    limits.maxDescriptorSetSamplers(),
+                    limits.maxDescriptorSetSampledImages());
+
+            CausticaMod.LOGGER.info(
+                    "RT portability limits: SBT handleAlignment={}, baseAlignment={}, maxStride={}; "
+                            + "AS scratchAlignment={}; combined-sampler limits per-stage={}, descriptor-set={}",
+                    rtProps.shaderGroupHandleAlignment(), rtProps.shaderGroupBaseAlignment(),
+                    Integer.toUnsignedLong(rtProps.maxShaderGroupStride()),
+                    asProps.minAccelerationStructureScratchOffsetAlignment(), perStageCombinedImageSamplerLimit,
+                    descriptorSetCombinedImageSamplerLimit);
+
+            return new RtContext(device, pVma.get(0), rtProps.shaderGroupHandleSize(), rtProps.shaderGroupBaseAlignment(),
+                    rtProps.shaderGroupHandleAlignment(), rtProps.maxShaderGroupStride(),
+                    asProps.minAccelerationStructureScratchOffsetAlignment(), perStageCombinedImageSamplerLimit,
+                    descriptorSetCombinedImageSamplerLimit);
         }
+    }
+
+    private static long minUnsigned(int... values) {
+        long result = Long.MAX_VALUE;
+        for (int value : values) {
+            result = Math.min(result, Integer.toUnsignedLong(value));
+        }
+        return result;
     }
 
     public VulkanDevice device() {
@@ -132,6 +179,36 @@ public final class RtContext {
         return shaderGroupBaseAlignment;
     }
 
+    public int shaderGroupHandleAlignment() {
+        return shaderGroupHandleAlignment;
+    }
+
+    public int maxShaderGroupStride() {
+        return maxShaderGroupStride;
+    }
+
+    /** Ordinary-descriptor combined-image-sampler ceiling for any one shader stage. */
+    public long perStageCombinedImageSamplerLimit() {
+        return perStageCombinedImageSamplerLimit;
+    }
+
+    /** Ordinary-descriptor combined-image-sampler ceiling across the whole pipeline layout. */
+    public long descriptorSetCombinedImageSamplerLimit() {
+        return descriptorSetCombinedImageSamplerLimit;
+    }
+
+    public int accelerationStructureScratchAlignment() {
+        return accelerationStructureScratchAlignment;
+    }
+
+    /**
+     * Minimum device-address alignment for buffers that hit shaders / raygen load via
+     * {@code buffer_reference}. SPIR-V {@code buffer_reference_align = 16} (WorldPush, Prims) and
+     * the stricter AMD SQC path both require the base BDA itself to be 16B-aligned; VMA AUTO
+     * suballocation does not guarantee that without {@code vmaCreateBufferWithAlignment}.
+     */
+    public static final long BDA_REF_ALIGN = 16L;
+
     /** Create a VMA buffer; {@code SHADER_DEVICE_ADDRESS} is always added so it has a device address. */
     public RtBuffer createBuffer(long size, int usage, boolean hostVisible) {
         return createBuffer(size, usage, hostVisible, "buffer " + size + "B");
@@ -139,25 +216,159 @@ public final class RtContext {
 
     /** Create a VMA buffer; {@code SHADER_DEVICE_ADDRESS} is always added so it has a device address. */
     public RtBuffer createBuffer(long size, int usage, boolean hostVisible, String label) {
+        return createBuffer(size, usage, hostVisible, label, 0L);
+    }
+
+    /** Create a buffer whose returned device address is explicitly aligned for its consumer. */
+    public RtBuffer createAlignedBuffer(long size, int usage, boolean hostVisible, String label, long addressAlignment) {
+        return createBuffer(size, usage, hostVisible, label, addressAlignment);
+    }
+
+    /**
+     * Device-local (or host-visible) buffer whose device address is aligned for {@code buffer_reference}
+     * loads ({@link #BDA_REF_ALIGN}). Prefer this over {@link #createBuffer} for any buffer whose BDA is
+     * written into a section/entity table, WorldPush, or push-constant table address.
+     */
+    public RtBuffer createBdaBuffer(long size, int usage, boolean hostVisible, String label) {
+        return createAlignedBuffer(size, usage, hostVisible, label, BDA_REF_ALIGN);
+    }
+
+    private RtBuffer createBuffer(long size, int usage, boolean hostVisible, String label, long addressAlignment) {
+        if (addressAlignment < 0L
+                || (addressAlignment != 0L && (addressAlignment & (addressAlignment - 1L)) != 0L)) {
+            throw new IllegalArgumentException("Device-address alignment must be zero or a positive power of two: "
+                    + addressAlignment);
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkBufferCreateInfo bci = VkBufferCreateInfo.calloc(stack).sType$Default()
                     .size(size).usage(usage | VK12.VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
                     .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE);
             VmaAllocationCreateInfo aci = VmaAllocationCreateInfo.calloc(stack).usage(Vma.VMA_MEMORY_USAGE_AUTO);
             if (hostVisible) {
-                aci.flags(Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT);
+                // Sequential-write + mapped is the common path for one-shot staging uploads. AS build-input
+                // geometry is intentionally NOT left host-visible on RADV — see {@link #uploadDeviceLocal}.
+                aci.flags(Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+                        | Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT);
             }
             LongBuffer pBuf = stack.mallocLong(1);
             PointerBuffer pAlloc = stack.mallocPointer(1);
             VmaAllocationInfo info = VmaAllocationInfo.calloc(stack);
-            check(Vma.vmaCreateBuffer(vma, bci, aci, pBuf, pAlloc, info), "vmaCreateBuffer");
+            int createResult = addressAlignment == 0L
+                    ? Vma.vmaCreateBuffer(vma, bci, aci, pBuf, pAlloc, info)
+                    : Vma.vmaCreateBufferWithAlignment(vma, bci, aci, addressAlignment, pBuf, pAlloc, info);
+            check(createResult, addressAlignment == 0L ? "vmaCreateBuffer" : "vmaCreateBufferWithAlignment");
             long handle = pBuf.get(0);
             RtDebugLabels.nameBuffer(this, handle, label);
             VkBufferDeviceAddressInfo bdai = VkBufferDeviceAddressInfo.calloc(stack).sType$Default().buffer(handle);
             long address = VK12.vkGetBufferDeviceAddress(vk, bdai);
-            return new RtBuffer(vma, handle, pAlloc.get(0), address, hostVisible ? info.pMappedData() : 0L, size, usage, hostVisible);
+            if (address == 0L) {
+                throw new IllegalStateException(label + " returned a null device address");
+            }
+            if (addressAlignment != 0L && (address & (addressAlignment - 1L)) != 0L) {
+                throw new IllegalStateException(label + " device address 0x"
+                        + Long.toUnsignedString(address, 16) + " is not aligned to " + addressAlignment);
+            }
+            return new RtBuffer(vma, handle, pAlloc.get(0), address, hostVisible ? info.pMappedData() : 0L,
+                    size, usage, hostVisible, label);
         }
     }
+
+    /**
+     * Create a pure device-local buffer and fill it from a host pointer via a one-shot staging copy.
+     * Used for acceleration-structure geometry inputs on RADV: the AS builder GPUVM-faults while following
+     * BDAs into host-visible memory (HOST_CACHED GTT <em>and</em> BAR) on Mesa 26.1 + NAVI33, so geometry
+     * must live in non-host-visible VRAM before {@code vkCmdBuildAccelerationStructuresKHR}.
+     */
+    public RtBuffer uploadDeviceLocal(long size, int usage, long hostPtr, int hostBytes, String label) {
+        // Default to buffer_reference-safe alignment: terrain prim/uv/pos and SBT consumers all load via BDA.
+        return uploadDeviceLocal(size, usage, hostPtr, hostBytes, label, BDA_REF_ALIGN);
+    }
+
+    public RtBuffer uploadDeviceLocal(long size, int usage, long hostPtr, int hostBytes, String label,
+                                      long addressAlignment) {
+        if (hostBytes < 0 || (long) hostBytes > size) {
+            throw new IllegalArgumentException(label + " host payload " + hostBytes + "B exceeds buffer " + size + "B");
+        }
+        if (hostBytes > 0 && hostPtr == 0L) {
+            throw new IllegalArgumentException(label + " host pointer is null");
+        }
+        int deviceUsage = usage | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        // addressAlignment <= 0 falls back to BDA_REF_ALIGN so accidental 0 never reintroduces unaligned BDAs.
+        long align = addressAlignment > 0L ? addressAlignment : BDA_REF_ALIGN;
+        RtBuffer device = createAlignedBuffer(size, deviceUsage, false, label, align);
+        if (hostBytes == 0) {
+            return device;
+        }
+        RtBuffer staging = createBuffer(hostBytes, VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, label + " staging");
+        try {
+            org.lwjgl.system.MemoryUtil.memCopy(hostPtr, staging.mapped, hostBytes);
+            staging.flush();
+            submitSync(cmd -> {
+                try (MemoryStack stack = MemoryStack.stackPush()) {
+                    org.lwjgl.vulkan.VkBufferCopy.Buffer region = org.lwjgl.vulkan.VkBufferCopy.calloc(1, stack)
+                            .srcOffset(0L).dstOffset(0L).size(hostBytes);
+                    VK10.vkCmdCopyBuffer(cmd, staging.handle, device.handle, region);
+                    // Make the transfer write visible to AS builds and shader / SBT reads of this BDA.
+                    org.lwjgl.vulkan.VkBufferMemoryBarrier.Buffer barrier =
+                            org.lwjgl.vulkan.VkBufferMemoryBarrier.calloc(1, stack).sType$Default()
+                                    .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                                    .dstAccessMask(org.lwjgl.vulkan.KHRAccelerationStructure
+                                            .VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                                            | VK10.VK_ACCESS_SHADER_READ_BIT
+                                            | VK10.VK_ACCESS_TRANSFER_READ_BIT)
+                                    .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                                    .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                                    .buffer(device.handle)
+                                    .offset(0L)
+                                    .size(hostBytes);
+                    VK10.vkCmdPipelineBarrier(cmd,
+                            VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            org.lwjgl.vulkan.KHRAccelerationStructure
+                                    .VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+                                    | org.lwjgl.vulkan.KHRRayTracingPipeline
+                                    .VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                            0, null, barrier, null);
+                }
+            });
+        } finally {
+            staging.destroy();
+        }
+        return device;
+    }
+
+    /** VMA memory type index of an allocation (for RADV diagnostics). */
+    public int memoryTypeOf(RtBuffer buffer) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VmaAllocationInfo info = VmaAllocationInfo.calloc(stack);
+            Vma.vmaGetAllocationInfo(vma, buffer.allocation, info);
+            return info.memoryType();
+        }
+    }
+
+    /**
+     * Make prior host writes (persistent-mapped buffers, SBT, TLAS instances, section table) visible
+     * to a later GPU stage. RADV does not always insert this for HOST_COHERENT memory on the RT pipe.
+     */
+    public static void hostWriteBarrier(org.lwjgl.vulkan.VkCommandBuffer cmd, int dstStageMask, int dstAccessMask) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            org.lwjgl.vulkan.VkMemoryBarrier.Buffer mem = org.lwjgl.vulkan.VkMemoryBarrier.calloc(1, stack)
+                    .sType$Default()
+                    .srcAccessMask(VK10.VK_ACCESS_HOST_WRITE_BIT)
+                    .dstAccessMask(dstAccessMask);
+            VK10.vkCmdPipelineBarrier(cmd,
+                    VK10.VK_PIPELINE_STAGE_HOST_BIT,
+                    dstStageMask,
+                    0, mem, null, null);
+        }
+    }
+
+    /**
+     * Packed 32-bit unsigned HDR for pure RGB radiance plates (beauty / firefly / denoise out /
+     * temporal accum visible). Half the bandwidth of RGBA16F on the RX 7600's narrow bus; no alpha
+     * channel, so anything that stores signed data or hitDist/depth in .a must stay RGBA16F.
+     * GLSL layout qualifier: {@code r11f_g11f_b10f}.
+     */
+    public static final int HDR_RADIANCE_FORMAT = VK10.VK_FORMAT_B10G11R11_UFLOAT_PACK32;
 
     /** Create an R8G8B8A8_UNORM storage image (STORAGE + TRANSFER_SRC/DST) already transitioned to GENERAL. */
     public RtImage createStorageImage(int width, int height) {
@@ -166,9 +377,9 @@ public final class RtContext {
 
     /**
      * Create a storage image of the given format (STORAGE + TRANSFER_SRC/DST), transitioned to GENERAL.
-     * The RT trace target uses an HDR float format (R16G16B16A16_SFLOAT) so radiance values above 1 are
-     * preserved for the tonemap seam; the world-target copy stays R8G8B8A8 to match vanilla's LDR target
-     * for the vkCmdCopyImage round-trip (copy requires texel-size-compatible formats).
+     * Pure radiance plates use {@link #HDR_RADIANCE_FORMAT} (B10G11R11_UFLOAT, 32bpp); signed guides
+     * (normal/motion) and multi-channel packs stay R16G16B16A16_SFLOAT. The world-target copy stays
+     * R8G8B8A8 to match vanilla's LDR target for the vkCmdCopyImage round-trip.
      */
     public RtImage createStorageImage(int width, int height, int format) {
         return createStorageImage(width, height, format, "storage image " + width + "x" + height);
@@ -185,6 +396,9 @@ public final class RtContext {
      * see {@code VUID-VkRenderingInfo-colorAttachmentCount-06087}).
      */
     public RtImage createStorageImage(int width, int height, int format, String label, int extraUsage) {
+        int usage = VK10.VK_IMAGE_USAGE_STORAGE_BIT | VK10.VK_IMAGE_USAGE_SAMPLED_BIT
+                | VK10.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK10.VK_IMAGE_USAGE_TRANSFER_DST_BIT | extraUsage;
+        requireStorageImageSupport(width, height, format, usage, label);
         long image;
         long allocation;
         long view;
@@ -192,10 +406,9 @@ public final class RtContext {
             VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default()
                     .imageType(VK10.VK_IMAGE_TYPE_2D).format(format)
                     .mipLevels(1).arrayLayers(1).samples(VK10.VK_SAMPLE_COUNT_1_BIT).tiling(VK10.VK_IMAGE_TILING_OPTIMAL)
-                    // SAMPLED so DLSS-RR can read these as input textures (color + guide buffers);
+                    // SAMPLED so denoise/upscaler providers can read color and guide buffers;
                     // STORAGE for raygen/compute writes; TRANSFER for the world-target copies.
-                    .usage(VK10.VK_IMAGE_USAGE_STORAGE_BIT | VK10.VK_IMAGE_USAGE_SAMPLED_BIT
-                            | VK10.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK10.VK_IMAGE_USAGE_TRANSFER_DST_BIT | extraUsage)
+                    .usage(usage)
                     .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED);
             ici.extent().set(width, height, 1);
             VmaAllocationCreateInfo iaci = VmaAllocationCreateInfo.calloc(stack).usage(Vma.VMA_MEMORY_USAGE_AUTO);
@@ -229,6 +442,42 @@ public final class RtContext {
             }
         });
         return new RtImage(vma, vk, image, allocation, view, width, height);
+    }
+
+    private void requireStorageImageSupport(int width, int height, int format, int usage, String label) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkFormatProperties formatProperties = VkFormatProperties.calloc(stack);
+            VK10.vkGetPhysicalDeviceFormatProperties(vk.getPhysicalDevice(), format, formatProperties);
+            int required = VK10.VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK10.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+            if ((usage & VK10.VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0) {
+                required |= VK11.VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+            }
+            if ((usage & VK10.VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0) {
+                required |= VK11.VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+            }
+            if ((usage & VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0) {
+                required |= VK10.VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+            }
+            int supported = formatProperties.optimalTilingFeatures();
+            if ((supported & required) != required) {
+                throw new UnsupportedOperationException(label + " format " + format
+                        + " lacks optimal-tiling features 0x" + Integer.toHexString(required & ~supported));
+            }
+
+            VkImageFormatProperties imageProperties = VkImageFormatProperties.calloc(stack);
+            int result = VK10.vkGetPhysicalDeviceImageFormatProperties(vk.getPhysicalDevice(), format,
+                    VK10.VK_IMAGE_TYPE_2D, VK10.VK_IMAGE_TILING_OPTIMAL, usage, 0, imageProperties);
+            if (result == VK10.VK_ERROR_FORMAT_NOT_SUPPORTED) {
+                throw new UnsupportedOperationException(label + " format " + format
+                        + " does not support image usage 0x" + Integer.toHexString(usage));
+            }
+            check(result, "vkGetPhysicalDeviceImageFormatProperties");
+            if (width > imageProperties.maxExtent().width() || height > imageProperties.maxExtent().height()) {
+                throw new UnsupportedOperationException(label + " extent " + width + "x" + height
+                        + " exceeds format maximum " + imageProperties.maxExtent().width() + "x"
+                        + imageProperties.maxExtent().height());
+            }
+        }
     }
 
     /**
@@ -400,6 +649,9 @@ public final class RtContext {
 
     public static void check(int rc, String what) {
         if (rc != VK10.VK_SUCCESS) {
+            if (rc == VK10.VK_ERROR_DEVICE_LOST && instance != null) {
+                VulkanDiagnostics.reportDeviceLost(instance.device, what);
+            }
             throw new IllegalStateException(what + " failed: " + rc);
         }
     }

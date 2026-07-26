@@ -19,6 +19,7 @@ public final class Fsr2ClassicLibrary {
     private final MethodHandle create;
     private final MethodHandle destroy;
     private final MethodHandle dispatch;
+    private final MethodHandle dispatchV2;
     private final MethodHandle upscaleRatio;
     private final MethodHandle jitterPhase;
     private final MethodHandle jitterOffset;
@@ -47,6 +48,23 @@ public final class Fsr2ClassicLibrary {
                         ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
                         ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
                         ValueLayout.JAVA_INT));
+        // v2: adds reactiveImg, reactiveView. Optional — older SOs (probe < 20302) lack it.
+        // Caller must check the probe low-digit before invoking.
+        this.dispatchV2 = lookup.find("caustica_ffx_fsr2_dispatch_v2").map(addr ->
+                LINKER.downcallHandle(addr,
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
+                                ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                                ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                                ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                                ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                                ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                                ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+                                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
+                                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
+                                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
+                                ValueLayout.JAVA_INT)))
+                .orElse(null);
         this.upscaleRatio = req(lookup, "caustica_ffx_fsr2_get_upscale_ratio",
                 FunctionDescriptor.of(ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_INT));
         this.jitterPhase = req(lookup, "caustica_ffx_fsr2_get_jitter_phase_count",
@@ -102,6 +120,38 @@ public final class Fsr2ClassicLibrary {
         try {
             return (int) dispatch.invokeExact(ctx, cmd,
                     colorImg, colorView, depthImg, depthView, mvImg, mvView, outImg, outView,
+                    rw, rh, jx, jy, dtMs, preExposure, camNear, camFar, fovY, reset);
+        } catch (Throwable t) {
+            throw new IllegalStateException(t);
+        }
+    }
+
+    /** True if the loaded SO exports caustica_ffx_fsr2_dispatch_v2 (reactive-mask ABI). */
+    public boolean hasV2Dispatch() {
+        return dispatchV2 != null;
+    }
+
+    /**
+     * v2 dispatch: adds reactive-mask image/view (R32F, render res).
+     * Caller must check hasV2Dispatch() first; passing reactive=0 disables the
+     * mask (FSR2 behaves like v1).
+     */
+    public int dispatchV2(MemorySegment ctx, long cmd,
+                          long colorImg, long colorView,
+                          long depthImg, long depthView,
+                          long mvImg, long mvView,
+                          long outImg, long outView,
+                          long reactiveImg, long reactiveView,
+                          int rw, int rh,
+                          float jx, float jy, float dtMs, float preExposure,
+                          float camNear, float camFar, float fovY, int reset) {
+        if (dispatchV2 == null) {
+            return -200; // sentinel: caller falls back to v1 dispatch or quarantine
+        }
+        try {
+            return (int) dispatchV2.invokeExact(ctx, cmd,
+                    colorImg, colorView, depthImg, depthView, mvImg, mvView, outImg, outView,
+                    reactiveImg, reactiveView,
                     rw, rh, jx, jy, dtMs, preExposure, camNear, camFar, fovY, reset);
         } catch (Throwable t) {
             throw new IllegalStateException(t);

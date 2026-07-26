@@ -1,7 +1,7 @@
 package dev.comfyfluffy.caustica.upscale;
 
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
-import dev.comfyfluffy.caustica.upscale.UpscalerSelector.Mode;
+import dev.comfyfluffy.caustica.rt.plate.RtPlateBridge;
 import org.joml.Matrix4fc;
 
 /**
@@ -19,8 +19,69 @@ import org.joml.Matrix4fc;
  */
 public interface Upscaler {
 
-    /** What this upscaler is. */
-    Mode mode();
+    /** Stable provider identifier used by diagnostics and capability routing. */
+    String id();
+
+    /** Human-readable provider name used in logs and overlays. */
+    default String displayName() {
+        return id();
+    }
+
+    /** Whether this provider owns temporal reconstruction/history at the upscale stage. */
+    default boolean performsTemporalReconstruction() {
+        return false;
+    }
+
+    /** Whether this provider intentionally delegates output to the renderer's fallback blit. */
+    default boolean isPassThrough() {
+        return false;
+    }
+
+    /** Required Vulkan format for the render-resolution color plate. */
+    default int inputColorFormat(int rawBeautyFormat) {
+        return rawBeautyFormat;
+    }
+
+    /** Vulkan format produced by the provider before bridge output adaptation. */
+    default int outputColorFormat(int rawBeautyFormat) {
+        return inputColorFormat(rawBeautyFormat);
+    }
+
+    /**
+     * Format the provider can deliver to the renderer's display-side plate. Most
+     * providers write the raw beauty format; HDR-aware adapters may keep RGBA16F.
+     */
+    default int displayColorFormat(int rawBeautyFormat, boolean hdrEnabled) {
+        return rawBeautyFormat;
+    }
+
+    /** Whether the provider consumes the bridge-generated reactive mask. */
+    default boolean needsReactiveMask() {
+        return false;
+    }
+
+    /** Whether the provider needs the bridge's output blackout fail-open guard. */
+    default boolean needsBlackoutGuard() {
+        return false;
+    }
+
+    /**
+     * Whether {@link #evaluate} expects the raw path-tracer jitter sign instead of the
+     * camera-equivalent sign used by external temporal reconstruction APIs.
+     */
+    default boolean expectsRawRenderJitter() {
+        return false;
+    }
+
+    /** Whether the provider already applies configured sharpening internally. */
+    default boolean includesSharpening() {
+        return false;
+    }
+
+    /** Consume a provider-owned fail-open latch after evaluation. */
+    default boolean consumeFailOpen() {
+        return false;
+    }
 
     /**
      * Whether the SDK initialised AND a feature for the current size/quality has been created. False
@@ -41,8 +102,8 @@ public interface Upscaler {
      * {@code isReady()} to false so subsequent calls become no-ops.
      *
      * @param cmd                recording command buffer (the SDK records its setup into it)
-     * @param quality            quality mode (interpretation is implementation-defined: DLSS-RR uses
-     *                           NVSDK_NGX perf-quality enums; FSR / XeSS use 0=NATIVE..4=ULTRA_PERF)
+     * @param quality            quality mode on the shared 0=NATIVE..4=ULTRA_PERF scale; providers may
+     *                           map the value to their own internal presets
      * @param featureFlags       bit flags (interpretation implementation-defined)
      */
     boolean ensureFeature(long cmd, int renderWidth, int renderHeight, int displayWidth, int displayHeight,
@@ -78,14 +139,66 @@ public interface Upscaler {
      * Ask the upscaler to drop its internal temporal history on the next evaluate
      * (or as soon as the SDK supports it). Called by
      * {@code RtComposite.invalidateHistory()} on hard cuts (teleport,
-     * dimension change, resource reload) so the NGX / FFX / XeSS internal
-     * accumulator does not smear the previous scene's colour into the new one.
+     * dimension change, resource reload) so the provider's internal accumulator
+     * does not smear the previous scene's colour into the new one.
      *
      * <p>Default no-op is safe: an upscaler whose SDK doesn't expose a reset path
      * simply relies on its own history-rejection logic + the consumer's depth /
-     * MV rejection. Implementations with an SDK reset path (DLSS-RR's NGX
-     * {@code reset} flag) MUST override.
+     * MV rejection. Implementations with an explicit reset path must override.
      */
     default void requestResetHistory() {
+    }
+
+    /**
+     * v0.6.8+: bind the per-tile jitter guide (R8G8_UNORM, render res) written by
+     * world.rgen. The upscaler reads this and adds the per-tile offset to its
+     * reproject UV so the temporal accumulation lines up with the path tracer's
+     * actual sub-pixel sampling pattern.
+     *
+     * <p>Default no-op is safe: upscalers that don't use the guide (FSR, XeSS —
+     * they handle jitter via their SDK's internal math, not the user-
+     * supplied guide) just ignore it. Only TAAU / FFX's user-space reproject
+     * need this. The caller (RtComposite) passes {@code null} if the rgen is from
+     * an older shader set that doesn't write the guide.
+     */
+    default void setJitterGuide(RtImage jitterGuide) {
+    }
+
+    /**
+     * Bind the denoise-pipeline outputs an upscaler needs to derive a
+     * self-supplied reactive mask. The motion / deviceZ / normal-roughness are
+     * already part of {@link #evaluate} so the caller only needs to provide
+     * the two NRD-owned guides: linear viewZ and the prep-pass disocclusion
+     * mix (rgba8 .b = disocclusion signal).
+     *
+     * <p>Upscalers that already own their own reactive-mask path (for example XeSS
+     * auto-reactive) leave this as a no-op.
+     * Classic FSR2 uses these to derive the reactive signal ported from
+     * iterationRP's DepthClip_CS.glsl motion+depth divergence (see
+     * {@code shaders/display/denoise_ffx/fsr2_reactive_mask.comp}) so the SDK
+     * gets a real reactive input without the host having to author one.
+     *
+     * <p>Caller (RtComposite) sets this once per frame after the denoise backend
+     * has written its outputs. Either argument may be {@code null} to disable
+     * the reactive mask for this frame (e.g. denoise-off path) — the upscaler
+     * should fall back to its no-reactive behaviour.
+     */
+    default void setReactiveMaskGuides(RtImage viewZ, RtImage disocclusionMix) {
+    }
+
+    /**
+     * Inject the composite-owned RT plate bridge. Implementations must treat it as
+     * non-owning and must not destroy it. Format-adapting upscalers (currently
+     * classic FSR2) use it for denoise-to-upscale staging.
+     */
+    default void setPlateBridge(RtPlateBridge bridge) {
+    }
+
+    /**
+     * Describe the actual Vulkan format of {@code color} passed to the next
+     * {@link #evaluate} call. This is separate from {@link RtImage} because the
+     * image wrapper intentionally does not retain its VkFormat.
+     */
+    default void setInputColorFormat(int format) {
     }
 }

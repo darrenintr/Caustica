@@ -11,6 +11,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.OptionalInt;
 
 /** Loads the platform NRD shim and owns the REBLUR context. */
@@ -24,6 +25,13 @@ public final class NrdRuntime {
 
     private NrdLibrary lib;
     private MemorySegment ctx = MemorySegment.NULL;
+    // RELAX runs on a separate context — NRD's Instance can only host REBLUR or RELAX
+    // at a time, so we own two contexts side-by-side when both are in use.
+    private MemorySegment ctxRelax = MemorySegment.NULL;
+    private int relaxWidth, relaxHeight;
+    private long relaxDevice, relaxPhysical;
+    private int relaxGraphicsFamily = -1, relaxComputeFamily = -1;
+    private boolean relaxReady;
     private boolean failed;
     private int version = -1;
     private int width, height;
@@ -133,6 +141,146 @@ public final class NrdRuntime {
         }
     }
 
+    /**
+     * Update REBLUR's {@code maxAccumulatedFrameNum} at runtime. Returns true on success,
+     * false if the underlying shim does not expose the setter symbol (older build).
+     * Idempotent and safe to call before {@link #ensureContext} — it just no-ops.
+     */
+    public synchronized boolean setReblurMaxAccumulatedFrames(int frameNum) {
+        if (lib == null || failed) return false;
+        if (ctx.equals(MemorySegment.NULL)) return false;
+        int rc = lib.setMaxAccumulatedFrameNum(ctx, frameNum);
+        if (rc == 0) return true;
+        if (rc == -1) {
+            // Symbol missing — older build, no-op.
+            return false;
+        }
+        CausticaMod.LOGGER.warn("caustica_nrd_set_max_accumulated_frame_num failed rc={}", rc);
+        return false;
+    }
+
+    /** RELAX equivalent of {@link #setReblurMaxAccumulatedFrames}. */
+    public synchronized boolean setRelaxMaxAccumulatedFrames(int frameNum) {
+        if (lib == null || failed) return false;
+        if (ctxRelax.equals(MemorySegment.NULL)) return false;
+        int rc = lib.setRelaxMaxAccumulatedFrameNum(ctxRelax, frameNum);
+        if (rc == 0) return true;
+        if (rc == -1) return false;
+        CausticaMod.LOGGER.warn("caustica_nrd_set_relax_max_accumulated_frame_num failed rc={}", rc);
+        return false;
+    }
+
+    /** True iff the underlying shim exposes the REBLUR setter (newer build with v3 ABI hooks). */
+    public synchronized boolean supportsReblurMaxAccumulatedFramesSetter() {
+        return lib != null && !failed && lib.supportsMaxAccumulatedFrameNumSetter();
+    }
+
+    /** True iff the underlying shim exposes the RELAX setter. */
+    public synchronized boolean supportsRelaxMaxAccumulatedFramesSetter() {
+        return lib != null && !failed && lib.supportsRelaxMaxAccumulatedFrameNumSetter();
+    }
+
+    public synchronized boolean isRelaxAvailable() {
+        return lib != null && !failed && lib.supportsRelax();
+    }
+
+    /**
+     * Lazily create the RELAX context. Returns false if the underlying shim predates RELAX
+     * support or RELAX creation fails (e.g. format unsupported on this device).
+     */
+    public synchronized boolean ensureContextRelax(long vkDevice, long vkPhysical,
+                                                    int graphicsFamily, int computeFamily,
+                                                    int w, int h) {
+        if (!isRelaxAvailable() || w <= 0 || h <= 0) {
+            return false;
+        }
+        try {
+            boolean sameDevice = relaxDevice == vkDevice && relaxPhysical == vkPhysical
+                    && relaxGraphicsFamily == graphicsFamily && relaxComputeFamily == computeFamily;
+            if (!ctxRelax.equals(MemorySegment.NULL) && sameDevice) {
+                if (relaxWidth == w && relaxHeight == h) return true;
+                int rc = lib.resize(ctxRelax, w, h);
+                if (rc == 0) {
+                    relaxWidth = w;
+                    relaxHeight = h;
+                    return true;
+                }
+                CausticaMod.LOGGER.warn("caustica_nrd_resize (relax) failed rc={}; recreating", rc);
+            }
+            if (!ctxRelax.equals(MemorySegment.NULL)) {
+                lib.destroy(ctxRelax);
+                ctxRelax = MemorySegment.NULL;
+            }
+            long gdpa = APIUtil.apiGetFunctionAddress(VK.getFunctionProvider(), "vkGetDeviceProcAddr");
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                int rc = lib.createRelax(vkDevice, vkPhysical, gdpa, w, h,
+                        graphicsFamily, computeFamily, out);
+                if (rc != 0) {
+                    CausticaMod.LOGGER.warn("caustica_nrd_create_relax failed rc={} ({})", rc, createError(rc));
+                    return false;
+                }
+                ctxRelax = out.get(ValueLayout.ADDRESS, 0);
+                if (ctxRelax.equals(MemorySegment.NULL)) {
+                    return false;
+                }
+            }
+            relaxWidth = w;
+            relaxHeight = h;
+            relaxDevice = vkDevice;
+            relaxPhysical = vkPhysical;
+            relaxGraphicsFamily = graphicsFamily;
+            relaxComputeFamily = computeFamily;
+            relaxReady = true;
+            CausticaMod.LOGGER.info("NRD RELAX context {}x{}", w, h);
+            return true;
+        } catch (Throwable t) {
+            CausticaMod.LOGGER.warn("NRD RELAX ensureContext failed", t);
+            return false;
+        }
+    }
+
+    public synchronized int dispatchRelax(long cmd,
+                                           long inDiffImg, long inDiffView,
+                                           long inSpecImg, long inSpecView,
+                                           long inMvImg, long inMvView,
+                                           long inNormImg, long inNormView,
+                                           long inVzImg, long inVzView,
+                                           long inShadowImg, long inShadowView,
+                                           long inDiffConfImg, long inDiffConfView,
+                                           long inSpecConfImg, long inSpecConfView,
+                                           long inDisocclusionImg, long inDisocclusionView,
+                                           long outDiffImg, long outDiffView,
+                                           long outSpecImg, long outSpecView,
+                                           long outShadowImg, long outShadowView,
+                                           float[] viewToClip, float[] viewToClipPrev,
+                                           float[] worldToView, float[] worldToViewPrev,
+                                           float jx, float jy, float jxPrev, float jyPrev,
+                                           float lightDirX, float lightDirY, float lightDirZ,
+                                           int frameIndex, boolean reset) {
+        if (ctxRelax.equals(MemorySegment.NULL) || lib == null) {
+            return -1;
+        }
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment vtc = copyFloats(arena, viewToClip);
+            MemorySegment vtcp = copyFloats(arena, viewToClipPrev);
+            MemorySegment wtv = copyFloats(arena, worldToView);
+            MemorySegment wtvp = copyFloats(arena, worldToViewPrev);
+            return lib.dispatchRelax(ctxRelax, cmd,
+                    inDiffImg, inDiffView, inSpecImg, inSpecView,
+                    inMvImg, inMvView, inNormImg, inNormView, inVzImg, inVzView,
+                    inShadowImg, inShadowView, inDiffConfImg, inDiffConfView,
+                    inSpecConfImg, inSpecConfView, inDisocclusionImg, inDisocclusionView,
+                    outDiffImg, outDiffView, outSpecImg, outSpecView, outShadowImg, outShadowView,
+                    vtc, vtcp, wtv, wtvp,
+                    jx, jy, jxPrev, jyPrev, lightDirX, lightDirY, lightDirZ,
+                    frameIndex, reset ? 1 : 0);
+        } catch (Throwable t) {
+            CausticaMod.LOGGER.warn("NRD RELAX dispatch failed", t);
+            return -2;
+        }
+    }
+
     public synchronized int dispatch(long cmd,
                                      long inDiffImg, long inDiffView,
                                      long inSpecImg, long inSpecView,
@@ -182,9 +330,20 @@ public final class NrdRuntime {
             }
             ctx = MemorySegment.NULL;
         }
+        if (lib != null && !ctxRelax.equals(MemorySegment.NULL)) {
+            try {
+                lib.destroy(ctxRelax);
+            } catch (Throwable ignored) {
+            }
+            ctxRelax = MemorySegment.NULL;
+        }
+        relaxReady = false;
         width = height = 0;
         device = physical = 0;
         graphicsQueueFamily = computeQueueFamily = -1;
+        relaxWidth = relaxHeight = 0;
+        relaxDevice = relaxPhysical = 0;
+        relaxGraphicsFamily = relaxComputeFamily = -1;
     }
 
     private static MemorySegment copyFloats(Arena arena, float[] src) {
@@ -217,7 +376,10 @@ public final class NrdRuntime {
         try (InputStream in = NrdRuntime.class.getResourceAsStream(platform.resourcePath())) {
             if (in != null) {
                 byte[] bytes = in.readAllBytes();
-                if (!Files.isRegularFile(target) || Files.size(target) != bytes.length) {
+                // Native rebuilds commonly keep the same byte length. A size-only cache check
+                // silently reused the previous shim, so Java changes shipped while the NRD motion
+                // fix did not. Compare the actual content before loading the extracted library.
+                if (!Files.isRegularFile(target) || !Arrays.equals(Files.readAllBytes(target), bytes)) {
                     Files.write(target, bytes);
                     if (!platform.windows()) target.toFile().setExecutable(true);
                 }

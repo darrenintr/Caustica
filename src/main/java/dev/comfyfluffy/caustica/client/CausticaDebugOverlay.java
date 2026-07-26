@@ -3,19 +3,19 @@ package dev.comfyfluffy.caustica.client;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtFrameStats;
-import dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr;
+import dev.comfyfluffy.caustica.upscale.Upscaler;
 import dev.comfyfluffy.caustica.upscale.UpscalerSelector;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
  * Builds the multi-line text drawn on top of the main render target by {@code InGameHudMixin}. Pure function
- * of the current {@link RtComposite} + {@link RtFrameStats} + {@link RtDlssRr} state — no side effects, no
+ * of the current {@link RtComposite}, selected provider, and {@link RtFrameStats} state — no side effects, no
  * GL/Vulkan calls. Cheap to call every frame; only invoked when {@code CausticaConfig.Rt.DebugOverlay.ENABLED}
  * is true (the mixin gates the call).
  *
  * <p>The output is meant to be readable in a screenshot. Each line is annotated with a hint about which
- * field it is showing, so a single photo can answer "is the denoise on?", "did DLSS-RR throw and why?",
+ * field it is showing, so a single photo can answer "is the denoise on?", "did the upscaler fall back?",
  * "is the denoise temporal history fresh?", and "which frame-stage dominates the frame?". The exact format
  * is intentionally short — full debug logs go to {@code latest.log} via {@link CausticaMod#LOGGER}.
  */
@@ -26,32 +26,25 @@ public final class CausticaDebugOverlay {
     public static List<String> build() {
         List<String> out = new ArrayList<>(12);
         RtComposite c = RtComposite.INSTANCE;
-        UpscalerSelector.Mode mode = UpscalerSelector.resolvedMode();
-        String modeStr = mode == null ? "?" : mode.key();
-        String dlssRcStr = c.getLastRrOk()
+        Upscaler upscaler = UpscalerSelector.current();
+        String modeStr = upscaler != null ? upscaler.id() : "?";
+        String upscalerRcStr = c.getLastUpscalerOk()
                 ? "ok"
-                : (c.getLastRrRc() == 0 ? "fallback" : String.format("0x%X", c.getLastRrRc()));
+                : (c.getLastUpscalerRc() == 0 ? "fallback" : Integer.toString(c.getLastUpscalerRc()));
         // Show *resolved* upscaler (what actually runs), not only the config key.
         String cfgUpscaler = CausticaConfig.Rt.Upscaler.MODE.value().key();
         String pathHint;
         if (c.getLastUpscalerPath()) {
             pathHint = "ran";
-        } else if (mode == UpscalerSelector.Mode.TAAU
-                || mode == UpscalerSelector.Mode.DLSS_RR
-                || mode == UpscalerSelector.Mode.FSR_3
-                || mode == UpscalerSelector.Mode.FSR_4
-                || mode == UpscalerSelector.Mode.XESS) {
+        } else if (upscaler != null && upscaler.performsTemporalReconstruction()) {
             pathHint = "fallback-blit";
         } else {
             pathHint = "blit+taa";
         }
-        String rrInfo = String.format("%s/%s (cfg=%s rc=%s)",
-                modeStr, pathHint, cfgUpscaler, dlssRcStr);
-        if (mode == UpscalerSelector.Mode.DLSS_RR && RtDlssRr.INSTANCE.evaluateFailureCount() > 0) {
-            rrInfo += String.format("  failures=%d", RtDlssRr.INSTANCE.evaluateFailureCount());
-        }
+        String upscalerInfo = String.format("%s/%s (cfg=%s rc=%s)",
+                modeStr, pathHint, cfgUpscaler, upscalerRcStr);
         out.add("§6Caustica RT debug");
-        out.add(" §7upscaler: §r" + rrInfo);
+        out.add(" §7upscaler: §r" + upscalerInfo);
         out.add(" §7denoise: §r" + CausticaConfig.Rt.Denoise.MODE.get()
                 + " §8(" + (c.getLastDenoiseOn()
                 ? "§a" + c.getLastDenoisePath()
@@ -59,14 +52,14 @@ public final class CausticaDebugOverlay {
         out.add(" §7NRD prepare: §r" + status(c.getLastNrdPrepareOk()));
         out.add(" §7NRD dispatch: §r" + status(c.getLastNrdDispatchOk()));
         out.add(" §7NRD compose: §r" + status(c.getLastNrdComposeOk()));
-        out.add(" §7TAAU evaluate: §r" + status(mode == UpscalerSelector.Mode.TAAU
-                && c.getLastUpscalerPath()));
+        out.add(" §7upscaler evaluate: §r" + status(upscaler != null
+                && upscaler.performsTemporalReconstruction() && c.getLastUpscalerPath()));
         out.add(String.format(" §7render: §r%d×%d → %d×%d",
                 c.getRenderWidth(), c.getRenderHeight(), c.getDisplayWidth(), c.getDisplayHeight()));
         out.add(String.format(" §7jitter: §r(%+.4f, %+.4f) render px (applied to primary ray)",
                 c.getLastJitterPixelsX(), c.getLastJitterPixelsY()));
         // Render/display resolution is private on RtComposite; debugSummary exposes upscale + denoise +
-        // render/display res + frame counter + RR status. Misleading to label this "geometry" — it's the
+        // render/display res + frame counter + upscaler status. Misleading to label this "geometry" — it's the
         // composite state, not the geometry pass.
         out.add(" §7composite: §r" + c.debugSummary());
         // Frame-stage timing — only meaningful when frame-stats is on, but reading is safe when it's off.

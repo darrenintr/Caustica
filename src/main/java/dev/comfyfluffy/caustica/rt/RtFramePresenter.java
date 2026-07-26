@@ -27,7 +27,7 @@ import java.nio.IntBuffer;
 import java.nio.LongBuffer;
 
 /**
- * DLSS Frame Generation present engine (slice 2). Shows more than one image per rendered frame: the
+ * Frame-generation present engine. Shows more than one image per rendered frame: the
  * generated frame(s), then the real frame.
  *
  * <p>It hooks Minecraft's frame tail (Minecraft.java: {@code blitFromTexture} → {@code encoder.submit()} →
@@ -38,8 +38,8 @@ import java.nio.LongBuffer;
  * a self-contained present here failed validation). Then at {@code present()} HEAD we present the extra
  * image(s) before MC presents the real one, giving display order generated-then-real.
  *
- * <p>The generated frame is the active {@code FrameGen}'s real interpolated output (DLSSG via
- * {@link RtComposite#fgInterpolate}); when there's simply no captured RT frame this tick (menu/loading/
+ * <p>The generated frame is the active {@code FrameGen}'s interpolated output via
+ * {@link RtComposite#fgInterpolate}; when there's simply no captured RT frame this tick (menu/loading/
  * transition — routine) it falls back to duplicating the real frame for just that one frame (see
  * {@code interpFallbackDuplicate} in the present-rate log), but a genuine FG failure is fatal (see that
  * method's docs) rather than silently duplicating forever. Called from both present paths — the normal SDR
@@ -74,16 +74,14 @@ public final class RtFramePresenter {
     private RtFramePresenter() {
     }
 
-    /** Whether FG extra-present should run this frame (any vendor — DLSSG, FSR FG, XeSS-FG). */
+    /** Whether the selected provider should run extra presents this frame. */
     public boolean isActive() {
         if (failed || Minecraft.getInstance().level == null) {
             return false;
         }
-        // The FrameGenSelector is the master switch: its mode (off / auto / forced) plus the per-backend
-        // availability determine whether FG runs. The legacy {@code caustica.rt.fg} config is honoured
-        // by the selector: a fresh config file still has {@code caustica.rt.fg = true} (which the
-        // selector maps to the resolved mode = AUTO) and the user can override per-vendor with
-        // {@code caustica.rt.framegen.mode}.
+        // The selector is the sole lifecycle/availability boundary. Presentation does not branch on GPU
+        // vendor or provider implementation; the configured provider either exposes generated frames or
+        // resolves to FrameGen.NOOP.
         dev.comfyfluffy.caustica.framegen.FrameGen fg = dev.comfyfluffy.caustica.framegen.FrameGenSelector.current();
         return fg.isAvailable() && fg.effectiveMultiFrameCount() > 0;
     }
@@ -92,13 +90,13 @@ public final class RtFramePresenter {
      * Acquire {@code generatedCount} extra swapchain images and record a Y-flipped blit of {@code srcImage}
      * (the final rendered frame, GENERAL layout) into each, using Minecraft's command encoder {@code enc} so
      * the work rides MC's next {@code submit()}. The presents happen later in {@link #flushPendingPresents}.
-     * Blits DLSSG's real interpolated output per generated frame, or a duplicate of the real frame when RT
-     * simply isn't producing frames this tick (routine). A genuine DLSSG failure latches FG off for the
+     * Blits the provider's interpolated output per generated frame, or a duplicate of the real frame when RT
+     * simply isn't producing frames this tick (routine). A genuine provider failure latches frame generation off for the
      * session — see {@link RtComposite#fgInterpolate}.
      *
      * @param hdrBackbuffer whether {@code backbufferView}/{@code srcImage} is the PQ HDR backbuffer
      *     ({@link RtComposite#hdrBackbufferView()}, already UI-composited) rather than the SDR main target —
-     *     selects DLSSG's HDR backbuffer format/flag in {@link RtComposite#fgInterpolate}.
+     *     selects the provider's HDR backbuffer format/flag in {@link RtComposite#fgInterpolate}.
      */
     public void prepareExtraFrames(VulkanCommandEncoder enc, VulkanDevice device, long swapchain,
             LongList swapchainImages, long[] presentSemaphores, int swapW, int swapH,
@@ -227,7 +225,7 @@ public final class RtFramePresenter {
                     .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(dstImage);
             toDst.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
             // Make the source's prior writes visible to the blit read — the world render (duplicate path) or
-            // the DLSSG evaluate that wrote the interp image earlier in this same submit (interp path).
+            // the provider evaluation that wrote the interp image earlier in this same submit (interp path).
             VkMemoryBarrier2.Buffer srcVis = VkMemoryBarrier2.calloc(1, stack).sType$Default();
             srcVis.get(0).srcStageMask(65536L).srcAccessMask(65536L).dstStageMask(4096L).dstAccessMask(2048L);
             VkDependencyInfo dep1 = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toDst).pMemoryBarriers(srcVis);

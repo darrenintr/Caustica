@@ -3,7 +3,14 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_nonuniform_qualifier : require
-#extension GL_EXT_ray_tracing_position_fetch : require // gl_HitTriangleVertexPositionsEXT for TBN
+#ifndef CAUSTICA_POSITION_FETCH_NONE
+#extension GL_EXT_ray_tracing_position_fetch : require
+#define HIT_TRIANGLE_POSITION(i) gl_HitTriangleVertexPositionsEXT[i]
+#else
+// Portable fallback for devices without VK_KHR_ray_tracing_position_fetch. Zero edges make
+// rayConeTextureLod select base LOD and perturbNormal keep the geometric normal.
+#define HIT_TRIANGLE_POSITION(i) vec3(0.0)
+#endif
 
 // Closest-hit shader. Geometry is per-section: gl_InstanceCustomIndexEXT indexes a section table (BDA
 // array reached from the push constant) holding this section's {prim, index, uv} buffer addresses.
@@ -51,10 +58,10 @@ layout(binding = 2, set = 0) uniform sampler2D blockAtlas;
 // Parallel LabPBR _s (specular) and _n (normal) atlases, stitched to mirror the block atlas
 // sprite layout (RtBlockMaterials), sampled at the SAME uv as blockAtlas. Read only when the prim is
 // flagged (pr.mat.z for _s, pr.mat.w for _n).
-// Bindings follow raygen extras (GUIDE_COUNT=9 → storage images at 3..11); materials start at 12.
-// materialBase = firstExtra(3) + GUIDE_COUNT(13) = 16 (must match RtPipeline)
-layout(binding = 25, set = 0) uniform sampler2D blockSpecAtlas;
-layout(binding = 26, set = 0) uniform sampler2D blockNormalAtlas;
+// Bindings follow raygen extras (GUIDE_COUNT=24 → resources at 3..26).
+// materialBase = firstExtra(3) + GUIDE_COUNT(24) = 27 (must match RtPipeline).
+layout(binding = 27, set = 0) uniform sampler2D blockSpecAtlas;
+layout(binding = 28, set = 0) uniform sampler2D blockNormalAtlas;
 // Bindless entity textures — a runtime-sized array indexed per-prim (tint.w) by the entity
 // hit path. Slot 0 is a fallback. Entities use per-type texture files, so each RenderType gets a slot.
 layout(binding = 0, set = 1) uniform sampler2D entityTex[];
@@ -123,6 +130,19 @@ const uint MATERIAL_OPAQUE = 0u;
 const uint MATERIAL_WATER = 1u;
 const uint MATERIAL_PARTICLE = 2u;
 const uint MATERIAL_GLASS = 3u;
+// flags bits 0..1 material; bit 2 celestial (miss only); bit 3 water-entering (hit only).
+const uint PAYLOAD_WATER_ENTERING = 8u;
+
+
+// Vanilla block/entity atlases are sRGB PNGs through a UNORM view (no hardware sRGB decode).
+// BRDF / Beer–Lambert / NEE need linear albedo; data maps (_s/_n) stay raw.
+vec3 srgbToLinear(vec3 c) {
+    vec3 lo = c / 12.92;
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    bvec3 isHi = greaterThanEqual(c, vec3(0.04045));
+    return mix(lo, hi, vec3(isHi));
+}
+
 
 void payloadSetPacked(uint material, float roughness, float metalness, float emission, float sss) {
     payload.flags = material;
@@ -230,7 +250,8 @@ void decodeSpec(vec4 s, vec3 albedo, out float rough, out float metal, out vec3 
 }
 
 // LabPBR _n decode (shared): rotate the tangent-space normal into world space via a TBN built from the hit
-// triangle's vertex positions (VK_KHR_ray_tracing_position_fetch) + UVs. `n` must already be oriented
+// triangle's vertex positions + UVs. Without position fetch the synthetic zero edges take the degenerate
+// fallback and preserve the geometric normal. `n` must already be oriented
 // toward the viewer (`vdir`). Clamps the result above the horizon so grazing perturbations don't invert it
 // through the surface (the black-spot fix). Returns AO (blue) via `ao`; falls back to `n` on a degenerate
 // UV triangle. Instance transforms are translation-only, so object edges equal world edges.
@@ -282,7 +303,7 @@ vec3 applyBreaking(vec3 albedo, vec3 rayOrigin, vec3 rayDir, float hitT, vec3 n)
                          : (an.y >= an.z) ? local.xz
                          : local.xy;
             float decalLod = rayConeUnitUvLod(vec2(textureSize(entityTex[nonuniformEXT(ps.w)], 0)));
-            vec3 crack = textureLod(entityTex[nonuniformEXT(ps.w)], decalUv, decalLod).rgb;
+            vec3 crack = srgbToLinear(textureLod(entityTex[nonuniformEXT(ps.w)], decalUv, decalLod).rgb);
             return clamp(crack * albedo, 0.0, 1.0);
         }
     }
@@ -305,16 +326,16 @@ void main() {
         vec3 pbary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
         vec2 puv = pbary.x * uvb.uv[p0] + pbary.y * uvb.uv[p1] + pbary.z * uvb.uv[p2];
         int pslot = int(pr.tint.w + 0.5);
-        vec3 pp0 = mat3(gl_ObjectToWorldEXT) * gl_HitTriangleVertexPositionsEXT[0];
-        vec3 pp1 = mat3(gl_ObjectToWorldEXT) * gl_HitTriangleVertexPositionsEXT[1];
-        vec3 pp2 = mat3(gl_ObjectToWorldEXT) * gl_HitTriangleVertexPositionsEXT[2];
+        vec3 pp0 = mat3(gl_ObjectToWorldEXT) * HIT_TRIANGLE_POSITION(0);
+        vec3 pp1 = mat3(gl_ObjectToWorldEXT) * HIT_TRIANGLE_POSITION(1);
+        vec3 pp2 = mat3(gl_ObjectToWorldEXT) * HIT_TRIANGLE_POSITION(2);
         float particleLod = rayConeTextureLod(vec2(textureSize(entityTex[nonuniformEXT(pslot)], 0)),
                 pp0, pp1, pp2, uvb.uv[p0], uvb.uv[p1], uvb.uv[p2]);
         vec3 pn = normalize(pr.normal.xyz);
         if (dot(pn, gl_WorldRayDirectionEXT) > 0.0) {
             pn = -pn;
         }
-        payload.albedo = textureLod(entityTex[nonuniformEXT(pslot)], puv, particleLod).rgb * pr.tint.rgb;
+        payload.albedo = srgbToLinear(textureLod(entityTex[nonuniformEXT(pslot)], puv, particleLod).rgb) * pr.tint.rgb;
         payload.normal = pn;
         payload.hitT = gl_HitTEXT;
         // Per-particle motion vector: interpolate the captured per-vertex displacement (uniform across the
@@ -356,15 +377,15 @@ void main() {
         vec3 ebary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
         vec2 euvCoord = ebary.x * euv.uv[e0] + ebary.y * euv.uv[e1] + ebary.z * euv.uv[e2];
         int texSlot = int(pr.tint.w + 0.5);
-        vec3 ep0 = entityO2w * gl_HitTriangleVertexPositionsEXT[0];
-        vec3 ep1 = entityO2w * gl_HitTriangleVertexPositionsEXT[1];
-        vec3 ep2 = entityO2w * gl_HitTriangleVertexPositionsEXT[2];
+        vec3 ep0 = entityO2w * HIT_TRIANGLE_POSITION(0);
+        vec3 ep1 = entityO2w * HIT_TRIANGLE_POSITION(1);
+        vec3 ep2 = entityO2w * HIT_TRIANGLE_POSITION(2);
         float entityLod = rayConeTextureLod(vec2(textureSize(entityTex[nonuniformEXT(texSlot)], 0)),
                 ep0, ep1, ep2, euv.uv[e0], euv.uv[e1], euv.uv[e2]);
         float blockEntityLod = rayConeTextureLod(vec2(textureSize(blockAtlas, 0)),
                 ep0, ep1, ep2, euv.uv[e0], euv.uv[e1], euv.uv[e2]);
 
-        vec3 albedo = textureLod(entityTex[nonuniformEXT(texSlot)], euvCoord, entityLod).rgb * pr.tint.rgb;
+        vec3 albedo = srgbToLinear(textureLod(entityTex[nonuniformEXT(texSlot)], euvCoord, entityLod).rgb) * pr.tint.rgb;
         float rough = pr.mat.x;          // heuristic material default
         float metal = pr.mat.y;
         vec3 f0 = mix(vec3(0.02), albedo, metal);
@@ -415,6 +436,12 @@ void main() {
     vec3 n = normalize(pr.normal.xyz);
     vec3 tint = pr.tint.rgb;
 
+    // Water prims are single-sided, wound outward from the fluid volume (RtFluidMesher). Capture the
+    // UNFLIPPED geometric "entering water?" signal before the toward-viewer flip below so raygen can
+    // set inWater from hit orientation instead of toggling parity per crossing.
+    bool waterEntering = pr.tint.w > 0.5 && pr.tint.w < 1.5
+            && dot(gl_WorldRayDirectionEXT, n) < 0.0;
+
     // Lever B: per-triangle corner UVs in primitive order. uvs.uv[3*pid + k] is a contiguous,
     // directly-addressed load (no index buffer, no scattered vertex-UV gather), so it issues as soon as
     // pid is known and its latency overlaps the prim fetch instead of serialising behind an index load.
@@ -425,9 +452,9 @@ void main() {
     vec2 uv2 = uvs.uv[3u * pid + 2u];
     vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
     vec2 uv = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
-    vec3 tp0 = gl_HitTriangleVertexPositionsEXT[0];
-    vec3 tp1 = gl_HitTriangleVertexPositionsEXT[1];
-    vec3 tp2 = gl_HitTriangleVertexPositionsEXT[2];
+    vec3 tp0 = HIT_TRIANGLE_POSITION(0);
+    vec3 tp1 = HIT_TRIANGLE_POSITION(1);
+    vec3 tp2 = HIT_TRIANGLE_POSITION(2);
     float blockLod = rayConeTextureLod(vec2(textureSize(blockAtlas, 0)), tp0, tp1, tp2, uv0, uv1, uv2);
 
     // Orient the GEOMETRIC normal toward the viewer FIRST (double-sided geometry), so the normal-map TBN
@@ -452,9 +479,10 @@ void main() {
     // a more opaque texel tints transmitted light more strongly.
     if (pr.tint.w > 1.5) {
         vec4 gtex = textureLod(blockAtlas, uv, blockLod);
+        vec3 gtexRgb = srgbToLinear(gtex.rgb);
         // Translucent blocks (glass, ice, …) are breakable too — apply the same overlay here, reusing
         // gtex (already sampled above) rather than re-fetching blockAtlas.
-        payload.albedo = applyBreaking(mix(vec3(1.0), gtex.rgb * tint * ao, gtex.a),
+        payload.albedo = applyBreaking(mix(vec3(1.0), gtexRgb * tint * ao, gtex.a),
                 gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT, gl_HitTEXT, n);
         payload.normal = n;
         payload.hitT = gl_HitTEXT;
@@ -467,7 +495,7 @@ void main() {
     // Water (tint.w == 1) carries the pure biome water tint (no grey water-texture multiply): raygen
     // shades the surface as a clear dielectric and only needs the tint to derive the per-channel
     // Beer–Lambert absorption. Opaque terrain uses textured albedo.
-    payload.albedo = (pr.tint.w > 0.5) ? tint : textureLod(blockAtlas, uv, blockLod).rgb * tint * ao;
+    payload.albedo = (pr.tint.w > 0.5) ? tint : srgbToLinear(textureLod(blockAtlas, uv, blockLod).rgb) * tint * ao;
     payload.normal = n;
     payload.hitT = gl_HitTEXT;
     payload.motionPrev = vec3(0.0); // static terrain: camera-only motion vector
@@ -499,4 +527,7 @@ void main() {
     }
     payload.f0 = f0;
     payloadSetPacked(material, rough, metal, emission, sss);
+    if (waterEntering) {
+        payload.flags |= PAYLOAD_WATER_ENTERING;
+    }
 }

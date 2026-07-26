@@ -9,6 +9,7 @@ import com.mojang.blaze3d.vulkan.VulkanPhysicalDevice;
 import com.mojang.blaze3d.vulkan.init.VulkanFeature;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
+import dev.comfyfluffy.caustica.rt.VulkanDiagnostics;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VkDevice;
@@ -45,19 +46,20 @@ public abstract class VulkanBackendMixin {
 			new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderStorageImageWriteWithoutFormat",
 					VkPhysicalDeviceFeatures.SHADERSTORAGEIMAGEWRITEWITHOUTFORMAT);
 	private static final List<VulkanFeature> SDK_SHADER_FEATURES = List.of(
+			// The packed B10G11R11 HDR beauty chain is declared as r11f_g11f_b10f storage
+			// images in GLSL. Format support alone is insufficient: Vulkan also requires this
+			// core feature to be enabled at vkCreateDevice time. RADV correctly treats use
+			// without it as invalid and the affected RT plate commonly reads back as black.
+			new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderStorageImageExtendedFormats",
+					VkPhysicalDeviceFeatures.SHADERSTORAGEIMAGEEXTENDEDFORMATS),
 			STORAGE_IMAGE_WRITE_WITHOUT_FORMAT,
 			new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderInt16", VkPhysicalDeviceFeatures.SHADERINT16),
 			new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "shaderFloat16", VkPhysicalDeviceVulkan12Features.SHADERFLOAT16));
 
 	private static final List<String> CAUSTICA_WANTED_EXTENSIONS = List.of(
-			// FFX (FSR)
+			// Cross-vendor SDK/runtime compatibility aliases.
 			"VK_KHR_get_memory_requirements2",
 			"VK_KHR_dedicated_allocation",
-			// NGX (DLSS) — NVIDIA-only; skipped on other vendors. (The NGX instance
-			// extension VK_KHR_get_physical_device_properties2 needs an instance hook;
-			// DLSS relies on it being core/enabled at instance level.)
-			"VK_NVX_binary_import",
-			"VK_NVX_image_view_handle",
 			"VK_KHR_push_descriptor");
 
 	private static final Set<String> loggedMissingSdkFeatures = new HashSet<>();
@@ -78,16 +80,19 @@ public abstract class VulkanBackendMixin {
 				augmented.add(extension);
 				CausticaMod.LOGGER.info("Enabling device extension {} for the Caustica runtime", extension);
 			} else {
-				CausticaMod.LOGGER.warn("Device extension {} not supported by {} — upscaling will be unavailable",
+				CausticaMod.LOGGER.warn("Optional Caustica device extension {} is not supported by {}",
 						extension, physicalDevice.deviceName());
 			}
 		}
+		VulkanDiagnostics.addDeviceFaultExtension(augmented, physicalDevice);
 		RtDeviceBringup.addExtensions(augmented, physicalDevice);
 		args.set(0, augmented);
 
 		caustica$addCoreDeviceFeatures(args, physicalDevice);
 
+		VulkanDiagnostics.addDeviceFaultFeature(args);
 		RtDeviceBringup.addFeatures(args, physicalDevice);
+		VulkanDiagnostics.logEnabledExtensions(augmented);
 	}
 
 	@SuppressWarnings("unchecked")
@@ -97,7 +102,7 @@ public abstract class VulkanBackendMixin {
 		for (VulkanFeature feature : SDK_SHADER_FEATURES) {
 			if (!caustica$supportsFeature(physicalDevice, feature)) {
 				if (loggedMissingSdkFeatures.add(feature.name())) {
-					CausticaMod.LOGGER.warn("Device [{}] lacks {}; FSR/DLSS SDK shaders may fail validation",
+					CausticaMod.LOGGER.warn("Device [{}] lacks {}; external SDK shaders may fail validation",
 							physicalDevice.deviceName(), feature.name());
 				}
 				continue;
@@ -105,7 +110,7 @@ public abstract class VulkanBackendMixin {
 
 			if (features.add(feature)) {
 				changed = true;
-				CausticaMod.LOGGER.info("Enabling Vulkan feature {} for FSR/DLSS SDK shaders", feature.name());
+				CausticaMod.LOGGER.info("Enabling Vulkan feature {} for external SDK shaders", feature.name());
 			}
 		}
 		if (changed) {
@@ -132,6 +137,8 @@ public abstract class VulkanBackendMixin {
 			at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/vulkan/VulkanBackend;createVma(Lorg/lwjgl/vulkan/VkDevice;)J"))
 	private void caustica$probeRayTracing(long window, ShaderSource defaultShaderSource, GpuDebugOptions debugOptions,
 			Runnable criticalShaderLoader, CallbackInfoReturnable<GpuDevice> cir, @Local VkDevice device) {
+		VulkanDiagnostics.probe(device);
 		RtDeviceBringup.probe(device);
 	}
+
 }

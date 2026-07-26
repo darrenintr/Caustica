@@ -1,11 +1,11 @@
 # Caustica
 
-Caustica is an experimental ray-traced renderer for Minecraft 26.2's Vulkan backend.
-It replaces the vanilla world view with hardware ray tracing and NVIDIA DLSS
-features while keeping Minecraft's familiar UI and gameplay intact.
+Caustica is an experimental client-side ray-traced renderer for Minecraft 26.2
+on the Vulkan graphics backend. It replaces the vanilla world view with a
+hardware ray-tracing pipeline while preserving Minecraft's UI and gameplay.
 
-Caustica is early software. Expect bugs, missing visual cases, and frequent
-changes while the renderer is being built.
+Caustica is early software. Expect missing visual cases, compatibility issues,
+and frequent renderer changes.
 
 ![Caustica ray-traced Minecraft scene](docs/gallery/2026-07-09_21.25.14.jpg)
 
@@ -16,94 +16,98 @@ changes while the renderer is being built.
 - [CurseForge](https://www.curseforge.com/minecraft/mc-mods/caustica/preview)
 - [Gallery](docs/gallery.md)
 
-## Features
+## Highlights
 
-- Vulkan hardware path-traced world rendering
-- DLSS Ray Reconstruction support
-- DLSS Frame Generation support (experimental)
-- HDR output
-- Dynamic entity rendering in the ray-traced scene
-- LabPBR-style material support
-- OMM (Opacity Micro-Map) + SER (Shader Execution Reordering) optimizations
+- Vulkan hardware ray-traced world rendering
+- Cross-vendor Vulkan device bring-up based on capabilities rather than GPU names
+- Modular denoise, upscale, frame-generation, material, and presentation stages
+- LabPBR-style block and entity material support
+- Dynamic entities, block entities, particles, and world overlays in the RT scene
+- HDR10/PQ display output with SDR-to-PQ composition for Minecraft UI content
+- Opacity micromaps where supported
+- Shader invocation reordering through `VK_EXT_ray_tracing_invocation_reorder`,
+  with a portable no-SER shader fallback
+
+## Denoising
+
+The denoiser is selected independently from the upscaler:
+
+- `auto` capability-probes the bundled NRD path and falls back to the pure-SPIR-V
+  bilateral denoiser when the native backend is unavailable.
+- `nrd`, `hybrid`, and `relax` explicitly select NRD-based paths.
+- `ffx` selects the FidelityFX shadow/reflection path.
+- `bilateral` is the portable spatial-only fallback.
+- `off` presents the raw RT result.
+
+Optional native backends fail open; an unavailable library does not make the
+renderer depend on a particular GPU vendor.
+
+## Upscaling and frame generation
+
+- `auto` uses Caustica's portable compute TAAU implementation.
+- `fsr2` (legacy aliases such as `fsr-3` are accepted) probes the classic FSR2
+  Vulkan provider and falls back to TAAU when it is unavailable.
+- Unsupported legacy selector values are accepted for config compatibility and
+  resolve to a supported portable fallback.
+- Built-in Vulkan motion/depth frame generation is experimental, disabled by
+  default, and can generate up to three intermediate frames per rendered frame.
+
+Caustica does not include an NGX/DLSS runtime.
 
 ## Requirements
 
-- **Vulkan graphics backend enabled**
-- A GPU and driver with Vulkan ray tracing support
-- NVIDIA RTX GPU and supported driver for DLSS features
-- HDR-capable display and OS HDR mode for HDR output
-- On Linux, an HDR-capable Wayland compositor and a native Wayland session for HDR output
-- Install LabPBR resource pack like [SPBR](https://modrinth.com/resourcepack/spbr) for better visuals
+- Minecraft `26.2`
+- Fabric Loader `0.19.3` or newer
+- Fabric API
+- Java `25`
+- The Minecraft Vulkan graphics backend
+- A GPU and driver exposing the Vulkan ray-tracing features required by Caustica
+- An HDR-capable display, OS HDR mode, and an HDR-capable Vulkan surface for HDR output
+- On Linux, a native Wayland session is normally required for HDR10/PQ surfaces
+
+A LabPBR resource pack such as [SPBR](https://modrinth.com/resourcepack/spbr)
+is recommended for richer material data, but is not required to start the renderer.
 
 ## Installation
 
-1. Install Fabric Loader for Minecraft `26.2`.
-2. Install Fabric API.
-3. Put the Caustica jar in your Minecraft `mods` folder.
-4. Launch the game with the Vulkan graphics backend.
-5. Open Video Settings to adjust Caustica's renderer options.
+1. Install Fabric Loader for Minecraft `26.2` and Fabric API.
+2. Enable the Vulkan graphics backend.
+3. Put the Caustica JAR in the Minecraft `mods` directory.
+4. Launch the game and adjust Caustica in Video Settings or `config/caustica.toml`.
 
-## Linux / CachyOS
+If Minecraft falls back to OpenGL after a crash, re-enable the Vulkan backend
+before starting Caustica again.
 
-Caustica is supported on Linux with the same DLSS / FSR / XeSS native
-bundle as Windows. The project ships a CachyOS-tuned build + runtime
-pack at [`scripts/cachyos/`](scripts/cachyos/) covering:
+## Building
 
-- `build.sh` — full build pipeline (deps, DLSS/FFX/XeSS SDKs, native
-  shim, gradle bundleNgxNatives for linux-x64).
-- `install.sh` — one-shot setup (deps, ananicy-cpp rule, kernel
-  sysctls, optional build).
-- `run-caustica.sh` — runtime launcher with gamemode, ananicy-cpp,
-  nice/ionice, NUMA bind, and the JVM flags the renderer needs.
-- `.github/workflows/build-linux-x64.yml` — CI build of the same JAR on
-  a `ubuntu-latest` runner. Download the artifact from the run's
-  "Artifacts" panel.
-
-Quickstart on CachyOS:
+Building requires Java 25 plus `glslangValidator` and `spirv-val`. CMake and
+Ninja are recommended so Gradle can also build the optional portable JNI bridge.
 
 ```bash
-# Pull a prebuilt JAR from CI (or build it locally with scripts/cachyos/build.sh)
-gh run download -n caustica-linux-x64-jar      # or copy build/libs/caustica-*-linux-x64.jar
-
-# One-shot setup
-sudo ./scripts/cachyos/install.sh
-
-# Drop the JAR in and launch
-cp caustica-*-linux-x64.jar ~/.minecraft/mods/
-caustica-launch prism-launcher                 # or any launcher you use
+export JAVA_HOME=/path/to/jdk-25
+bash ./gradlew build
 ```
 
-CachyOS-specific notes: use `linux-cachyos-bore` or `-eevdf` kernel for
-the best render-thread scheduling; HDR requires a Wayland session
-(Plasma 6 / Hyprland / Gamescope 3.16+). XeSS-Linux is gated to Intel
-DevZone; FSR works out of the box from the bundled natives.
+The regular mod JAR is written under `build/libs/`. No DLSS, NGX, or XeSS SDK is
+required. See [the developer guide](docs/developer_guide.md) and the
+[CachyOS/Arch guide](scripts/cachyos/README.md) for platform-specific setup.
 
-See [scripts/cachyos/README.md](scripts/cachyos/README.md) for details.
-
-## Usage Notes
+## Usage notes
 
 - Caustica is client-side only.
-- DLSS Ray Reconstruction and Frame Generation require supported NVIDIA
-  hardware and drivers.
-- Use Java args to improve performance. Minecraft Launcher default:
-  `-XX:+UseCompactObjectHeaders -XX:+AlwaysPreTouch -XX:+UseStringDeduplication -XX:+UseZGC`
-- Frame Generation is experimental and needs to be enabled by modifying the configuration file.
-- HDR output requires an HDR swapchain and a correctly configured HDR display.
-- When HDR is enabled on Linux, Caustica selects GLFW's native Wayland backend automatically. X11/XWayland surfaces generally do not expose the required HDR10/PQ format.
-- If Minecraft falls back to OpenGL after a crash, re-enable the Vulkan backend
-  before using Caustica again.
-
-## Compatibility
-
-Caustica takes over the world renderer, so other mods that heavily modify world
-rendering, shader pipelines, post-processing, or the Vulkan backend may conflict.
-UI-only mods are more likely to work.
+- HDR automatically falls back to SDR when the Vulkan surface cannot expose a
+  compatible HDR10/PQ presentation format.
+- Frame generation is experimental and disabled by default.
+- On Linux, `-Xss2M` may help if a heavily modded instance reports a startup
+  stack overflow.
+- Other mods that replace world rendering, post-processing, or Vulkan backend
+  internals may conflict. UI-only mods are more likely to work.
 
 ## Status
 
-Caustica is not a finished renderer yet. Current work focuses on visual
-correctness, world coverage, stability, and making the SDR/HDR presentation
-paths behave consistently.
+Current work focuses on visual correctness, world coverage, stability, portable
+Vulkan behavior, and clean contracts between the renderer's pipeline modules.
+No specific performance uplift is guaranteed across hardware or driver versions.
 
 ## License
 
@@ -111,12 +115,5 @@ Caustica's project-owned source code and documentation are licensed under the
 GNU Lesser General Public License v3.0 or later. See [LICENSE.md](LICENSE.md),
 [COPYING](COPYING), and [COPYING.LESSER](COPYING.LESSER).
 
-Release artifacts may bundle NVIDIA DLSS/NGX SDK components under NVIDIA's own
-license terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-## TODO List
-
-- [ ] Nether/End sky, weather, volumetric fog/clouds
-- [ ] NRD + FSR for non-NVIDIA GPUs
-- [ ] LOD
-- [ ] ReSTIR
+Optional third-party native components retain their own license terms. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

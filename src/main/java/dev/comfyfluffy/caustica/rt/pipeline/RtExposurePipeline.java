@@ -70,7 +70,7 @@ final class RtExposurePipeline {
         this.resolvePipeline = resolvePipeline;
     }
 
-    static RtExposurePipeline create(RtContext ctx) {
+    static RtExposurePipeline create(RtContext ctx, int inputFormat) {
         VkDevice vk = ctx.vk();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             LongBuffer p = stack.mallocLong(1);
@@ -91,7 +91,10 @@ final class RtExposurePipeline {
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, histSet, "exposure histogram descriptor set");
             long histLayout = createPipelineLayout(vk, stack, histDsl, 16, "hist");
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_PIPELINE_LAYOUT, histLayout, "exposure histogram pipeline layout");
-            long histModule = loadModule(vk, stack, "exposure_hist.comp.spv");
+            String histShader = inputFormat == VK10.VK_FORMAT_R16G16B16A16_SFLOAT
+                    ? "exposure_hist_rgba16f.comp.spv"
+                    : "exposure_hist.comp.spv";
+            long histModule = loadModule(vk, stack, histShader);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SHADER_MODULE, histModule, "exposure histogram shader module");
             long histPipeline = createComputePipeline(vk, stack, histLayout, histModule, "hist");
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_PIPELINE, histPipeline, "exposure histogram pipeline");

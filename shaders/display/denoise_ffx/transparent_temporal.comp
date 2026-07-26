@@ -4,13 +4,13 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(binding = 0, rgba16f) readonly uniform image2D gSpatialFiltered;
+layout(binding = 0, r11f_g11f_b10f) readonly uniform image2D gSpatialFiltered;
 layout(binding = 1, r32f) readonly uniform image2D gDepth;
 layout(binding = 2, rgba16f) readonly uniform image2D gMotion;
 layout(binding = 3, r8) readonly uniform image2D gTransparencyMask;
-layout(binding = 4, rgba16f) uniform image2D gHistoryColor;  // read+write
+layout(binding = 4, r11f_g11f_b10f) uniform image2D gHistoryColor;  // pure RGB; depth is a separate image
 layout(binding = 5, r32f) uniform image2D gHistoryDepth;     // read+write
-layout(binding = 6, rgba16f) writeonly uniform image2D gOutColor;
+layout(binding = 6, r11f_g11f_b10f) writeonly uniform image2D gOutColor;
 
 layout(push_constant) uniform Push {
     float mvScaleX;

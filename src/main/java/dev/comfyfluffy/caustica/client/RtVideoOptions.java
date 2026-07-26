@@ -21,10 +21,8 @@ import net.minecraft.network.chat.Component;
  *
  * <p>Only settings the renderer re-reads per-frame are exposed here — toggles that would require a device or
  * buffer-pool rebuild (worker threads, OMM, max-entity capacities, PBR material flags) are intentionally
- * left to the {@code -Dcaustica.*} startup surface. DLSS-RR quality is the exception: the render resolution
- * is queried from NGX for the chosen quality mode on every resize (see
- * {@code RtDlssRr.queryOptimalRenderSize}), and the RR feature itself is recreated live whenever
- * {@code quality} changes (see {@code RtDlssRr.ensureFeature}), so it is safe to expose here.
+ * left to the {@code -Dcaustica.*} startup surface. Upscaler quality is runtime-tunable because the selected
+ * provider is resized or recreates its feature lazily when the quality preset changes.
  */
 public final class RtVideoOptions {
     private RtVideoOptions() {
@@ -43,7 +41,7 @@ public final class RtVideoOptions {
             waterWaves(),
             upscalerMode(),
             denoiseMode(),
-            dlssQuality(),
+            upscalerQuality(),
             hdrEnabled(),
             hdrPaperWhite(),
             hdrPeak(),
@@ -128,24 +126,16 @@ public final class RtVideoOptions {
         return bool("caustica.options.rt.waterWaves", CausticaConfig.Rt.Composite.WATER_WAVES);
     }
 
-    // NVSDK_NGX_PerfQuality_Value, ordered performance -> quality for the slider. Per NVIDIA's DLSS-RR
-    // programming guide, Ray Reconstruction only supports Performance(0), Balanced(1), Quality(2),
-    // Ultra-Performance(3), and DLAA(5) — Ultra Quality(4) is not a valid PerfQualityValue for RR (its
-    // optimal-settings query returns a zeroed render size for it) and is deliberately excluded here.
-    private static final List<Integer> DLSS_QUALITY_ORDER = List.of(3, 0, 1, 2, 5);
-
-    private static OptionInstance<Integer> dlssQuality() {
-        IntSetting setting = CausticaConfig.Rt.DlssRr.QUALITY;
-        int initialQuality = DLSS_QUALITY_ORDER.contains(setting.value()) ? setting.value() : 0;
-        int initialPosition = DLSS_QUALITY_ORDER.indexOf(initialQuality);
+    private static OptionInstance<Integer> upscalerQuality() {
+        IntSetting setting = CausticaConfig.Rt.Upscaler.QUALITY;
         return new OptionInstance<>(
-            "caustica.options.rt.dlssQuality",
-            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.dlssQuality.tooltip")),
-            (caption, position) -> Options.genericValueLabel(caption,
-                    Component.translatable("caustica.options.rt.dlssQuality." + DLSS_QUALITY_ORDER.get(position))),
-            new OptionInstance.IntRange(0, DLSS_QUALITY_ORDER.size() - 1),
-            initialPosition,
-            position -> setting.set(DLSS_QUALITY_ORDER.get(position)));
+            "caustica.options.rt.upscalerQuality",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.upscalerQuality.tooltip")),
+            (caption, quality) -> Options.genericValueLabel(caption,
+                    Component.translatable("caustica.options.rt.upscalerQuality." + quality)),
+            new OptionInstance.IntRange(0, 4),
+            Math.clamp(setting.value(), 0, 4),
+            setting::set);
     }
 
     private static OptionInstance<Boolean> hdrEnabled() {
@@ -176,10 +166,8 @@ public final class RtVideoOptions {
 
     private static OptionInstance<String> upscalerMode() {
         EnumSetting<CausticaConfig.UpscalerMode> setting = CausticaConfig.Rt.Upscaler.MODE;
-        // TAAU is the primary option (pure compute, cross-vendor, Linux-friendly).
-        // FSR2 added for quality comparison (v0.6.19).
-        // Legacy DLSS-RR / XeSS / NIS keys are still accepted in caustica.toml
-        // (mapped to AUTO) but no longer shown in the dropdown.
+        // TAAU: pure compute fallback. FSR2: classic FidelityFX Super Resolution. Legacy vendor
+        // mode keys still parse from caustica.toml but are not shown in the dropdown.
         List<String> values = List.of("auto", "taau", "fsr2", "off");
         return new OptionInstance<>(
             "caustica.options.rt.upscalerMode",
@@ -197,7 +185,11 @@ public final class RtVideoOptions {
 
     private static OptionInstance<String> denoiseMode() {
         EnumSetting<CausticaConfig.DenoiserKind> setting = CausticaConfig.Rt.Denoise.MODE;
-        List<String> values = List.of("auto", "ffx", "nrd", "svgf", "off");
+        // AMD vendor routes to NRD via AUTO; the legacy AMD_FIDELITYFX FFX-only mode
+        // is gone (2.x modular loader has no denoiser provider — see commit log).
+        // AUTO picks the right denoiser per vendor; NRD is the explicit
+        // Radiance-style choice; HYBRID is FFX prepass + NRD.
+        List<String> values = List.of("auto", "nrd", "hybrid", "ffx", "off");
         return new OptionInstance<>(
             "caustica.options.rt.denoiseMode",
             OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.denoiseMode.tooltip")),
@@ -205,7 +197,8 @@ public final class RtVideoOptions {
             new OptionInstance.Enum<>(values, Codec.STRING),
             setting.value().key(),
             value -> {
-                setting.set(CausticaConfig.DenoiserKind.fromKey(value));
+                CausticaConfig.DenoiserKind kind = CausticaConfig.DenoiserKind.fromKey(value);
+                setting.set(kind);
                 dev.comfyfluffy.caustica.rt.RtComposite.INSTANCE.invalidateDenoiseSelection();
             });
     }

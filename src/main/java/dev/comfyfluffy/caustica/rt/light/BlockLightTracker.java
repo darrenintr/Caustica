@@ -285,17 +285,23 @@ public final class BlockLightTracker {
         return ((long) cx << 42) | ((long) (cy & 0x1FFFFF) << 21) | (long) (cz & 0x1FFFFF);
     }
 
+    // Light color palette tuned for BetterRTX-style indoor warmth.
+    // Source colors are the block's apparent emission tint — torch 0xFFCC66 reads "yellow" indoors;
+    // BetterRTX pushes it deeper into the orange band so the bounce onto grey stone reads as warm grey
+    // rather than pale yellow. Lava gets a deeper red, soul fires lean more azure (less cyan), and
+    // default fallback warms up to read "amber glow" against any unspecialised emissive block.
+    // These tints ride on top of the HDR radiance path; intensity (0..1) is still driven by lightLevel/15.
     private static int getLightColor(BlockState state) {
         String name = state.getBlock().getName().getString().toLowerCase();
-        if (name.contains("lava") || name.contains("magma")) return 0xFF6A00;
-        if (name.contains("redstone")) return 0xFF2020;
-        if (name.contains("soul")) return 0x66DDFF;
-        if (name.contains("glowstone") || name.contains("shroomlight")) return 0xFFDD88;
-        if (name.contains("sea") || name.contains("prismarine") || name.contains("conduit")) return 0x66FFEE;
-        if (name.contains("torch") || name.contains("lantern") || name.contains("campfire")) return 0xFFCC66;
-        if (name.contains("amethyst") || name.contains("sculk")) return 0xAA88FF;
+        if (name.contains("lava") || name.contains("magma")) return 0xFF5500;
+        if (name.contains("redstone")) return 0xFF3030;
+        if (name.contains("soul")) return 0x66BBFF;
+        if (name.contains("glowstone") || name.contains("shroomlight")) return 0xFFE8B0;
+        if (name.contains("sea") || name.contains("prismarine") || name.contains("conduit")) return 0x80FFE8;
+        if (name.contains("torch") || name.contains("lantern") || name.contains("campfire")) return 0xFFAA55;
+        if (name.contains("amethyst") || name.contains("sculk")) return 0xB499FF;
         if (name.contains("copper") || name.contains("oxid")) return 0x88DDAA;
-        return 0xFFDDAA;
+        return 0xFFCC99;
     }
 
     private record LightDistance(int index, float distSq) {}

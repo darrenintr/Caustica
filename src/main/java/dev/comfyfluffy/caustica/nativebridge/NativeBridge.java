@@ -1,0 +1,390 @@
+package dev.comfyfluffy.caustica.nativebridge;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Locale;
+
+import net.fabricmc.loader.api.FabricLoader;
+import org.slf4j.Logger;
+
+import dev.comfyfluffy.caustica.CausticaMod;
+
+/**
+ * Java side of the libcaustica_native JNI bridge.
+ *
+ * <p>Phase 1 (2026-07-20): a single {@code ping()} round-trip to prove the cmake → ninja →
+ * jar → extract → System.load(absolute) → JNI call chain works end-to-end without
+ * touching any AMD FFX / NRD / Vulkan SDK. The native lib only writes a marker to
+ * stderr on {@code JNI_OnLoad} and returns a fixed UTF string; everything else stays
+ * in the GLSL pipeline so we can isolate "is the toolchain right?" from "does FFX on
+ * AMD actually work?".
+ *
+ * <h2>Loading model</h2>
+ *
+ * {@link #tryLoad(Logger)} extracts the bundled {@code libcaustica_native.so} from the
+ * JAR to {@code <gameDir>/caustica-native/natives/<platform>/}, then loads it by
+ * absolute path. Fabric does not put JAR-bundled natives on
+ * {@code java.library.path} automatically, so {@code System.loadLibrary(name)} would
+ * silently fail on a typical player install.
+ *
+ * <h2>Failure containment</h2>
+ *
+ * The user constraint was "no failure, only success" — i.e. MC must keep booting
+ * with or without the native half. Every fallible step is wrapped in
+ * {@code catch (Throwable t)}: a missing lib, mismatched symbols, file-permission
+ * flakiness, even an in-flight security manager all degrade to
+ * {@link #isLoaded()} == {@code false} plus an entry in {@link #getLoadError()}. Nothing
+ * thrown by this class can bubble out of mod init.
+ */
+public final class NativeBridge {
+
+    private static final String LIB_NAME = "caustica_native";
+    private static final String RESOURCE_PATH = "/caustica/natives/" + platformDir() + "/lib" + LIB_NAME + ".so";
+    private static final String GAME_DIR_RELATIVE =
+            "caustica-native/natives/" + platformDir() + "/lib" + LIB_NAME + ".so";
+
+    private static volatile boolean LOADED = false;
+    private static volatile String LOAD_ERROR = null;
+    private static volatile Path EXTRACTED_LIB = null;
+
+    private NativeBridge() {
+    }
+
+    /**
+     * Idempotent. Extracts the bundled lib (if needed) and {@code System.load}s it.
+     * Logs a single warning if anything goes wrong but never propagates a throwable.
+     */
+    public static void tryLoad(Logger logger) {
+        if (LOADED) {
+            return;
+        }
+        try {
+            Path lib = locateOrExtract();
+            if (lib == null) {
+                LOAD_ERROR = "libcaustica_native.so not present in JAR resources";
+                if (logger != null) {
+                    logger.warn("[caustica_native] not bundled in JAR; continuing with GLSL fallback");
+                }
+                return;
+            }
+            System.load(lib.toAbsolutePath().toString());
+            LOADED = true;
+            EXTRACTED_LIB = lib;
+            if (logger != null) {
+                logger.info("[caustica_native] loaded from {}", lib);
+            }
+        } catch (UnsatisfiedLinkError e) {
+            // Symbol mismatch (e.g. wrong -fvisibility, stale .so) or a corrupt extract.
+            LOAD_ERROR = e.getMessage() != null ? e.getMessage() : e.toString();
+            if (logger != null) {
+                logger.warn("[caustica_native] System.load failed; continuing with GLSL fallback: {}",
+                        LOAD_ERROR);
+            }
+        } catch (Throwable t) {
+            // Defensive: SecurityException, IOException, anything.
+            LOAD_ERROR = t.toString();
+            if (logger != null) {
+                logger.warn("[caustica_native] load failed; continuing with GLSL fallback", t);
+            }
+        }
+    }
+
+    public static boolean isLoaded() {
+        return LOADED;
+    }
+
+    public static String getLoadError() {
+        return LOAD_ERROR;
+    }
+
+    public static Path getExtractedLib() {
+        return EXTRACTED_LIB;
+    }
+
+    /**
+     * Round-trip through JNI. Returns the static "pong-v1" string the C++ side emits
+     * (the "v1" suffix lets a caller assert that this is the build it expects).
+     *
+     * <p>Throws {@link UnsatisfiedLinkError} if {@link #tryLoad} has not run or
+     * failed. Callers should gate with {@link #isLoaded()} first.
+     */
+    public static native String ping();
+
+    /**
+     * Returns the AMD FidelityFX Denoiser SDK version this build was compiled against,
+     * as a human-readable string (e.g. {@code "1.2.0 (10200)"}). The C++ side reads
+     * the {@code FFX_DENOISER_VERSION} macro from {@code ffx_denoiser.h}, which encodes
+     * major*10000 + minor*100 + patch.
+     *
+     * <p>Phase 2 (2026-07-20) readback: the SDK runtime is NOT linked yet, so this
+     * method only proves the header is reachable + its compile-time version constant is
+     * visible to the .so. If the SDK headers were missing at build time (the
+     * FFX_SDK_PRESENT macro in CMakeLists.txt was 0), the C++ side returns a stub
+     * string explaining why.
+     *
+     * <p>Throws {@link UnsatisfiedLinkError} if {@link #tryLoad} has not run or
+     * failed. Callers should gate with {@link #isLoaded()} first.
+     */
+    public static native String ffxDenoiserVersion();
+
+    /**
+     * Phase 3 verify (2026-07-20): on the C++ side, this calls
+     * {@code dlopen(path, RTLD_NOW)} then {@code dlsym} for each of the six AMD FFX
+     * 2.x modular API entry points ({@code ffxConfigure}, {@code ffxCreateContext},
+     * {@code ffxDestroyContext}, {@code ffxDispatch}, {@code ffxGetLastError},
+     * {@code ffxQuery}). Returns a human-readable summary like
+     * {@code "ok (6/6)"} or {@code "dlopen failed: <err>"} or
+     * {@code "missing: ffxCreateContext, ffxQuery"}.
+     *
+     * <p>This is a Phase 3 minimum-viable verify: we are NOT calling any AMD API
+     * yet, just proving the .so file can be dlopened and the 6 entry-point symbols
+     * are resolvable. If anything is missing, the GLSL denoise path stays the
+     * default; no risk to the current rendering path.
+     */
+    public static native String amdFfxLoaderCheck(String absolutePath);
+
+    /**
+     * Phase 3 follow-up (2026-07-20): minimum real call into the AMD FFX 2.x
+     * modular API. Opens the loader, calls {@code ffxQuery} with
+     * {@code FFX_API_QUERY_DESC_TYPE_GET_VERSIONS} for the denoiser effect ID
+     * (0x00050000u). Confirms the loader actually exposes the denoiser effect
+     * through the modular API — i.e. that there's a real denoiser to call, not
+     * just six symbols that may or may not back a real effect.
+     *
+     * <p>Does NOT create a context, does NOT dispatch, does NOT touch Vulkan
+     * resources. The worst case on failure is a non-zero return code in the log.
+     *
+     * <p>Returns one of:
+     * <ul>
+     *   <li>{@code "denoiser: ok (N versions)"} — N >= 1, real effect available</li>
+     *   <li>{@code "denoiser: rc=N (message)"} — query returned non-zero</li>
+     *   <li>{@code "denoiser: ffxQuery sym missing"} — symbol not in .so</li>
+     *   <li>{@code "denoiser: <dlopen-error>"} — same dlopen failure as amdFfxLoaderCheck</li>
+     * </ul>
+     */
+    public static native String amdFfxDenoiserQuery(String absolutePath);
+
+    /**
+     * Convenience entry point for the denoiser-version verify: extract the AMD
+     * loader (same path as {@link #tryCheckAmdFfxLoader}), call the JNI, log the
+     * result. Catches every failure case so the verify cannot crash mod init.
+     */
+    public static String tryCheckAmdFfxDenoiser(Logger logger) {
+        Path gameDir = FabricLoader.getInstance().getGameDir();
+        String amdRes = "/caustica/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
+        String amdRel = "caustica/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
+        Path amdTarget = gameDir.resolve(amdRel);
+        // Same unconditional re-extract as the loader check: the file is small, and
+        // skipping means a stale .so would mask a real Phase 3 signal.
+        try {
+            try (InputStream in = NativeBridge.class.getResourceAsStream(amdRes)) {
+                if (in == null) {
+                    return "denoiser-query: not bundled in jar (resource missing: " + amdRes + ")";
+                }
+                Files.createDirectories(amdTarget.getParent());
+                byte[] bytes;
+                try (InputStream copy = in) {
+                    bytes = copy.readAllBytes();
+                }
+                Files.write(amdTarget, bytes);
+            }
+        } catch (IOException | SecurityException e) {
+            String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+            if (logger != null) {
+                logger.warn("[caustica_native] failed to extract AMD FFX loader for denoiser query: {}", msg);
+            }
+            return "denoiser-query: extract failed: " + msg;
+        }
+        try {
+            String result = amdFfxDenoiserQuery(amdTarget.toAbsolutePath().toString());
+            if (logger != null) {
+                logger.info("[caustica_native] amdFfxDenoiserQuery: {}", result);
+            }
+            return result;
+        } catch (UnsatisfiedLinkError ule) {
+            if (logger != null) {
+                logger.warn("[caustica_native] amdFfxDenoiserQuery threw — was caustica_native.so loaded?");
+            }
+            return "denoiser-query: caustica_native.so not loaded";
+        } catch (Throwable t) {
+            String msg = t.getMessage() != null ? t.getMessage() : t.toString();
+            if (logger != null) {
+                logger.warn("[caustica_native] amdFfxDenoiserQuery threw unexpected: {}", msg);
+            }
+            return "denoiser-query: jni call failed: " + msg;
+        }
+    }
+
+    /**
+     * Phase 3 verify entry point: extract the AMD FFX 2.x modular loader
+     * ({@code libamd_fidelityfx_loader.so}) from {@code caustica-fsr/natives/<platform>/},
+     * pass the absolute path to the C++ side, and have the C++ side {@code dlopen} +
+     * {@code dlsym} the six expected entry points.
+     *
+     * <p>This is a Phase 3 minimum-viable verify. The function does NOT call any of
+     * the resolved AMD API symbols. The point is to confirm the .so is reachable
+     * from the JVM and the six function pointers are present on this machine. If
+     * anything is missing, the GLSL denoise path stays the default.
+     *
+     * <p>Returns a string like {@code "ok (6/6)"} or {@code "partial (4/6, missing: ffxQuery, ffxGetLastError)"}
+     * or {@code "dlopen failed: <err>"} or {@code "lib not found in jar resources"}.
+     */
+    public static String tryCheckAmdFfxLoader(Logger logger) {
+        // Extract the AMD loader from the JAR's caustica/natives/<platform>/ resource
+        // tree (NOT caustica-fsr — that's the post-extraction on-disk target used by
+        // FSR2, not the source path in the JAR). The .so is unconditional re-write so a
+        // stale Phase 2 .so doesn't mask Phase 3's signal.
+        Path gameDir = FabricLoader.getInstance().getGameDir();
+        String amdRes = "/caustica/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
+        String amdRel = "caustica/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
+        Path amdTarget = gameDir.resolve(amdRel);
+        try {
+            try (InputStream in = NativeBridge.class.getResourceAsStream(amdRes)) {
+                if (in == null) {
+                    return "amd-loader: not bundled in jar (resource missing: " + amdRes + ")";
+                }
+                Files.createDirectories(amdTarget.getParent());
+                byte[] bytes;
+                try (InputStream copy = in) {
+                    bytes = copy.readAllBytes();
+                }
+                Files.write(amdTarget, bytes);
+            }
+        } catch (IOException | SecurityException e) {
+            String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+            if (logger != null) {
+                logger.warn("[caustica_native] failed to extract AMD FFX loader: {}", msg);
+            }
+            return "amd-loader: extract failed: " + msg;
+        }
+        // Hand the absolute path to the C++ side. Must be done before any try-with-resources
+        // around the tryLoad call, because tryLoad references CausticaMod.LOGGER
+        // via a static import the user might not be seeing here.
+        String result;
+        try {
+            result = amdFfxLoaderCheck(amdTarget.toAbsolutePath().toString());
+        } catch (UnsatisfiedLinkError ule) {
+            // caustica_native.so probably wasn't loaded yet — fall back to a clear
+            // "not loaded" message rather than the raw UnsatisfiedLinkError.
+            if (logger != null) {
+                logger.warn("[caustica_native] amdFfxLoaderCheck threw — was caustica_native.so loaded?");
+            }
+            return "amd-loader: caustica_native.so not loaded";
+        } catch (Throwable t) {
+            String msg = t.getMessage() != null ? t.getMessage() : t.toString();
+            if (logger != null) {
+                logger.warn("[caustica_native] amdFfxLoaderCheck threw unexpected: {}", msg);
+            }
+            return "amd-loader: jni call failed: " + msg;
+        }
+        if (logger != null) {
+            logger.info("[caustica_native] amdFfxLoaderCheck: {}", result);
+        }
+        return result;
+    }
+
+    /**
+     * Convenience: {@link #tryLoad(Logger)} then {@link #ping()}. Returns
+     * {@code null} on any failure. Used from {@code CausticaMod.onInitialize()}.
+     */
+    public static String tryLoadAndPing(Logger logger) {
+        tryLoad(logger);
+        if (!LOADED) {
+            return null;
+        }
+        try {
+            return ping();
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.warn("[caustica_native] ping() threw after a clean load — unexpected", t);
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Convenience: {@link #tryLoad(Logger)} then {@link #ffxDenoiserVersion()}.
+     * Returns the SDK version string from the C++ readback, or {@code null} if the
+     * native half is unavailable.
+     */
+    public static String tryLoadAndFfxVersion(Logger logger) {
+        tryLoad(logger);
+        if (!LOADED) {
+            return null;
+        }
+        try {
+            return ffxDenoiserVersion();
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.warn("[caustica_native] ffxDenoiserVersion() threw after a clean load", t);
+            }
+            return null;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // extraction
+    // ---------------------------------------------------------------------
+
+    private static Path locateOrExtract() throws IOException {
+        // 1) Resolve where the extracted library should live on disk.
+        Path gameDir = FabricLoader.getInstance().getGameDir();
+        Path target = gameDir.resolve(GAME_DIR_RELATIVE);
+
+        // 2) Extract the bundled lib from the JAR. We don't short-circuit on an
+        //    already-existing file: the .so shipped inside the JAR can change between
+        //    builds (Phase 1 had a 15648-byte ping-only stub, Phase 2 added the
+        //    ffxDenoiserVersion symbol at 15856 bytes). If we returned early on file-
+        //    existence we'd silently load the stale copy from a previous run. The
+        //    cost of always re-writing is one small (~15 KB) write per boot.
+        try (InputStream in = NativeBridge.class.getResourceAsStream(RESOURCE_PATH)) {
+            if (in == null) {
+                return null;
+            }
+            Files.createDirectories(target.getParent());
+            byte[] bytes;
+            try (InputStream copy = in) {
+                bytes = copy.readAllBytes();
+            }
+            Files.write(target, bytes);
+            return target;
+        }
+    }
+
+    private static String platformDir() {
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        String arch = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);
+        boolean x64 = arch.equals("x86_64") || arch.equals("amd64");
+        boolean aarch64 = arch.equals("aarch64") || arch.equals("arm64");
+        if (os.contains("linux") && x64) {
+            return "linux-x64";
+        }
+        if (os.contains("linux") && aarch64) {
+            return "linux-arm64";
+        }
+        if (os.contains("windows") && x64) {
+            return "windows-x64";
+        }
+        if (os.contains("windows") && aarch64) {
+            return "windows-arm64";
+        }
+        if (os.contains("mac") && aarch64) {
+            return "macos-arm64";
+        }
+        if (os.contains("mac") && x64) {
+            return "macos-x64";
+        }
+        // Last-resort: let the resource look-up fail with a clear "not bundled" log.
+        return "unknown";
+    }
+
+    // ---- CausticaMod boot entry point ----
+    //
+    // Wrapped so the mod's main class doesn't need to know about NativeBridge directly.
+
+    public static String tryLoadAndPingViaProjectLogger() {
+        return tryLoadAndPing(CausticaMod.LOGGER);
+    }
+}

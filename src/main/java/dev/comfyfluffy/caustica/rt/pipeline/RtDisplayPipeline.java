@@ -55,7 +55,7 @@ public final class RtDisplayPipeline {
         this.pipeline = pipeline;
     }
 
-    public static RtDisplayPipeline create(RtContext ctx) {
+    public static RtDisplayPipeline create(RtContext ctx, int inputFormat) {
         VkDevice vk = ctx.vk();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(4, stack);
@@ -96,7 +96,10 @@ public final class RtDisplayPipeline {
             long layout = p.get(0);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_PIPELINE_LAYOUT, layout, "display pipeline layout");
 
-            long module = loadModule(vk, stack, "display.comp.spv");
+            String shader = inputFormat == VK10.VK_FORMAT_R16G16B16A16_SFLOAT
+                    ? "display_rgba16f.comp.spv"
+                    : "display.comp.spv";
+            long module = loadModule(vk, stack, shader);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SHADER_MODULE, module, "display shader module");
             VkPipelineShaderStageCreateInfo stage = VkPipelineShaderStageCreateInfo.calloc(stack).sType$Default()
                     .stage(VK10.VK_SHADER_STAGE_COMPUTE_BIT).module(module).pName(stack.UTF8("main"));

@@ -9,21 +9,12 @@ import com.mojang.blaze3d.vulkan.VulkanGpuSurface;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.RtComposite;
-import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
+import dev.comfyfluffy.caustica.framegen.FrameGen;
+import dev.comfyfluffy.caustica.framegen.FrameGenSelector;
 import dev.comfyfluffy.caustica.rt.RtFramePresenter;
 import dev.comfyfluffy.caustica.rt.RtHdr;
-import dev.comfyfluffy.caustica.rt.RtReflex;
 import it.unimi.dsi.fastutil.longs.LongList;
-import org.lwjgl.system.MemoryStack;
-import org.lwjgl.vulkan.KHRSwapchain;
-import org.lwjgl.vulkan.VkAllocationCallbacks;
-import org.lwjgl.vulkan.VkDevice;
-import org.lwjgl.vulkan.VkPresentIdKHR;
-import org.lwjgl.vulkan.VkPresentInfoKHR;
-import org.lwjgl.vulkan.VkQueue;
 import org.lwjgl.vulkan.VkSurfaceFormatKHR;
-import org.lwjgl.vulkan.VkSwapchainCreateInfoKHR;
-import org.lwjgl.vulkan.VkSwapchainLatencyCreateInfoNV;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -31,11 +22,9 @@ import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.ModifyArg;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
-import java.nio.LongBuffer;
 
 /**
  * HDR Phase 0 capability logging + PQ swapchain selection.
@@ -141,95 +130,16 @@ public abstract class VulkanGpuSurfaceMixin {
 		return this.caustica$colorSpace != 0 ? this.caustica$colorSpace : original;
 	}
 
-	/**
-	 * Reflex Phase 1a: chain {@code VkSwapchainLatencyCreateInfoNV{latencyModeEnable=true}} into the
-	 * swapchain's pNext at creation. Per spec {@code vkSetLatencySleepModeNV} (not called yet — lands with
-	 * the sleep loop) only takes effect on a swapchain created with this flag, so it has to be set here,
-	 * before there's any other reason to touch swapchain creation. Preserves whatever pNext was already
-	 * there (currently nothing else chains one). The extra struct is stack-allocated and only needs to
-	 * survive this call — Vulkan reads pNext chains synchronously during {@code vkCreateSwapchainKHR}, it
-	 * doesn't retain the pointer afterward, so freeing it when this method's stack frame pops is safe even
-	 * though {@code pCreateInfo} isn't touched again after this point in {@code configure()}. No-op (calls
-	 * through unchanged) when Reflex isn't enabled + device-supported.
-	 */
-	@Redirect(method = "configure",
-			at = @At(value = "INVOKE",
-					target = "Lorg/lwjgl/vulkan/KHRSwapchain;vkCreateSwapchainKHR(Lorg/lwjgl/vulkan/VkDevice;Lorg/lwjgl/vulkan/VkSwapchainCreateInfoKHR;Lorg/lwjgl/vulkan/VkAllocationCallbacks;Ljava/nio/LongBuffer;)I"))
-	private int caustica$createSwapchainWithReflex(VkDevice device, VkSwapchainCreateInfoKHR pCreateInfo,
-			VkAllocationCallbacks pAllocator, LongBuffer pSwapchain) {
-		if (!RtDeviceBringup.reflexEnabled()) {
-			return KHRSwapchain.vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
-		}
-		try (MemoryStack stack = MemoryStack.stackPush()) {
-			VkSwapchainLatencyCreateInfoNV latency = VkSwapchainLatencyCreateInfoNV.calloc(stack).sType$Default();
-			latency.pNext(pCreateInfo.pNext());
-			latency.latencyModeEnable(true);
-			pCreateInfo.pNext(latency.address());
-			return KHRSwapchain.vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
-		}
-	}
-
-	/**
-	 * Reflex Phase 1b: (re)apply the sleep-mode config for the just-(re)configured swapchain. Per spec this
-	 * is scoped to a specific swapchain object, so it must be re-called whenever {@code configure()} builds a
-	 * new one (e.g. resize) — {@link RtReflex#applySleepMode} is idempotent (no-op if unchanged), so calling
-	 * it unconditionally here is cheap. No-op when Reflex isn't enabled + device-supported.
-	 */
+	/** Log presentation constraints for the active frame-generation backend after swapchain reconfiguration. */
 	@Inject(method = "configure", at = @At("TAIL"))
-	private void caustica$applyReflexSleepMode(GpuSurface.Configuration config, CallbackInfo ci) {
-		if (RtDeviceBringup.reflexEnabled()) {
-			RtReflex.INSTANCE.applySleepMode(this.device.vkDevice(), this.swapchain);
+	private void caustica$logFrameGenerationPresentMode(GpuSurface.Configuration config, CallbackInfo ci) {
+		// MAILBOX/IMMEDIATE may replace an earlier queued image before scanout. Providers that emit
+		// multiple presents therefore require FIFO to guarantee each generated frame reaches the display.
+		FrameGen provider = FrameGenSelector.current();
+		if (provider.isEnabled() && provider.requiresFifoPresent()) {
+			CausticaMod.LOGGER.info("{}: swapchain present mode = {} (FIFO required for generated frames; "
+					+ "MAILBOX/IMMEDIATE may drop queued frames)", provider.name(), config.presentMode());
 		}
-		// DLSS-FG diagnostic: MAILBOX/IMMEDIATE present modes let a later present silently replace/skip an
-		// earlier queued-but-not-yet-scanned-out one, which would drop FG's generated frame before the
-		// display ever shows it — even though our vkQueuePresentKHR call itself reports success. FIFO is the
-		// only mode that guarantees every queued present gets its own vblank. Log once per (re)configure so
-		// this is checkable without guessing at the in-game V-Sync setting.
-		if (dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.enabled()) {
-			CausticaMod.LOGGER.info("DLSS-FG: swapchain present mode = {} (FIFO required for generated frames "
-					+ "to actually display; MAILBOX/IMMEDIATE will silently drop them — enable V-Sync if not FIFO)",
-					config.presentMode());
-		}
-	}
-
-	/**
-	 * Reflex Phase 1b: PRESENT_START/END markers around the real frame's present, plus (when
-	 * {@code VK_KHR_present_id} is enabled) chaining a {@code VkPresentIdKHR} onto it so the marker's
-	 * {@code presentID} correlates with this exact present call. The FG-generated extra presents
-	 * ({@link RtFramePresenter}) are deliberately NOT marked/present-id'd — Reflex paces/measures the real
-	 * frame only. No-op passthrough unless Reflex has successfully applied sleep mode for this swapchain.
-	 */
-	@Redirect(method = "present",
-			at = @At(value = "INVOKE",
-					target = "Lorg/lwjgl/vulkan/KHRSwapchain;vkQueuePresentKHR(Lorg/lwjgl/vulkan/VkQueue;Lorg/lwjgl/vulkan/VkPresentInfoKHR;)I"))
-	private int caustica$presentWithReflex(VkQueue queue, VkPresentInfoKHR presentInfo) {
-		boolean reflexActive = RtReflex.enabled() && this.swapchain == RtReflex.INSTANCE.appliedSwapchain();
-		if (!reflexActive) {
-			return KHRSwapchain.vkQueuePresentKHR(queue, presentInfo);
-		}
-		VkDevice vkDevice = this.device.vkDevice();
-		// Own counter (not currentSimFrameId()): Minecraft can present outside the normal tick loop (e.g.
-		// Minecraft.setScreenAndShow's synchronous redraw when opening a world), so presentID must advance on
-		// every actual vkQueuePresentKHR call, not just once per sleep()/runTick — otherwise a stale, already-
-		// used id gets resent and VUID-VkPresentIdKHR-presentIds-04999 fires.
-		long presentId = RtReflex.INSTANCE.advancePresentId();
-		RtReflex.INSTANCE.marker(vkDevice, this.swapchain, RtReflex.MARKER_RENDERSUBMIT_END, presentId);
-		RtReflex.INSTANCE.marker(vkDevice, this.swapchain, RtReflex.MARKER_PRESENT_START, presentId);
-		int result;
-		if (RtDeviceBringup.presentIdEnabled()) {
-			try (MemoryStack stack = MemoryStack.stackPush()) {
-				VkPresentIdKHR vkPresentId = VkPresentIdKHR.calloc(stack).sType$Default()
-						.pNext(presentInfo.pNext())
-						.swapchainCount(1)
-						.pPresentIds(stack.longs(presentId));
-				presentInfo.pNext(vkPresentId.address());
-				result = KHRSwapchain.vkQueuePresentKHR(queue, presentInfo);
-			}
-		} else {
-			result = KHRSwapchain.vkQueuePresentKHR(queue, presentInfo);
-		}
-		RtReflex.INSTANCE.marker(vkDevice, this.swapchain, RtReflex.MARKER_PRESENT_END, presentId);
-		return result;
 	}
 
 	/**
@@ -238,7 +148,7 @@ public abstract class VulkanGpuSurfaceMixin {
 	 * vanilla blit entirely (the SDR target + its UI are bypassed for now; UI compositing is a later step).
 	 *
 	 * <p>Because this cancels {@code blitFromTexture} at HEAD, the normal {@code caustica$presentGeneratedFrames}
-	 * TAIL inject below never runs on HDR frames — so DLSS-FG's extra-present step is invoked explicitly here,
+	 * TAIL inject below never runs on HDR frames — so the active frame-generation backend's extra-present step is invoked explicitly here,
 	 * right after the real HDR frame is recorded, using the just-composited {@code hdrDisplayImage} (already
 	 * UI-composited by {@code presentHdr}) as the interpolation source instead of the SDR main target.
 	 */
@@ -276,11 +186,10 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	/**
-	 * DLSS Frame Generation (slice 2): after Minecraft blits the real frame into its acquired swapchain image
-	 * (but before {@code present()} shows it), present the generated frame(s) into additional swapchain images
-	 * via {@link RtFramePresenter}, so the display order is generated-then-real. Runs only on the normal
-	 * present path — the HDR/PQ present hooks cancel {@code blitFromTexture} at HEAD, so this TAIL is
-	 * skipped there (HDR+FG deferred). Iteration 1 duplicates the final frame (no DLSSG eval yet).
+	 * Frame-generation presentation seam: after Minecraft blits the real frame into its acquired swapchain
+	 * image (but before {@code present()} shows it), present generated frames into additional swapchain images
+	 * via {@link RtFramePresenter}, so the display order is generated-then-real. The HDR/PQ path invokes the
+	 * same seam explicitly because it cancels {@code blitFromTexture} before this TAIL injection.
 	 */
 	@Inject(method = "blitFromTexture", at = @At("TAIL"))
 	private void caustica$presentGeneratedFrames(CommandEncoderBackend commandEncoder, GpuTextureView textureView, CallbackInfo ci) {
@@ -292,7 +201,7 @@ public abstract class VulkanGpuSurfaceMixin {
 		if (srcImage == 0L) {
 			return;
 		}
-		int generatedCount = dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.effectiveMultiFrameCount();
+		int generatedCount = FrameGenSelector.current().effectiveMultiFrameCount();
 		RtFramePresenter.INSTANCE.prepareExtraFrames((VulkanCommandEncoder) commandEncoder, this.device,
 				this.swapchain, this.swapchainImages, this.presentSemaphores,
 				this.swapchainWidth, this.swapchainHeight,
@@ -300,7 +209,7 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	/**
-	 * DLSS-FG on the HDR present path: same extra-present mechanism as {@link #caustica$presentGeneratedFrames},
+	 * Frame generation on the HDR present path: same extra-present mechanism as {@link #caustica$presentGeneratedFrames},
 	 * but sourced from the HDR backbuffer ({@link RtComposite#hdrBackbufferView()}/{@code hdrBackbufferImage()})
 	 * since HDR frames never reach that TAIL inject (HEAD cancels {@code blitFromTexture} above). No-op if FG
 	 * isn't active or the HDR backbuffer isn't available (shouldn't happen right after a successful
@@ -316,7 +225,7 @@ public abstract class VulkanGpuSurfaceMixin {
 		if (hdrImage == 0L) {
 			return;
 		}
-		int generatedCount = dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.effectiveMultiFrameCount();
+		int generatedCount = FrameGenSelector.current().effectiveMultiFrameCount();
 		RtFramePresenter.INSTANCE.prepareExtraFrames(enc, this.device, this.swapchain, this.swapchainImages,
 				this.presentSemaphores, this.swapchainWidth, this.swapchainHeight,
 				hdrView, hdrImage, this.swapchainWidth, this.swapchainHeight, generatedCount, true);

@@ -44,11 +44,11 @@ public final class RtFrameStats {
                     "frame.prepareTlas",
                     "frame.recordTlas",
                     "frame.trace",
+                    "frame.firefly",
                     "frame.denoise",
                     "frame.temporalAccum",
                     "frame.upscaler",
                     "frame.exposure",
-                    "frame.dlssRr",
                     "frame.upscale",
                     "frame.displayMap",
                     "frame.copyOutput"

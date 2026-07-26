@@ -1,0 +1,42 @@
+// Fail-open guard after classic FSR2 for the HDR-PQ linear display seam.
+// Same policy as fsr_blackout_guard.comp, but preserves RGBA16F instead of
+// packing the scene-linear result back into B10G11R11 before PQ encoding.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly  uniform image2D gFsrRgba;
+layout(binding = 1, rgba16f) readonly  uniform image2D gInRgba;
+layout(binding = 2, rgba16f) writeonly uniform image2D gOut;
+
+layout(push_constant) uniform Push {
+    int displayW;
+    int displayH;
+    int renderW;
+    int renderH;
+} pc;
+
+float luma(vec3 c) {
+    float l = dot(max(c, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+    return (isnan(l) || isinf(l)) ? 0.0 : l;
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= pc.displayW || pix.y >= pc.displayH) return;
+
+    vec2 uv = (vec2(pix) + 0.5) / vec2(float(max(pc.displayW, 1)), float(max(pc.displayH, 1)));
+    ivec2 src = ivec2(clamp(
+            floor(uv * vec2(float(pc.renderW), float(pc.renderH))),
+            vec2(0.0),
+            vec2(float(max(pc.renderW - 1, 0)), float(max(pc.renderH - 1, 0)))));
+    vec3 fsrRgb = max(imageLoad(gFsrRgba, pix).rgb, vec3(0.0));
+    vec3 inputRgb = max(imageLoad(gInRgba, src).rgb, vec3(0.0));
+    bool blackout = luma(fsrRgb) < 1.0e-4 && luma(inputRgb) > 1.0e-3;
+    vec3 rgb = blackout ? inputRgb : fsrRgb;
+    if (any(isnan(rgb)) || any(isinf(rgb))) {
+        rgb = inputRgb;
+        if (any(isnan(rgb)) || any(isinf(rgb))) rgb = vec3(0.0);
+    }
+    imageStore(gOut, pix, vec4(rgb, 1.0));
+}

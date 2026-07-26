@@ -143,7 +143,7 @@ public final class RtEntities {
     // dropped items become table-entry + instance writes only.
 
     // Max per-axis residual (blocks) for a capture to count as a rigid transform of the reference mesh.
-    // Well below a texel (1/16 block) and DLSS-RR jitter; float pose math noise is ~1e-5.
+    // Well below a texel (1/16 block) and temporal jitter; float pose math noise is ~1e-5.
     private static final float RIGID_FIT_EPS = 2.0e-3f;
 
     // Per-entity ring depth: a slot is reused every REFIT_RING frames, so it must be off all queues by
@@ -469,6 +469,9 @@ public final class RtEntities {
             // The deferred horizon guarantees these are off all queues, so destroying them now is safe.
             listsForFree.releaseDeferred();
         }));
+        if (build.count > 0 && tableRing[tableSlot] != null) {
+            tableRing[tableSlot].flush(0L, (long) build.count * TABLE_ENTRY_BYTES);
+        }
         return new FrameEntities(build.instances, build.blas, build.geomTableAddr);
     }
 
@@ -1312,7 +1315,8 @@ public final class RtEntities {
                 && slot.updatesSinceBuild < refitRebuildInterval();
         if (canUpdate) {
             RtFrameStats.FRAME.count("refits", 1);
-            RtBuffer scratch = allocBuffer(ctx, slot.updateScratchSize, storage, false, label + " refit scratch");
+            RtBuffer scratch = allocBuffer(ctx, RtAccel.scratchBufferSize(ctx, slot.updateScratchSize), storage, false,
+                    label + " refit scratch");
             build.blas.add(RtAccel.refitUpdate(slot.accel, scratch, positions.deviceAddress, indices.deviceAddress, vertCount, idxCount, false,
                     label + " BLAS refit"));
             build.refitScratch.add(scratch);

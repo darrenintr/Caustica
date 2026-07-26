@@ -14,11 +14,12 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(binding = 0, rgba16f) readonly  uniform image2D gUnshadowed;
 layout(binding = 1, r8)      readonly  uniform image2D gShadowRaw;
-layout(binding = 2, rg16f)   readonly  uniform image2D gShadowClean;
-layout(binding = 3, rgba16f) readonly  uniform image2D gBeauty;
+// Clean shadow may be rg16f (legacy) or rgba16f (P0: r=mask,g=count,b=var,a=mean). Read .r either way.
+layout(binding = 2, rgba16f) readonly  uniform image2D gShadowClean;
+layout(binding = 3, r11f_g11f_b10f) readonly  uniform image2D gBeauty;
 layout(binding = 4, rgba16f) readonly  uniform image2D gSpecRaw;
 layout(binding = 5, rgba16f) readonly  uniform image2D gSpecClean;
-layout(binding = 6, rgba16f) writeonly uniform image2D gOut;
+layout(binding = 6, r11f_g11f_b10f) writeonly uniform image2D gOut;
 
 layout(push_constant) uniform Push {
     int useFlags; // bit0 shadow, bit1 reflection
@@ -38,15 +39,32 @@ void main() {
     vec3 color = beauty;
 
     if ((pc.useFlags & 1) != 0) {
-        vec3 unshadowed = imageLoad(gUnshadowed, pix).rgb;
+        vec3 unshadowed = max(imageLoad(gUnshadowed, pix).rgb, vec3(0.0));
         float rawS = clamp(imageLoad(gShadowRaw, pix).r, 0.0, 1.0);
         float cleanS = clamp(imageLoad(gShadowClean, pix).r, 0.0, 1.0);
+        // Very tight clamps: FFX temporal must not rewrite lighting energy.
+        // Only allow a tiny denoise delta around the raw binary shadow sample.
+        cleanS = min(cleanS, rawS + 0.06);
+        cleanS = max(cleanS, rawS - 0.06);
+        // Reject non-finite / nonsense clean masks (uninit history used to go near 0 → world black).
+        if (isnan(cleanS) || isinf(cleanS)) {
+            cleanS = rawS;
+        }
         color += unshadowed * (cleanS - rawS);
     }
     if ((pc.useFlags & 2) != 0) {
-        vec3 specRaw = imageLoad(gSpecRaw, pix).rgb;
-        vec3 specClean = imageLoad(gSpecClean, pix).rgb;
-        color += (specClean - specRaw);
+        vec3 specRaw = max(imageLoad(gSpecRaw, pix).rgb, vec3(0.0));
+        vec3 specClean = max(imageLoad(gSpecClean, pix).rgb, vec3(0.0));
+        if (any(isnan(specClean)) || any(isinf(specClean))) {
+            specClean = specRaw;
+        }
+        // Cap reflection delta magnitude so a bad clean plate cannot black the frame.
+        vec3 dSpec = specClean - specRaw;
+        float dMax = max(max(abs(dSpec.r), abs(dSpec.g)), abs(dSpec.b));
+        if (dMax > 2.0) {
+            dSpec *= 2.0 / dMax;
+        }
+        color += dSpec;
     }
 
     if (any(isnan(color)) || any(isinf(color))) {
@@ -55,6 +73,10 @@ void main() {
             color = vec3(0.0);
         }
     }
+    // Never go darker than a large fraction of the raw beauty (fail-open floor).
+    // This alone would have prevented the "world black, hand lit" symptom.
+    vec3 floorC = beauty * 0.35;
+    color = max(color, floorC);
     color = min(max(color, vec3(0.0)), vec3(64.0));
     imageStore(gOut, pix, vec4(color, 1.0));
 }

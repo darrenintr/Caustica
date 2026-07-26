@@ -132,12 +132,36 @@ void main() {
 
     Section sec = SectionTable(pcAddr.tableAddr).s[gl_InstanceCustomIndexEXT];
     uint bucket = gl_GeometryIndexEXT;
-    uint tri = gl_PrimitiveID + sec.triBase[bucket];
+    // Multi-geom: gl_PrimitiveID restarts per geometry → re-add triBase[bucket].
+    // Single-geom (RADV): geometryIndex is always 0 and triBase[0]==0, so tri == gl_PrimitiveID
+    // over the packed solid|cutout|translucent|water arrays.
+    uint tri = gl_PrimitiveID + sec.triBase[min(bucket, 3u)];
+    Prim pr = Prims(sec.primAddr).p[tri];
 
-    // Water radiance rays use a closest-hit-only SBT record. Shadow rays run this record: tint sunlight by
-    // the biome water color, then keep walking so submerged terrain is lit by colored transmission.
+    // Shadow rays set SkipClosestHit (+ TerminateOnFirstHit). Multi-geom encodes material in
+    // geometryIndex; RADV single-geom always hits geometry 0, so re-derive the bucket from prim
+    // flags: tint.w 2=glass/ice, 1=water; normal.w>=1.5 marks non-SOLID (cutout/translucent).
+    bool shadowRay = (gl_IncomingRayFlagsEXT & gl_RayFlagsSkipClosestHitShaderEXT) != 0u;
+    if (bucket == 0u) {
+        if (pr.tint.w > 1.5) {
+            bucket = BUCKET_TRANSLUCENT;
+        } else if (pr.tint.w > 0.5) {
+            bucket = BUCKET_WATER;
+        } else if (pr.normal.w >= 1.5) {
+            bucket = BUCKET_CUTOUT;
+        } else {
+            // True solid: accept. Radiance continues to closest-hit; shadow terminates on this hit.
+            return;
+        }
+    }
+
+    // Water radiance rays use a closest-hit-only SBT record on multi-geom. Shadow rays (and RADV
+    // single-geom radiance any-hit for water) tint sunlight by the biome water color, then keep
+    // walking so submerged terrain is lit by colored transmission.
     if (bucket == BUCKET_WATER) {
-        Prim pr = Prims(sec.primAddr).p[tri];
+        if (!shadowRay) {
+            return; // radiance: accept, let closest-hit shade the dielectric surface
+        }
         shadowVis.tint *= mix(vec3(1.0), pr.tint.rgb, WATER_SHADOW_TINT);
         // Record the NEAREST water crossing (any-hit order is arbitrary) in the dedicated waterT lane. For an
         // underwater shading point this is the exit point of its sun shadow ray, where world.rgen evaluates
@@ -147,37 +171,21 @@ void main() {
         return;
     }
 
-    // Translucent radiance rays use a closest-hit-only SBT record; shadow rays tint and pass through here.
-    // Unlike the cutout path below, this doesn't touch the atlas at all: sampling+interpolating a UV per
-    // shadow hit was the hottest texture read in the any-hit shader (a shadow ray only needs the pane's
-    // overall tint/opacity, not the per-texel pattern the eye would see — world.rchit's radiance path
-    // still samples per-texel for that). pr.mat carries a precomputed whole-sprite average {r,g,b,a} with
-    // biome tint already baked in at pack time (RtTerrain.emit()/translucentAvgColor), so this reads only
-    // the one 16-byte mat lane of the 48-byte Prim record — not a second, separately-scattered tint load.
-    //
-    // Modeled as Beer-Lambert absorption (matching the water medium in world.rgen) rather than a flat
-    // alpha-lerp toward the raw average color: a per-channel extinction is derived from how dark that
-    // average is, scaled by the average alpha (how much of the sprite is glass-colorant vs. see-through
-    // frame), so richly saturated panes darken transmitted light non-linearly instead of just fading
-    // linearly toward flat paint. Multiplying into shadowVis.tint (rather than mixing from a fresh
-    // vec3(1.0)) blends this absorption with the light color already accumulated by any surfaces the
-    // shadow ray crossed earlier — stacked colored panes compound correctly.
+    // Translucent: radiance accepts (closest-hit does dielectric); shadow absorbs and passes through.
+    // pr.mat carries a precomputed whole-sprite average {r,g,b,a} with biome tint baked at pack time.
     if (bucket == BUCKET_TRANSLUCENT) {
-        Prim pr = Prims(sec.primAddr).p[tri];
+        if (!shadowRay) {
+            return;
+        }
         vec3 avgColor = max(pr.mat.rgb, vec3(1.0e-3));
         vec3 colorExtinction = max(-log(avgColor), vec3(0.0));
-        // The neutral floor is a flat per-hit dimming, NOT scaled by alpha: vanilla clear glass has a low
-        // natural alpha (that's what makes the alpha-blended render layer look see-through), so folding it
-        // into the alpha-scaled term crushed it to near-zero for exactly the white/clear-glass case it's
-        // meant to cover. Only the color-derived term scales with alpha (how saturated the pane's own tint
-        // is); every translucent hit still pays the flat neutral cost regardless.
+        // Neutral floor is flat per-hit dimming, not scaled by alpha (clear glass has low natural alpha).
         shadowVis.tint *= exp(-colorExtinction * pr.mat.a - TRANSLUCENT_NEUTRAL_EXTINCTION);
         ignoreIntersectionEXT;
         return;
     }
 
-    // Cutout geometry: alpha from the atlas. gl_PrimitiveID restarts at 0 per geometry, so re-add this
-    // bucket's triangle base to index the section's packed UV arrays.
+    // Cutout geometry: alpha from the atlas. UVs are packed per-triangle corner (3*tri + k).
     UVs uvs = UVs(sec.uvAddr);
     vec2 uv = bary.x * uvs.uv[3u * tri + 0u] + bary.y * uvs.uv[3u * tri + 1u] + bary.z * uvs.uv[3u * tri + 2u];
     if (textureLod(blockAtlas, uv, 0.0).a < ALPHA_CUTOFF) {

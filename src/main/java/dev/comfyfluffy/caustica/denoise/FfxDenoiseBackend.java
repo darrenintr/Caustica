@@ -55,13 +55,19 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
     private static final String SHADER_DIR = "/caustica/rt/";
     private static final int HISTORY_RING = 3;
     /**
-     * Temporal reproject is off until MV path is proven. Spatial à-trous is also off for now
-     * ({@link #SPATIAL_PASSTHROUGH}): the multi-pass atrous path produced pure black frames on
-     * RADV even with tight sigmas (2026-07-14). Dispatch does a reliable {@code vkCmdCopyImage}
-     * of the noisy RT color so the user at least sees the path-traced image while denoise=ON.
+     * Full AMD FidelityFX denoise pipeline enabled (2026-07-20):
+     * <pre>
+     *   ffx_reproject            (motion-aware temporal reproject + variance)
+     *   ffx_resolve_temporal     (variance-weighted AABB-clamped temporal mix)
+     *   ffx_atrous × 5           (dilated à-trous, stepSizes 1,2,4,8,1)
+     * </pre>
+     * The previous temporal OFF / spatial passthrough state was gated by a 2026-07-14
+     * RADV black-frame regression; the conditions that produced it (jittered MV
+     * injection in {@code world.rgen}, missing transfer→compute barriers on the
+     * history ring) are now fixed, so the full pipeline is active again.
      */
-    private static final boolean TEMPORAL_ENABLED = false;
-    private static final boolean SPATIAL_PASSTHROUGH = true;
+    private static final boolean TEMPORAL_ENABLED = true;
+    private static final boolean SPATIAL_PASSTHROUGH = false;
     private static final int ATROUS_PASSES = 5;
     private static final int[] ATROUS_STEPS = {1, 2, 4, 8, 1};
 
@@ -89,11 +95,19 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
     private long atrousLayout;
     private long atrousPipeline;
 
+    private long stampDsl;
+    private long stampPool;
+    private long stampSet;
+    private long stampLayout;
+    private long stampPipeline;
+
     private long sampler;
     private RtImage[] historyRadiance;
     private RtImage reprojectColorBuf;
     private RtImage reprojectVarianceBuf;
     private RtImage resolveDenoisedBuf;
+    /** v0.6.8+: per-tile jitter guide (R8G8_UNORM, render res). Optional — see bindReproject. */
+    private RtImage jitterGuide;
 
     @Override
     public String name() {
@@ -125,6 +139,7 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
                 createReprojectPipeline(ctx);
                 createResolvePipeline(ctx);
                 createAtrousPipeline(ctx);
+                createStampPipeline(ctx);
             }
             historyRadiance = new RtImage[HISTORY_RING];
         }
@@ -133,6 +148,7 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
                 historyRadiance[i].destroy();
                 historyRadiance[i] = null;
             }
+            // History packs device depth into .a for the next-frame disocclusion test — must stay RGBA16F.
             historyRadiance[i] = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                     "ffx history " + i);
         }
@@ -145,9 +161,10 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
         if (resolveDenoisedBuf != null) {
             resolveDenoisedBuf.destroy();
         }
+        // reprojectColorBuf packs depth into .a (rgba16f). resolveDenoisedBuf is pure RGB beauty.
         reprojectColorBuf = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx reproject color");
         reprojectVarianceBuf = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R32_SFLOAT, "ffx reproject variance");
-        resolveDenoisedBuf = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx resolve denoised");
+        resolveDenoisedBuf = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "ffx resolve denoised");
         this.width = width;
         this.height = height;
         frameCounter = 0;
@@ -235,10 +252,15 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
         }
 
         if (TEMPORAL_ENABLED) {
-            barrierComputeToTransfer(stack, cmd, outColor.image);
-            copyFinalToHistory(stack, cmd, ctx, outColor);
             int writeSlot = (int) (frameCounter % HISTORY_RING);
-            barrierTransferToShader(stack, cmd, historyRadiance[writeSlot].image);
+            RtImage historyWrite = historyRadiance[writeSlot];
+            // outColor (B10G11R11) → history slot (RGBA16F), packing device depth into
+            // .a. The atrous loop's last pass already emitted a barrierCompute for its
+            // dst (outColor on pass 4), so the stamp's read of outColor sees the
+            // up-to-date HDR radiance. The stamp's write to historyWrite is the
+            // last touch this frame; the next frame's reproject will sample this
+            // slot via the transfer barrier we set up at frame start.
+            dispatchStamp(stack, cmd, ctx, outColor, inDepth, historyWrite);
         }
         frameCounter++;
         return true;
@@ -283,6 +305,17 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
         frameCounter = 0;
     }
 
+    /**
+     * v0.6.8+: bind the per-tile jitter guide (R8G8_UNORM, render res). The reproject
+     * pass ({@code ffx_reproject.comp}) reads this and adds the per-tile offset to
+     * {@code prevUV} so the history is sampled at the previous-frame position that
+     * matches the current sample's sub-pixel. Optional — when null, a placeholder view
+     * is bound and the sampler returns 0.5 = offset 0 (legacy behaviour).
+     */
+    public void setJitterGuide(RtImage jitterGuide) {
+        this.jitterGuide = jitterGuide;
+    }
+
     @Override
     public void destroy() {
         if (!ready) {
@@ -294,15 +327,19 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
             if (reprojectPipeline != 0L) VK10.vkDestroyPipeline(vk, reprojectPipeline, null);
             if (resolvePipeline != 0L) VK10.vkDestroyPipeline(vk, resolvePipeline, null);
             if (atrousPipeline != 0L) VK10.vkDestroyPipeline(vk, atrousPipeline, null);
+            if (stampPipeline != 0L) VK10.vkDestroyPipeline(vk, stampPipeline, null);
             if (reprojectLayout != 0L) VK10.vkDestroyPipelineLayout(vk, reprojectLayout, null);
             if (resolveLayout != 0L) VK10.vkDestroyPipelineLayout(vk, resolveLayout, null);
             if (atrousLayout != 0L) VK10.vkDestroyPipelineLayout(vk, atrousLayout, null);
+            if (stampLayout != 0L) VK10.vkDestroyPipelineLayout(vk, stampLayout, null);
             if (reprojectPool != 0L) VK10.vkDestroyDescriptorPool(vk, reprojectPool, null);
             if (resolvePool != 0L) VK10.vkDestroyDescriptorPool(vk, resolvePool, null);
             if (atrousPool != 0L) VK10.vkDestroyDescriptorPool(vk, atrousPool, null);
+            if (stampPool != 0L) VK10.vkDestroyDescriptorPool(vk, stampPool, null);
             if (reprojectDsl != 0L) VK10.vkDestroyDescriptorSetLayout(vk, reprojectDsl, null);
             if (resolveDsl != 0L) VK10.vkDestroyDescriptorSetLayout(vk, resolveDsl, null);
             if (atrousDsl != 0L) VK10.vkDestroyDescriptorSetLayout(vk, atrousDsl, null);
+            if (stampDsl != 0L) VK10.vkDestroyDescriptorSetLayout(vk, stampDsl, null);
             if (sampler != 0L) VK10.vkDestroySampler(vk, sampler, null);
         }
         for (int i = 0; i < HISTORY_RING; i++) {
@@ -339,7 +376,12 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
 
     private void createReprojectPipeline(RtContext ctx) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(8, stack);
+            // v0.6.8+: 9 bindings (0..8). Binding 8 is the per-tile jitter guide sampler
+            // (R8G8_UNORM, render res) — see nrd_prewarp.comp / taau.comp / ffx_reproject.comp
+            // and docs/TILE_JITTER_GUIDE_DESIGN.md. The reproject reads it and adds the
+            // per-tile offset to prevUV so the history is sampled at the previous-frame
+            // position that matches the current sample's sub-pixel.
+            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(9, stack);
             for (int i = 0; i < 5; i++) {
                 binds.get(i).binding(i).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1)
                         .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
@@ -350,14 +392,17 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
                     .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
             binds.get(7).binding(7).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                     .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+            binds.get(8).binding(8).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
             VkDescriptorSetLayoutCreateInfo dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds);
             LongBuffer p = stack.mallocLong(1);
             check(VK10.vkCreateDescriptorSetLayout(ctx.vk(), dslci, null, p), "vkCreateDescriptorSetLayout(ffx reproject)");
             reprojectDsl = p.get(0);
 
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(2, stack);
-            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(8);
-            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1);
+            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(7);
+            // 2 combined samplers (history @7 + jitterGuide @8).
+            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(2);
             VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(1).pPoolSizes(poolSizes);
             check(VK10.vkCreateDescriptorPool(ctx.vk(), dpci, null, p), "vkCreateDescriptorPool(ffx reproject)");
             reprojectPool = p.get(0);
@@ -470,6 +515,74 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
         }
     }
 
+    private void createStampPipeline(RtContext ctx) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(3, stack);
+            for (int i = 0; i < 3; i++) {
+                binds.get(i).binding(i).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1)
+                        .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+            }
+            VkDescriptorSetLayoutCreateInfo dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds);
+            LongBuffer p = stack.mallocLong(1);
+            check(VK10.vkCreateDescriptorSetLayout(ctx.vk(), dslci, null, p), "vkCreateDescriptorSetLayout(ffx stamp)");
+            stampDsl = p.get(0);
+
+            VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(1, stack);
+            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(3);
+            VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(1).pPoolSizes(poolSizes);
+            check(VK10.vkCreateDescriptorPool(ctx.vk(), dpci, null, p), "vkCreateDescriptorPool(ffx stamp)");
+            stampPool = p.get(0);
+
+            VkDescriptorSetAllocateInfo dsai = VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
+                    .descriptorPool(stampPool).pSetLayouts(stack.longs(stampDsl));
+            LongBuffer pSet = stack.mallocLong(1);
+            check(VK10.vkAllocateDescriptorSets(ctx.vk(), dsai, pSet), "vkAllocateDescriptorSets(ffx stamp)");
+            stampSet = pSet.get(0);
+
+            VkPushConstantRange.Buffer pcr = VkPushConstantRange.calloc(1, stack)
+                    .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(16);
+            VkPipelineLayoutCreateInfo plci = VkPipelineLayoutCreateInfo.calloc(stack).sType$Default()
+                    .pSetLayouts(stack.longs(stampDsl)).pPushConstantRanges(pcr);
+            check(VK10.vkCreatePipelineLayout(ctx.vk(), plci, null, p), "vkCreatePipelineLayout(ffx stamp)");
+            stampLayout = p.get(0);
+
+            long module = loadModule(ctx.vk(), stack, "ffx_history_stamp.comp.spv");
+            VkPipelineShaderStageCreateInfo stage = VkPipelineShaderStageCreateInfo.calloc(stack)
+                    .sType$Default().stage(VK10.VK_SHADER_STAGE_COMPUTE_BIT).module(module).pName(stack.UTF8("main"));
+            VkComputePipelineCreateInfo.Buffer cpci = VkComputePipelineCreateInfo.calloc(1, stack);
+            cpci.get(0).sType$Default().stage(stage).layout(stampLayout);
+            check(VK10.vkCreateComputePipelines(ctx.vk(), VK10.VK_NULL_HANDLE, cpci, null, p), "vkCreateComputePipelines(ffx stamp)");
+            stampPipeline = p.get(0);
+            VK10.vkDestroyShaderModule(ctx.vk(), module, null);
+        }
+    }
+
+    private void bindStamp(RtContext ctx, RtImage inColor, RtImage inDepth, RtImage outHistory) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            RtImage[] images = {inColor, inDepth, outHistory};
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(3, stack);
+            for (int i = 0; i < 3; i++) {
+                VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
+                info.get(0).imageView(images[i].view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+                writes.get(i).sType$Default().dstSet(stampSet).dstBinding(i).descriptorCount(1)
+                        .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(info);
+            }
+            VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
+        }
+    }
+
+    private void dispatchStamp(MemoryStack stack, VkCommandBuffer cmd, RtContext ctx,
+                               RtImage inColor, RtImage inDepth, RtImage outHistory) {
+        bindStamp(ctx, inColor, inDepth, outHistory);
+        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "ffx history stamp")) {
+            VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, stampPipeline);
+            VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, stampLayout, 0,
+                    stack.longs(stampSet), null);
+            VK10.vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+        }
+        barrierCompute(stack, cmd, outHistory.image);
+    }
+
     private void clearHistoryToZero(MemoryStack stack, VkCommandBuffer cmd) {
         try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(RtContext.get(), cmd, "ffx denoise init clear")) {
             VkClearColorValue black = VkClearColorValue.calloc(stack);
@@ -498,7 +611,11 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
                                RtImage inMotion, RtImage colorOut, RtImage varianceOut, long historyView) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             RtImage[] images = {inColor, inNormal, inDepth, inMotion, inColor, colorOut, varianceOut};
-            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(8, stack);
+            // v0.6.8+: 9 writes (8 = jitterGuide sampler, optional). When jitterGuide is
+            // null, fall back to a placeholder view (any image view) so the descriptor
+            // update is well-formed; the sampler reads 0.5 = offset 0 = legacy behaviour.
+            long jitterView = (jitterGuide != null) ? jitterGuide.view : inColor.view;
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(9, stack);
             for (int i = 0; i < 7; i++) {
                 VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
                 info.get(0).imageView(images[i].view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
@@ -509,6 +626,11 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
             samplerInfo.get(0).imageView(historyView).sampler(sampler).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
             writes.get(7).sType$Default().dstSet(reprojectSet).dstBinding(7).descriptorCount(1)
                     .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(samplerInfo);
+            // 8: jitter guide sampler. Same `sampler` as history @7 (linear clamp).
+            VkDescriptorImageInfo.Buffer jitterInfo = VkDescriptorImageInfo.calloc(1, stack);
+            jitterInfo.get(0).imageView(jitterView).sampler(sampler).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+            writes.get(8).sType$Default().dstSet(reprojectSet).dstBinding(8).descriptorCount(1)
+                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(jitterInfo);
 
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
         }
@@ -667,20 +789,10 @@ public final class FfxDenoiseBackend implements CausticaDenoiseBackend {
     }
 
     private void copyFinalToHistory(MemoryStack stack, VkCommandBuffer cmd, RtContext ctx, RtImage outColor) {
-        int writeSlot = (int) (frameCounter % HISTORY_RING);
-        RtImage history = historyRadiance[writeSlot];
-        if (history == null) {
-            System.err.println("[Caustica FFX] copyFinalToHistory early-return: historyRadiance[" + writeSlot + "] is null");
-            return;
-        }
-        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "ffx history copy")) {
-            VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
-            region.srcSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
-            region.dstSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
-            region.extent().width(width).height(height).depth(1);
-            VK10.vkCmdCopyImage(cmd, outColor.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
-                    history.image, VK10.VK_IMAGE_LAYOUT_GENERAL, region);
-        }
+        // Retained as a no-op for source compatibility; the real history stamp is
+        // dispatched directly via {@link #dispatchStamp} so .a gets device depth
+        // (vkCmdCopyImage from B10G11R11 leaves RGBA16F .a undefined / zero on RADV).
+        // Kept in case any external call site still references this method.
     }
 
     private static long loadModule(VkDevice vk, MemoryStack stack, String name) {

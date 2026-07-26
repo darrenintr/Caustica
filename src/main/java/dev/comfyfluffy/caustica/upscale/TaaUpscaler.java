@@ -7,7 +7,6 @@ import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
-import dev.comfyfluffy.caustica.upscale.UpscalerSelector.Mode;
 import org.joml.Matrix4fc;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
@@ -16,6 +15,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
+import java.util.Arrays;
 
 /**
  * TAAU - Temporal Anti-Aliasing Upsampler.
@@ -33,14 +33,15 @@ import java.nio.LongBuffer;
  *   <li>4 = ULTRA PERFORMANCE (0.40x render)</li>
  * </ul>
  *
- * <p>Why this exists: XeSS only ships Windows DLLs in its public SDK, FSR 4.1 INT8 requires RDNA 3/4,
- * DLSS-RR requires NVIDIA. TAAU is the universal fallback -- lower quality than XeSS/FSR 4 but
+ * <p>Why this exists: optional SDK-backed providers have platform and hardware constraints. TAAU is the
+ * universal fallback -- lower quality than dedicated temporal super-resolution providers but
  * works on anything and gives meaningful temporal stability (the main thing the user was missing
  * with spp=1 + NRD-only + no upscaler).
  */
 public final class TaaUpscaler implements Upscaler {
 
     private static final String SHADER_PATH = "/caustica/rt/taau.comp.spv";
+    private static final String CAS_SHADER_PATH = "/caustica/rt/cas.comp.spv";
 
     private final VulkanDevice vkDevice;
     private boolean ready;
@@ -49,13 +50,36 @@ public final class TaaUpscaler implements Upscaler {
     private int displayWidth;
     private int displayHeight;
 
-    // Vulkan resources
+    // Vulkan resources — temporal pass
     private long descriptorSetLayout;
     private long pipelineLayout;
     private long pipeline;
     private long descriptorPool;
-    private long descriptorSet;
+    private final long[] descriptorSets = new long[2];
+    // 9 bindings (0..8): 5 storage inputs, 2 combined-image-samplers (history + jitterGuide),
+    //                   2 storage outputs. v0.6.8 added binding 8 (jitterGuide).
+    private final long[][] boundViews = new long[2][9];
     private long sampler;
+    // v0.6.8+: per-tile jitter guide written by world.rgen (R8G8_UNORM, render res). TAAU
+    // reads this in q2TrilinearHistory to add the per-tile offset to the reproject UV.
+    // Optional — when null the binding is filled with a placeholder (any view) and the
+    // sampler returns 0.5 (= 0 offset), preserving legacy behaviour.
+    private RtImage jitterGuide;
+    // Vulkan resources — RCAS post-pass (AMD CAS sharpening, same algorithm as FFX RCAS).
+    // RCAS is a 5-tap contrast-adaptive sharpen, runs after temporal blend at display res.
+    private long casDescriptorSetLayout;
+    private long casPipelineLayout;
+    private long casPipeline;
+    private long casDescriptorPool;
+    private long[] casDescriptorSets = new long[0];
+    private long[][] casBoundViews = new long[0][];
+    // Intermediate scratch: RCAS reads from temporal pass output, writes to final out.
+    // We can do RCAS in-place if temporal output is not the final swapchain, but to keep
+    // the temporal history copy clean we always have TAAU write into a separate "casSrc"
+    // and RCAS write into out. TAAU's existing logic writes directly to `out` though, so
+    // we keep that and use the same image for both stages (RCAS reads from outColor which
+    // was just written by TAAU, writes back to outColor — descriptor alias).
+    private RtImage casScratch;
 
     // History at display resolution (two ping-pong slots)
     private RtImage historyA;
@@ -82,8 +106,23 @@ public final class TaaUpscaler implements Upscaler {
     }
 
     @Override
-    public Mode mode() {
-        return Mode.TAAU;
+    public String id() {
+        return "taau";
+    }
+
+    @Override
+    public String displayName() {
+        return "TAAU";
+    }
+
+    @Override
+    public boolean performsTemporalReconstruction() {
+        return true;
+    }
+
+    @Override
+    public boolean expectsRawRenderJitter() {
+        return true;
     }
 
     @Override
@@ -91,13 +130,26 @@ public final class TaaUpscaler implements Upscaler {
         return ready;
     }
 
+    /**
+     * Set the per-tile jitter guide (R8G8_UNORM, render res) written by world.rgen. The
+     * TAAU's reproject reads this and adds the per-tile offset to {@code prevUV} so the
+     * history is sampled at the previous-frame position that matches the current sample's
+     * sub-pixel. Optional — when null, a placeholder view is bound and the sampler returns
+     * 0.5 (= 0 offset), preserving legacy behaviour.
+     */
+    public void setJitterGuide(RtImage jitterGuide) {
+        this.jitterGuide = jitterGuide;
+    }
+
     private float renderScaleForQuality(int quality) {
+        // Higher quality = higher render scale. Old mapping had QUALITY(1)=0.67 below
+        // BALANCED(2)=0.75, which made the "quality" preset blurrier than balanced.
         return switch (quality) {
-            case 0 -> 1.00f;
-            case 1 -> 0.67f;
-            case 2 -> 0.75f;
-            case 3 -> 0.50f;
-            default -> 0.40f;
+            case 0 -> 1.00f; // NATIVE — TAA only, no spatial downscale
+            case 1 -> 0.85f; // QUALITY
+            case 2 -> 0.75f; // BALANCED
+            case 3 -> 0.58f; // PERFORMANCE
+            default -> 0.45f; // ULTRA PERFORMANCE
         };
     }
 
@@ -125,6 +177,7 @@ public final class TaaUpscaler implements Upscaler {
 
         try {
             createPipeline();
+            createCasPipeline();
             RtContext ctx = RtContext.get();
             if (ctx != null) {
                 historyA = ctx.createStorageImage(displayWidth, displayHeight,
@@ -134,6 +187,12 @@ public final class TaaUpscaler implements Upscaler {
                 // Clear history on (re)create.
                 clearImage(cmd, historyA);
                 clearImage(cmd, historyB);
+                // RCAS scratch at display res in the same format TAAU produces (B10G11R11
+                // matches the TAAU out image, which is the same RtContext.HDR_RADIANCE_FORMAT).
+                // RCAS reads from outColor (alias of casScratch.view via descriptor rebind),
+                // writes to outColor — so scratch and out can be the same image.
+                casScratch = ctx.createStorageImage(displayWidth, displayHeight,
+                        RtContext.HDR_RADIANCE_FORMAT, "taau cas scratch");
                 historyInitialized = false;
             }
             ready = true;
@@ -162,8 +221,10 @@ public final class TaaUpscaler implements Upscaler {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             RtImage prevHistory = historyAIsCurrent ? historyA : historyB;
             RtImage newHistory = historyAIsCurrent ? historyB : historyA;
+            int setIndex = historyAIsCurrent ? 0 : 1;
 
-            bindDescriptors(stack, cmd, color, depth, motion, normals, diffuseAlbedo, prevHistory, newHistory, out);
+            bindDescriptors(stack, setIndex, color, depth, motion, normals, diffuseAlbedo,
+                    prevHistory, newHistory, out);
 
             ByteBuffer push = stack.malloc(56);
             push.putFloat(0, (float) renderWidth);
@@ -173,19 +234,24 @@ public final class TaaUpscaler implements Upscaler {
             // MV passed in is in render pixels; we want delta in display UV: mv / dstSize.
             push.putFloat(16, 1.0f / displayWidth);
             push.putFloat(20, 1.0f / displayHeight);
+            // Composite feeds NRD/FFX-denoised beauty into TAAU. A second heavy temporal pass
+            // (old alpha≈0.55, matte rough→0.27 current) milks the plate. Prefer current frame:
+            // near-native = mild AA only; downscaled = slightly more history for upsample noise.
+            float scale = (float) renderWidth / (float) Math.max(1, displayWidth);
             float baseAlpha = CausticaConfig.Rt.Composite.TEMPORAL_ALPHA.value();
-            float alpha = historyInitialized ? baseAlpha : 1.0f; // first frame: no blend
+            float taauAlpha = scale >= 0.95f
+                    ? Math.max(baseAlpha, 0.88f)
+                    : Math.max(baseAlpha, 0.72f);
+            float alpha = historyInitialized ? taauAlpha : 1.0f; // first frame: no blend
             push.putFloat(24, alpha);
             push.putFloat(28, CausticaConfig.Rt.Composite.TEMPORAL_DISOCCLUSION.value());
             float sharpness = CausticaConfig.Rt.Upscaler.SHARPEN.value()
                     ? CausticaConfig.Rt.Upscaler.SHARPNESS.value() : 0.0f;
-            // 0..0.5 Catmull-Rom bias. The shader further modulates per-pixel by roughness:
-            // matte (rough>=0.4) gets sharpened=0 to avoid amplifying path-tracer noise,
-            // glossy gets full sharpness.
-            push.putFloat(32, sharpness * 0.5f);
-            // varianceClipGamma: 1.0 = textbook, 1.5 = more conservative (less ghost, slightly more blur).
-            // We use 1.3 as a balanced default; the shader tightens to 0.7*gamma on glossy surfaces.
-            push.putFloat(36, 1.3f);
+            // Full sharpness range for the upsample kernel (shader multiplies; was *0.5 which
+            // halved user sharpness on top of RCAS post-pass already running).
+            push.putFloat(32, sharpness);
+            // varianceClipGamma: lower = tighter clip = less history bleed / less milk.
+            push.putFloat(36, 1.0f);
             push.putInt(40, historyInitialized ? 1 : 0);
             push.putInt(44, 0);
             // Signed render-pixel offset applied to the primary ray. taau.comp subtracts it
@@ -196,7 +262,7 @@ public final class TaaUpscaler implements Upscaler {
             VkCommandBuffer cb = new VkCommandBuffer(cmd, vkDevice.vkDevice());
             VK10.vkCmdBindPipeline(cb, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
             VK10.vkCmdBindDescriptorSets(cb, VK10.VK_PIPELINE_BIND_POINT_COMPUTE,
-                    pipelineLayout, 0, stack.longs(descriptorSet), null);
+                    pipelineLayout, 0, stack.longs(descriptorSets[setIndex]), null);
             VK10.vkCmdPushConstants(cb, pipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
 
             int groupsX = (displayWidth + 7) / 8;
@@ -207,6 +273,33 @@ public final class TaaUpscaler implements Upscaler {
             // caller's responsibility (RtComposite.recordFrame inserts one after dispatch).
             historyAIsCurrent = !historyAIsCurrent;
             historyInitialized = true;
+
+            // --- RCAS post-pass (AMD CAS sharpening, same algorithm as FFX RCAS) ---
+            // Runs at display res, reads from `out` (just written by TAAU), writes back to `out`
+            // in-place via descriptor aliasing. Skipped if sharpness <= 1e-4.
+            float sharpen = CausticaConfig.Rt.Upscaler.SHARPEN.value()
+                    ? CausticaConfig.Rt.Upscaler.SHARPNESS.value() : 0.0f;
+            if (sharpen > 1e-4f && casPipeline != 0L && casScratch != null) {
+                try {
+                    bindCasDescriptors(stack, out, out);
+                    ByteBuffer casPush = stack.malloc(16);
+                    casPush.putInt(0, displayWidth);
+                    casPush.putInt(4, displayHeight);
+                    casPush.putFloat(8, Math.min(sharpen, 1.0f));
+                    casPush.putFloat(12, 0.0f);
+                    VkCommandBuffer casCb = new VkCommandBuffer(cmd, vkDevice.vkDevice());
+                    VK10.vkCmdBindPipeline(casCb, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, casPipeline);
+                    VK10.vkCmdBindDescriptorSets(casCb, VK10.VK_PIPELINE_BIND_POINT_COMPUTE,
+                            casPipelineLayout, 0, stack.longs(casDescriptorSets[0]), null);
+                    VK10.vkCmdPushConstants(casCb, casPipelineLayout,
+                            VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, casPush);
+                    int casGx = (displayWidth + 7) / 8;
+                    int casGy = (displayHeight + 7) / 8;
+                    VK10.vkCmdDispatch(casCb, casGx, casGy, 1);
+                } catch (Throwable t) {
+                    CausticaMod.LOGGER.warn("TAAU RCAS post-pass failed", t);
+                }
+            }
             return true;
         } catch (Throwable t) {
             CausticaMod.LOGGER.warn("TAAU evaluate failed", t);
@@ -233,9 +326,37 @@ public final class TaaUpscaler implements Upscaler {
             VK10.vkDestroyDescriptorPool(vkDevice.vkDevice(), descriptorPool, null);
             descriptorPool = 0L;
         }
+        Arrays.fill(descriptorSets, 0L);
+        for (long[] views : boundViews) {
+            Arrays.fill(views, 0L);
+        }
         if (sampler != 0L) {
             VK10.vkDestroySampler(vkDevice.vkDevice(), sampler, null);
             sampler = 0L;
+        }
+        if (casPipeline != 0L) {
+            VK10.vkDestroyPipeline(vkDevice.vkDevice(), casPipeline, null);
+            casPipeline = 0L;
+        }
+        if (casPipelineLayout != 0L) {
+            VK10.vkDestroyPipelineLayout(vkDevice.vkDevice(), casPipelineLayout, null);
+            casPipelineLayout = 0L;
+        }
+        if (casDescriptorSetLayout != 0L) {
+            VK10.vkDestroyDescriptorSetLayout(vkDevice.vkDevice(), casDescriptorSetLayout, null);
+            casDescriptorSetLayout = 0L;
+        }
+        if (casDescriptorPool != 0L) {
+            VK10.vkDestroyDescriptorPool(vkDevice.vkDevice(), casDescriptorPool, null);
+            casDescriptorPool = 0L;
+        }
+        Arrays.fill(casDescriptorSets, 0L);
+        for (long[] views : casBoundViews) {
+            Arrays.fill(views, 0L);
+        }
+        if (casScratch != null) {
+            casScratch.destroy();
+            casScratch = null;
         }
         if (historyA != null) { historyA.destroy(); historyA = null; }
         if (historyB != null) { historyB.destroy(); historyB = null; }
@@ -250,9 +371,10 @@ public final class TaaUpscaler implements Upscaler {
 
     private void createPipeline() throws IOException {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            // 8 bindings: 5 storage image inputs (color/depth/motion/normal/albedo) + 1 sampled (history)
-            //            + 2 storage images (outColor, historyOut).
-            int bindings = 8;
+            // 9 bindings (v0.6.8+): 5 storage image inputs (color/depth/motion/normal/albedo)
+            //                      + 2 combined image samplers (history @5, jitterGuide @8)
+            //                      + 2 storage images (outColor, historyOut).
+            int bindings = 9;
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(bindings, stack);
             // 0..4: storage images (inColorLow, inDepthLow, inMotionLow, inNormalLow, inAlbedoLow)
             for (int i = 0; i < 5; i++) {
@@ -267,6 +389,12 @@ public final class TaaUpscaler implements Upscaler {
                     .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
             binds.get(7).binding(7).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                     .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+            // 8 (v0.6.8+): per-tile jitter guide, combined image sampler. Reuses the
+            // existing `sampler` (linear clamp, same as history). When the host doesn't
+            // call setJitterGuide, bindDescriptors writes a placeholder view and the
+            // sampler reads 0.5 → offset = 0, preserving the legacy path.
+            binds.get(8).binding(8).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
 
             LongBuffer pDsl = stack.mallocLong(1);
             VK10.vkCreateDescriptorSetLayout(vkDevice.vkDevice(),
@@ -275,21 +403,25 @@ public final class TaaUpscaler implements Upscaler {
             descriptorSetLayout = pDsl.get(0);
 
             VkDescriptorPoolSize.Buffer sizes = VkDescriptorPoolSize.calloc(2, stack);
-            sizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(7);
-            sizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1);
+            // 7 storage images × 2 sets = 14 (unchanged). 2 combined samplers × 2 sets = 4
+            // (was 2; binding 5 history + binding 8 jitterGuide).
+            sizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(14);
+            sizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(4);
             LongBuffer pPool = stack.mallocLong(1);
             VK10.vkCreateDescriptorPool(vkDevice.vkDevice(),
                     VkDescriptorPoolCreateInfo.calloc(stack).sType$Default()
-                            .maxSets(1).pPoolSizes(sizes),
+                            .maxSets(2).pPoolSizes(sizes),
                     null, pPool);
             descriptorPool = pPool.get(0);
 
-            LongBuffer pSet = stack.mallocLong(1);
+            LongBuffer pSet = stack.mallocLong(2);
             VK10.vkAllocateDescriptorSets(vkDevice.vkDevice(),
                     VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
-                            .descriptorPool(descriptorPool).pSetLayouts(stack.longs(descriptorSetLayout)),
+                            .descriptorPool(descriptorPool)
+                            .pSetLayouts(stack.longs(descriptorSetLayout, descriptorSetLayout)),
                     pSet);
-            descriptorSet = pSet.get(0);
+            descriptorSets[0] = pSet.get(0);
+            descriptorSets[1] = pSet.get(1);
 
             // Push constants: 56 bytes (vec2 srcSize, vec2 dstSize, float motionX/Y, float alpha,
             //                  float disocclusion, float sharpness, float varianceClipGamma,
@@ -346,10 +478,28 @@ public final class TaaUpscaler implements Upscaler {
         }
     }
 
-    private void bindDescriptors(MemoryStack stack, long cmd, RtImage inColorLow, RtImage inDepthLow,
+    private void bindDescriptors(MemoryStack stack, int setIndex, RtImage inColorLow, RtImage inDepthLow,
                                   RtImage inMotionLow, RtImage inNormalLow, RtImage inAlbedoLow,
                                   RtImage prevHistory, RtImage newHistory, RtImage out) {
-        VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(8, stack);
+        long descriptorSet = descriptorSets[setIndex];
+        // jitterGuide is optional; when null use a placeholder (any view) — the sampler
+        // returns 0.5 which the shader decodes to offset=0, preserving legacy behaviour.
+        long jitterView = (jitterGuide != null) ? jitterGuide.view : inColorLow.view;
+        long[] views = {
+                inColorLow.view,
+                inDepthLow.view,
+                inMotionLow.view,
+                (inNormalLow != null ? inNormalLow : inColorLow).view,
+                (inAlbedoLow != null ? inAlbedoLow : inColorLow).view,
+                prevHistory.view,
+                out.view,
+                newHistory.view,
+                jitterView
+        };
+        if (Arrays.equals(boundViews[setIndex], views)) {
+            return;
+        }
+        VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(9, stack);
         // 0..4: storage images (inColorLow, inDepthLow, inMotionLow, inNormalLow, inAlbedoLow).
         // Normal / albedo may be null (legacy callers); bind a placeholder view (any image view)
         // to satisfy the descriptor set layout. We pass the existing color view as the placeholder
@@ -367,7 +517,7 @@ public final class TaaUpscaler implements Upscaler {
         }
         // 5: combined image sampler for prevHistory
         VkDescriptorImageInfo.Buffer histInfo = VkDescriptorImageInfo.calloc(1, stack);
-        histInfo.get(0).imageView(prevHistory.view).imageLayout(VK10.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+        histInfo.get(0).imageView(prevHistory.view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
                 .sampler(sampler);
         writes.get(5).sType$Default().dstSet(descriptorSet).dstBinding(5)
                 .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
@@ -384,11 +534,22 @@ public final class TaaUpscaler implements Upscaler {
         writes.get(7).sType$Default().dstSet(descriptorSet).dstBinding(7)
                 .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                 .pImageInfo(histOutInfo);
+        // 8 (v0.6.8+): per-tile jitter guide sampler. Reuses the linear-clamp `sampler`
+        // (same as history @5). When the host didn't call setJitterGuide, `jitterView`
+        // is a placeholder and the sampler returns 0.5 (decoded offset = 0).
+        VkDescriptorImageInfo.Buffer jitterInfo = VkDescriptorImageInfo.calloc(1, stack);
+        jitterInfo.get(0).imageView(jitterView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                .sampler(sampler);
+        writes.get(8).sType$Default().dstSet(descriptorSet).dstBinding(8)
+                .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                .pImageInfo(jitterInfo);
         VK10.vkUpdateDescriptorSets(vkDevice.vkDevice(), writes, null);
+        System.arraycopy(views, 0, boundViews[setIndex], 0, views.length);
     }
 
     private void clearImage(long cmd, RtImage image) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkCommandBuffer cb = new VkCommandBuffer(cmd, vkDevice.vkDevice());
             VkImageMemoryBarrier2.Buffer bar = VkImageMemoryBarrier2.calloc(1, stack);
             bar.get(0).sType$Default()
                     .srcStageMask(VK10.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
@@ -401,8 +562,131 @@ public final class TaaUpscaler implements Upscaler {
                     .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
                             .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
             org.lwjgl.vulkan.KHRSynchronization2.vkCmdPipelineBarrier2KHR(
-                    new VkCommandBuffer(cmd, vkDevice.vkDevice()),
+                    cb,
                     VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(bar));
+
+            VkClearColorValue clear = VkClearColorValue.calloc(stack);
+            clear.float32(0, 0.0f).float32(1, 0.0f).float32(2, 0.0f).float32(3, 0.0f);
+            VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, stack);
+            range.get(0).aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+            VK10.vkCmdClearColorImage(cb, image.image, VK10.VK_IMAGE_LAYOUT_GENERAL, clear, range);
+
+            bar.get(0)
+                    .srcStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
+                    .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .dstStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                    .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                    .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                    .newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+            org.lwjgl.vulkan.KHRSynchronization2.vkCmdPipelineBarrier2KHR(
+                    cb,
+                    VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(bar));
+        }
+    }
+
+    /**
+     * Build the RCAS (AMD CAS) post-pass pipeline. Same algorithm as the FFX SDK's RCAS
+     * shader (5-tap contrast-adaptive sharpen with luminance + chroma derivative lobes).
+     * Reads from the TAAU out image, writes back to the same image — the temporal history
+     * already ping-ponged, so aliasing in-place is safe.
+     */
+    private void createCasPipeline() throws IOException {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            // 2 bindings: 0 = input HDR radiance, 1 = output HDR radiance (both B10G11R11).
+            // CasPushConstants: int width, int height, float sharpness, float pad.
+            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(2, stack);
+            binds.get(0).binding(0).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                    .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+            binds.get(1).binding(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                    .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+            LongBuffer pDsl = stack.mallocLong(1);
+            VK10.vkCreateDescriptorSetLayout(vkDevice.vkDevice(),
+                    VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds),
+                    null, pDsl);
+            casDescriptorSetLayout = pDsl.get(0);
+
+            VkDescriptorPoolSize.Buffer sizes = VkDescriptorPoolSize.calloc(1, stack);
+            sizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(2);
+            LongBuffer pPool = stack.mallocLong(1);
+            VK10.vkCreateDescriptorPool(vkDevice.vkDevice(),
+                    VkDescriptorPoolCreateInfo.calloc(stack).sType$Default()
+                            .maxSets(1).pPoolSizes(sizes),
+                    null, pPool);
+            casDescriptorPool = pPool.get(0);
+
+            casDescriptorSets = new long[1];
+            LongBuffer pSet = stack.mallocLong(1);
+            VK10.vkAllocateDescriptorSets(vkDevice.vkDevice(),
+                    VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
+                            .descriptorPool(casDescriptorPool)
+                            .pSetLayouts(stack.longs(casDescriptorSetLayout)),
+                    pSet);
+            casDescriptorSets[0] = pSet.get(0);
+
+            VkPushConstantRange.Buffer pcr = VkPushConstantRange.calloc(1, stack);
+            pcr.get(0).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(16);
+            LongBuffer pLayout = stack.mallocLong(1);
+            VK10.vkCreatePipelineLayout(vkDevice.vkDevice(),
+                    VkPipelineLayoutCreateInfo.calloc(stack).sType$Default()
+                            .pSetLayouts(stack.longs(casDescriptorSetLayout))
+                            .pPushConstantRanges(pcr),
+                    null, pLayout);
+            casPipelineLayout = pLayout.get(0);
+
+            // Load SPIR-V.
+            byte[] spv;
+            try (InputStream in = TaaUpscaler.class.getResourceAsStream(CAS_SHADER_PATH)) {
+                if (in == null) {
+                    throw new IOException("Missing " + CAS_SHADER_PATH);
+                }
+                spv = in.readAllBytes();
+            }
+            ByteBuffer code = org.lwjgl.system.MemoryUtil.memAlloc(spv.length);
+            code.put(spv).flip();
+
+            LongBuffer pMod = stack.mallocLong(1);
+            VK10.vkCreateShaderModule(vkDevice.vkDevice(),
+                    VkShaderModuleCreateInfo.calloc(stack).sType$Default().pCode(code), null, pMod);
+            long mod = pMod.get(0);
+            org.lwjgl.system.MemoryUtil.memFree(code);
+
+            VkPipelineShaderStageCreateInfo stage = VkPipelineShaderStageCreateInfo.calloc(stack)
+                    .sType$Default().stage(VK10.VK_SHADER_STAGE_COMPUTE_BIT).module(mod)
+                    .pName(stack.UTF8("main"));
+            LongBuffer pPipe = stack.mallocLong(1);
+            VK10.vkCreateComputePipelines(vkDevice.vkDevice(), 0,
+                    VkComputePipelineCreateInfo.calloc(1, stack).sType$Default()
+                            .stage(stage).layout(casPipelineLayout), null, pPipe);
+            casPipeline = pPipe.get(0);
+
+            VK10.vkDestroyShaderModule(vkDevice.vkDevice(), mod, null);
+        }
+    }
+
+    /**
+     * Bind the RCAS descriptor set. Both in and out point to the same image — RCAS reads
+     * the TAAU output, writes its sharpened version back to the same image. The temporal
+     * history already ping-ponged before this call so in-place is safe.
+     */
+    private void bindCasDescriptors(MemoryStack stack, RtImage in, RtImage out) {
+        long[] views = {in.view, out.view};
+        if (casBoundViews.length > 0 && Arrays.equals(casBoundViews[0], views)) {
+            return;
+        }
+        try {
+            casBoundViews = new long[][]{views};
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(2, stack);
+            for (int i = 0; i < 2; i++) {
+                VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
+                info.get(0).imageView(views[i]).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+                writes.get(i).sType$Default().dstSet(casDescriptorSets[0]).dstBinding(i)
+                        .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                        .pImageInfo(info);
+            }
+            VK10.vkUpdateDescriptorSets(vkDevice.vkDevice(), writes, null);
+        } catch (Throwable t) {
+            CausticaMod.LOGGER.warn("TAAU RCAS bindDescriptors failed", t);
         }
     }
 }

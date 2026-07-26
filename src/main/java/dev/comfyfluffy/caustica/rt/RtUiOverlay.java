@@ -107,7 +107,7 @@ public final class RtUiOverlay {
     }
 
     /** The overlay color image (0 if not available) — pairs with {@link #overlayColorView()} for callers
-     * (e.g. the DLSSG "ui" optional resource) that need both the view and the raw image. */
+     * (e.g. a frame-generation provider UI resource) that need both the view and the raw image. */
     public static long overlayColorImage() {
         if (overlay == null || overlay.getColorTexture() == null) {
             return 0L;

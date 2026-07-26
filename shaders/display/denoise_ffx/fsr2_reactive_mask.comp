@@ -1,0 +1,168 @@
+// Reactive mask generator for AMD FSR2.
+//
+// Borrowed from iterationRP (Alpha 0.7.5) shaders/Lib/FSR2/DepthClip_CS.glsl:82-151 —
+// the GLSL port of the AMD FSR2 algorithm. We don't depend on the host game to
+// supply a transparency/reflection reactive texture; we derive it from motion
+// divergence + depth divergence, exactly the way FSR2's sample app generates the
+// reactive input without application hints.
+//
+// Algorithm:
+//   reactive = max(motionDivergence, depthDivergence)
+//
+// motionDivergence (per-pixel):
+//   compute the 1 - dot(unit(neighborMV), unit(nucleusMV)) over the 3x3
+//   neighborhood; high values mean motion vectors in nearby pixels point in
+//   conflicting directions → camera-cut/disocclusion/reproject failure.
+//
+// depthDivergence (per-pixel):
+//   ratio of min(viewZ) to max(viewZ) in 3x3; surfaces at very different
+//   depths within the kernel = disocclusion/anti-parallax boundary.
+//
+// Both signals saturate into [0, 1] and are blended by max(). The final value
+// is fed to FSR2 as the reactive mask so freshly-disoccluded texels don't get
+// blended with stale history — eliminates the "ghost behind camera turn" and
+// "translucent trail" artifacts that vanilla FSR2 leaves on RT path-traced
+// frames without an app-provided reactive texture.
+//
+// Inputs:
+//   0  gMotion              rg16f       (UV-space MV, prev - cur; matches NRD/Native convention)
+//   1  gDeviceDepth         r32f        (current frame's reverse-Z deviceZ, near=1 far=0)
+//   2  gViewZ               r32f        (positive linear view Z in meters; reverse-Z derived)
+//   3  gNormalRough         rgba16f     (oct-decoded normal xyz, roughness w; length(xyz)<0.5 = sky)
+//   4  gDisocclusionMix     rgba8       (existing prep-pass mix: .r=diff conf, .g=spec conf, .b=disoccl, .a=unused)
+// Outputs:
+//   5  gReactiveMask        r32f        (FSR2 expects 1-channel float; 0=stable, 1=fully reactive)
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rg16f)   readonly  uniform image2D gMotion;
+layout(binding = 1, r32f)    readonly  uniform image2D gDeviceDepth;
+layout(binding = 2, r32f)    readonly  uniform image2D gViewZ;
+layout(binding = 3, rgba16f) readonly  uniform image2D gNormalRough;
+layout(binding = 4, rgba8)   readonly  uniform image2D gDisocclusionMix;
+layout(binding = 5, r32f)    writeonly uniform image2D gReactiveMask;
+
+layout(push_constant) uniform Push {
+    float motionDivergenceScale;   // multiplier on the motion-divergence signal (1.0 = default)
+    float depthDivergenceScale;    // multiplier on the depth-divergence signal (1.0 = default)
+    float _pad0;
+    float _pad1;
+} pc;
+
+float clamp01(float x) { return clamp(x, 0.0f, 1.0f); }
+float clamp01v(vec2 v) { return clamp(v.x, 0.0f, 1.0f); } // unused, kept for symmetry with HLSL originals
+
+float ComputeMotionDivergence(ivec2 texel, ivec2 size) {
+    // iterationRP DepthClip_CS.glsl:82-112
+    float minConvergence = 1.0;
+    vec2 nucleusMV = imageLoad(gMotion, texel).rg;
+    float nucleusLenUV = length(nucleusMV);
+
+    // Small static MV epsilon matches the iterationRP value. Below this the
+    // pixel is treated as "no motion" — a 3x3 neighborhood of static pixels
+    // trivially converges and produces zero divergence.
+    const float kVelocityEpsilon = 1e-2f;
+
+    if (nucleusLenUV > kVelocityEpsilon) {
+        float maxVelUV = nucleusLenUV;
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                ivec2 sp = texel + ivec2(x, y);
+                sp = clamp(sp, ivec2(0), size - 1);
+
+                vec2 v = imageLoad(gMotion, sp).rg;
+                float vLen = length(v);
+                if (vLen < kVelocityEpsilon) {
+                    // Iteration's max/min trick: a near-zero MV can't influence
+                    // either max or the dot product reliably, so skip it.
+                    continue;
+                }
+                maxVelUV = max(maxVelUV, vLen);
+                // 1 - dot(unit(neighbor), unit(nucleus)). Higher = more divergent.
+                float d = dot(v / vLen, nucleusMV / nucleusLenUV);
+                minConvergence = min(minConvergence, d);
+            }
+        }
+        // saturate(1 - convergence) * saturate(maxVel / epsilon)
+        return clamp01(1.0f - minConvergence) * clamp01(maxVelUV / kVelocityEpsilon);
+    }
+    return 0.0;
+}
+
+float ComputeDepthDivergence(ivec2 texel, ivec2 size) {
+    // iterationRP DepthClip_CS.glsl:114-139. colortex4.z is stored as
+    // (1.0 - dilatedDepth) in our pipeline, so we add it back before
+    // converting to view-space meters.
+    float minDist = 1.0e20f;
+    float maxDist = 0.0f;
+    bool foundSky = false;
+    float skyDist = 0.0f;
+
+    for (int y = -1; y < 2; ++y) {
+        for (int x = -1; x < 2; ++x) {
+            ivec2 samplePos = clamp(texel + ivec2(x, y), ivec2(0), size - 1);
+            vec4 normalRough = imageLoad(gNormalRough, samplePos);
+            bool isSky = length(normalRough.xyz) < 0.5;
+
+            // Use the prepared viewZ (linear meters, positive) so sky pixels
+            // (Z → +inf under reverse-Z) collapse to a single sky marker that
+            // we explicitly ignore for the depth-divergence computation.
+            float dist = imageLoad(gViewZ, samplePos).r;
+            if (isSky) {
+                foundSky = true;
+                skyDist = dist;
+                continue;
+            }
+            minDist = min(minDist, dist);
+            maxDist = max(maxDist, dist);
+        }
+    }
+
+    // If no opaque neighbor was sampled we can't estimate depth divergence
+    // meaningfully — return 0 (treat as stable). iterationRP's iMaxDistFound
+    // fallback returns 0 in the same situation.
+    if (maxDist <= 0.0f) {
+        return 0.0f;
+    }
+    float divergence = 1.0f - minDist / maxDist;
+    // Sky within kernel: a surface → sky transition is the canonical
+    // disocclusion case. iterationRP zeroes divergence for sky transitions
+    // because the per-pixel reactive is supposed to fire on sky-shows-surface,
+    // not on surface-shows-sky (sky pixels never accumulate history anyway).
+    return foundSky ? 0.0f : clamp01(divergence);
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(gReactiveMask);
+    if (pix.x >= size.x || pix.y >= size.y) {
+        return;
+    }
+
+    // Sky pixels never accumulate history — FSR2 with reactive=0 will let
+    // history blur them, but for sky there's nothing to preserve, so emit 0.
+    vec4 normalRough = imageLoad(gNormalRough, pix);
+    bool sky = length(normalRough.xyz) < 0.5;
+
+    float motionDiv = ComputeMotionDivergence(pix, size) * pc.motionDivergenceScale;
+    float depthDiv  = ComputeDepthDivergence(pix, size) * pc.depthDivergenceScale;
+
+    // Compose: either signal alone is enough to mark a pixel reactive.
+    // Max() mirrors iterationRP's DepthClip_CS.glsl:240 behavior.
+    float reactive = max(motionDiv, depthDiv);
+    reactive = clamp(reactive, 0.0f, 1.0f);
+
+    if (sky) {
+        reactive = 0.0f;
+    }
+
+    // Soft blend with the prep-pass's coarse disocclusion channel so the
+    // existing NRD signal (which knows about prepared-confidence drops from
+    // the compose stage) doesn't get clobbered by our motion/depth derivation.
+    float prepDisoccl = imageLoad(gDisocclusionMix, pix).b;
+    reactive = max(reactive, prepDisoccl);
+
+    imageStore(gReactiveMask, pix, vec4(reactive, 0.0, 0.0, 0.0));
+}

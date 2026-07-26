@@ -15,14 +15,16 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba16f) readonly uniform image2D inColor;
+// inColor / outAccum are pure RGB beauty (B10G11R11). History ring stays rgba16f so
+// .a can carry device depth for the next-frame disocclusion test.
+layout(set = 0, binding = 0, r11f_g11f_b10f) readonly uniform image2D inColor;
 layout(set = 0, binding = 1, rgba16f) readonly uniform image2D inNormal;
 layout(set = 0, binding = 2, r32f)    readonly uniform image2D inDepth;
 layout(set = 0, binding = 3, rgba16f) readonly uniform image2D inMotion;
 
 layout(set = 0, binding = 4) uniform sampler2D historySampler;
 
-layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D outAccum;
+layout(set = 0, binding = 5, r11f_g11f_b10f) writeonly uniform image2D outAccum;
 layout(set = 0, binding = 6, rgba16f) writeonly uniform image2D historyOut;
 
 layout(push_constant) uniform TemporalAccumParams {
@@ -30,7 +32,14 @@ layout(push_constant) uniform TemporalAccumParams {
     float disocclusionThreshold;
     float alpha;               // base weight of current frame when nearly static
     float frameHistoryReady;   // 0 on first frame
-    float _pad0;
+    // 1.0 = legacy luma-ratio anti-ghost bypass (standalone beauty TAA, block-break fix
+    // v0.6.23). 0.0 = pure reproject + AABB clamp + blend. The luma bypass treats any
+    // history/current luma disagreement as a scene change; on raw SPP-1 input (and on
+    // jittered point-sampled textures) per-frame luma differs from the converged mean by
+    // >3x at a large fraction of pixels, so history would track the current frame every
+    // frame and NEVER converge — the "full-screen raw noise" symptom. Denoise backends
+    // that own real 1spp input must pass 0.0; depth/normal disocclusion stays active.
+    float antiGhost;
     float _pad1;
 } pc;
 
@@ -168,7 +177,10 @@ void main() {
 
     // Bright history on a much darker current pixel = snow/sky ghost on ice/water.
     // Force disocclusion-style rejection instead of slowly fading the smear.
-    bool brightGhost = !sky && histLuma > luma * 1.35 + 0.04 && (histLuma - luma) > 0.08;
+    // Luma heuristic — only valid on pre-filtered input; on raw SPP-1 it misfires
+    // constantly, so it is gated behind pc.antiGhost (see the push-constant comment).
+    bool brightGhost = pc.antiGhost > 0.5
+            && !sky && histLuma > luma * 1.35 + 0.04 && (histLuma - luma) > 0.08;
     if (brightGhost) {
         disocclusion = true;
     }
@@ -188,7 +200,13 @@ void main() {
     }
 
     // Dark ice/water: prefer CURRENT so residual snow history cannot re-stick.
-    if (!sky && luma < 0.18 && avgLuma >= 0.12) {
+    // Gated for the same reason as brightGhost: this raises alpha toward 0.70 for ANY
+    // pixel whose current luminance is below 0.18 while its 3x3 neighbourhood average
+    // is above 0.12 — i.e. every noise-darkened pixel surrounded by brighter sample
+    // points. On raw SPP-1 most pixels match that every frame, so the temporal accumulator
+    // locks to ~70% current -> never converges. Only the standalone (pre-filtered-input)
+    // TAA path keeps this heuristic on.
+    if (pc.antiGhost > 0.5 && !sky && luma < 0.18 && avgLuma >= 0.12) {
         float darkT = 1.0 - smoothstep(0.0, 0.18, luma);
         a = mix(a, max(a, 0.70), 0.85 * darkT);
     }
@@ -200,8 +218,14 @@ void main() {
     // Problem: ALL previous fixes failed. Black square persists.
     // Last resort: when ANY disocclusion-like condition is detected, BYPASS history entirely
     // and use ONLY current frame data with stronger clamping.
+    //
+    // The three luma-ratio checks below assume a mostly-converged input. Fed raw SPP-1
+    // (AmdFidelityFx radiance stage), they fire on a large fraction of pixels EVERY frame,
+    // making history chase the current sample — zero temporal convergence, full-screen
+    // noise. They are therefore gated behind pc.antiGhost; geometric disocclusion (depth
+    // jump, bounds, sky transitions) above is NOT gated and still handles block-break.
     bool bypassHistory = disocclusion;
-    if (!bypassHistory) {
+    if (!bypassHistory && pc.antiGhost > 0.5) {
         // Check 1: hist/curr luma ratio > 3x
         float histLum2 = dot(historyColor, vec3(0.2126, 0.7152, 0.0722));
         float currLum2 = dot(currColor, vec3(0.2126, 0.7152, 0.0722));

@@ -2,7 +2,6 @@ package dev.comfyfluffy.caustica.upscale;
 
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
-import dev.comfyfluffy.caustica.upscale.UpscalerSelector.Mode;
 import org.joml.Matrix4fc;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,8 +22,13 @@ public final class NoopUpscaler implements Upscaler {
     }
 
     @Override
-    public Mode mode() {
-        return Mode.OFF;
+    public String id() {
+        return "off";
+    }
+
+    @Override
+    public boolean isPassThrough() {
+        return true;
     }
 
     @Override

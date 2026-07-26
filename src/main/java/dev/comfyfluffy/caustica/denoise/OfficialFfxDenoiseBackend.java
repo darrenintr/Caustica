@@ -1,5 +1,6 @@
 package dev.comfyfluffy.caustica.denoise;
 
+import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.ffx.denoiser.FfxDenoiserRuntime;
 import dev.comfyfluffy.caustica.rt.RtContext;
@@ -9,6 +10,7 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.KHRSynchronization2;
 import org.lwjgl.vulkan.VK10;
+import org.lwjgl.vulkan.VkClearColorValue;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkComputePipelineCreateInfo;
 import org.lwjgl.vulkan.VkDependencyInfo;
@@ -21,6 +23,7 @@ import org.lwjgl.vulkan.VkDescriptorSetLayoutCreateInfo;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkImageCopy;
 import org.lwjgl.vulkan.VkImageMemoryBarrier2;
+import org.lwjgl.vulkan.VkImageSubresourceRange;
 import org.lwjgl.vulkan.VkPipelineLayoutCreateInfo;
 import org.lwjgl.vulkan.VkPipelineShaderStageCreateInfo;
 import org.lwjgl.vulkan.VkPushConstantRange;
@@ -31,14 +34,23 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 
 import static dev.comfyfluffy.caustica.rt.RtContext.check;
 
 /**
- * Official FidelityFX Denoiser path (Shadow + Reflection), Caustica-hosted SPIR-V.
+ * FidelityFX-style Shadow + Reflection denoiser (Caustica-hosted SPIR-V).
  *
- * <p>Energy-correct composite:
- * {@code beauty + unshadowed*(S_clean-S_raw) + (R_clean-R_raw)} — never multiplies GI/sky by shadow.
+ * <p>P0 alignment with official FFX Denoiser docs:
+ * <ul>
+ *   <li>Shadow prepare: pack 8×4 hitmask + dense float shadow</li>
+ *   <li>Shadow reproject: local moments / variance boost / neighborhood clamp</li>
+ *   <li>Shadow spatial: 3-pass EAW with variance cooling</li>
+ *   <li>Reflection: depth hierarchy (3 half-res mips) for disocclusion</li>
+ *   <li>Energy-correct composite (never multiplies GI by shadow)</li>
+ * </ul>
  *
  * <p>Fail-open: seed with raw beauty; any filter failure leaves that seed.
  */
@@ -53,33 +65,51 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
     private boolean shadowHistoryValid;
     private boolean reflHistoryValid;
     private boolean hardReset;
+    /** Clear history/spat buffers once after allocate or reset (avoid garbage dark deltas). */
+    private boolean needsHistoryClear;
 
     private RtImage shadowHit;
-    private RtImage diffuse;      // unshadowed primary direct
+    /** Unshadowed primary direct (for shadow delta). Prefer gUnshadowedDirect over gDiffuse. */
+    private RtImage unshadowedDirect;
+    private RtImage diffuseFallback; // gDiffuse — only used if unshadowedDirect is null
     private RtImage reflection;   // raw specular
     private RtImage specMotion;   // optional; falls back to surface motion
 
-    /** Last frame's cleaned shadow mask (rg16f: r=mask) after a successful shadow pass; null if skipped. */
     private RtImage lastCleanShadow;
-    /** Last frame's cleaned specular (rgba16f) after a successful reflection pass; null if skipped. */
     private RtImage lastCleanReflection;
     private int lastCompositeFlags;
 
-    // Shadow pipelines
+    // Pipelines: prepare, shadow reproject/spatial, depth pyramid, reflection reproject/spatial, composite
+    private long prepDsl, prepPool, prepSet, prepLayout, prepPipe;
     private long shReproDsl, shReproPool, shReproSet, shReproLayout, shReproPipe;
-    private long shSpatDsl, shSpatPool, shSpatSet, shSpatLayout, shSpatPipe;
-    // Reflection pipelines
+    private long shSpatDsl, shSpatPool, shSpatLayout, shSpatPipe;
+    private long[] shSpatSets = new long[0];
+    private long depthPyrDsl, depthPyrPool, depthPyrLayout, depthPyrPipe;
+    private long[] depthPyrSets = new long[0];
     private long rfReproDsl, rfReproPool, rfReproSet, rfReproLayout, rfReproPipe;
-    private long rfSpatDsl, rfSpatPool, rfSpatSet, rfSpatLayout, rfSpatPipe;
-    // Composite
-    private long compDsl, compPool, compSet, compLayout, compPipe;
+    private long rfSpatDsl, rfSpatPool, rfSpatLayout, rfSpatPipe;
+    private long[] rfSpatSets = new long[0];
+    private long compDsl, compPool, compLayout, compPipe;
+    private long[] compSets = new long[0];
 
-    // Shadow buffers (rg16f: r=mask, g=count)
+    /**
+     * Descriptor contents are execution-time state in Vulkan, not command-recording snapshots.
+     * Cache stable bindings so a later frame never updates a set still referenced by the GPU.
+     */
+    private final Map<Long, long[]> descriptorBindings = new HashMap<>();
+
+    // Shadow buffers (rgba16f: r=mask, g=count, b=variance, a=mean)
+    private RtImage hitMask;       // r32ui tiles (ceil(w/8) x ceil(h/4))
+    private RtImage shadowDense;   // rgba16f dense float from prepare
     private RtImage historyShadow;
     private RtImage shReproBuf;
     private RtImage shSpatA;
     private RtImage shSpatB;
-    // Reflection buffers (rgba16f: rgb=spec, a=count)
+    // Depth hierarchy
+    private RtImage depthMip1;
+    private RtImage depthMip2;
+    private RtImage depthMip3;
+    // Reflection buffers
     private RtImage historyRefl;
     private RtImage rfReproBuf;
     private RtImage rfSpatA;
@@ -99,11 +129,11 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
             var ver = FfxDenoiserRuntime.INSTANCE.tryLoad();
             if (ver.isPresent()) {
                 CausticaMod.LOGGER.info(
-                        "OfficialFfxDenoiseBackend: native probe OK (packed={}); SPIR-V shadow+reflection filters active",
+                        "OfficialFfxDenoiseBackend: native probe OK (packed={}); SPIR-V P0 shadow+reflection active",
                         ver.getAsInt());
             } else {
                 CausticaMod.LOGGER.info(
-                        "OfficialFfxDenoiseBackend: native probe unavailable; SPIR-V shadow+reflection still active");
+                        "OfficialFfxDenoiseBackend: native probe unavailable; SPIR-V P0 shadow+reflection still active");
             }
         }
         ready = true;
@@ -111,29 +141,31 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
 
     public void setSplitBuffers(RtImage shadowHit, RtImage diffuse, RtImage reflection) {
         this.shadowHit = shadowHit;
-        this.diffuse = diffuse;
+        this.diffuseFallback = diffuse;
         this.reflection = reflection;
     }
 
-    /** Optional specular motion vectors; if null, surface motion is used for reflection reproject. */
+    /** Primary NEE without visibility — required for energy-correct shadow composite. */
+    public void setUnshadowedDirect(RtImage unshadowedDirect) {
+        this.unshadowedDirect = unshadowedDirect;
+    }
+
     public void setSpecMotion(RtImage specMotion) {
         this.specMotion = specMotion;
     }
 
-    /**
-     * Cleaned shadow after the last {@link #dispatch} (for hybrid FFX→NRD). Valid only until the next
-     * ensureSized/destroy. Null if the shadow pass was skipped.
-     */
+    private RtImage unshadowedForComposite() {
+        return unshadowedDirect != null ? unshadowedDirect : diffuseFallback;
+    }
+
     public RtImage lastCleanShadow() {
         return lastCleanShadow;
     }
 
-    /** Cleaned specular after the last {@link #dispatch}. Null if reflection pass was skipped. */
     public RtImage lastCleanReflection() {
         return lastCleanReflection;
     }
 
-    /** Bit0 = shadow applied, bit1 = reflection applied (same as composite push flags). */
     public int lastCompositeFlags() {
         return lastCompositeFlags;
     }
@@ -156,30 +188,49 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
                 return;
             }
         }
-        if (this.width == width && this.height == height && historyShadow != null && historyRefl != null) {
+        if (this.width == width && this.height == height && historyShadow != null && historyRefl != null
+                && hitMask != null && depthMip1 != null) {
             return;
         }
         destroyImages();
-        historyShadow = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16_SFLOAT, "ffx-off shadow history");
-        shReproBuf = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16_SFLOAT, "ffx-off shadow reproject");
-        shSpatA = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16_SFLOAT, "ffx-off shadow spat A");
-        shSpatB = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16_SFLOAT, "ffx-off shadow spat B");
-        historyRefl = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx-off refl history");
-        rfReproBuf = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx-off refl reproject");
-        rfSpatA = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx-off refl spat A");
-        rfSpatB = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx-off refl spat B");
+
+        int tilesX = Math.max(1, (width + 7) / 8);
+        int tilesY = Math.max(1, (height + 3) / 4);
+        hitMask = ctx.createStorageImage(tilesX, tilesY, VK10.VK_FORMAT_R32_UINT, "ffx hitmask 8x4");
+        shadowDense = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx shadow dense");
+        historyShadow = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx shadow history");
+        shReproBuf = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx shadow reproject");
+        shSpatA = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx shadow spat A");
+        shSpatB = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx shadow spat B");
+
+        int w1 = Math.max(1, width / 2);
+        int h1 = Math.max(1, height / 2);
+        int w2 = Math.max(1, w1 / 2);
+        int h2 = Math.max(1, h1 / 2);
+        int w3 = Math.max(1, w2 / 2);
+        int h3 = Math.max(1, h2 / 2);
+        depthMip1 = ctx.createStorageImage(w1, h1, VK10.VK_FORMAT_R32_SFLOAT, "ffx depth mip1");
+        depthMip2 = ctx.createStorageImage(w2, h2, VK10.VK_FORMAT_R32_SFLOAT, "ffx depth mip2");
+        depthMip3 = ctx.createStorageImage(w3, h3, VK10.VK_FORMAT_R32_SFLOAT, "ffx depth mip3");
+
+        historyRefl = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx refl history");
+        rfReproBuf = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx refl reproject");
+        rfSpatA = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx refl spat A");
+        rfSpatB = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx refl spat B");
+
         this.width = width;
         this.height = height;
         shadowHistoryValid = false;
         reflHistoryValid = false;
         hardReset = true;
+        needsHistoryClear = true;
     }
 
     @Override
     public boolean dispatch(MemoryStack stack, VkCommandBuffer cmd,
-                         RtImage inColor, RtImage inNormal, RtImage inDepth, RtImage inMotion,
-                         float mvScaleX, float mvScaleY,
-                         RtImage outColor) {
+                            RtImage inColor, RtImage inNormal, RtImage inDepth, RtImage inMotion,
+                            float mvScaleX, float mvScaleY,
+                            RtImage outColor) {
         if (!ready || width <= 0 || height <= 0 || outColor == null) {
             return false;
         }
@@ -192,35 +243,66 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
         lastCleanReflection = null;
         lastCompositeFlags = 0;
 
-        boolean canComposite = shadowHit != null && diffuse != null && reflection != null
+        RtImage unshadowed = unshadowedForComposite();
+        boolean canComposite = shadowHit != null && unshadowed != null && reflection != null
                 && inColor != null && compPipe != 0L && shSpatA != null && rfSpatA != null;
 
-        // Seed: pure beauty (flags=0)
         if (canComposite) {
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "ffx-off seed beauty")) {
-                bindComposite(ctx, diffuse, shadowHit, shSpatA, inColor, reflection, rfSpatA, outColor);
-                dispatchComposite(stack, cmd, 0);
+                // flags=0: pure beauty passthrough seed (fail-open baseline)
+                bindComposite(ctx, compSets[0], unshadowed, shadowHit, shSpatA,
+                        inColor, reflection, rfSpatA, outColor);
+                dispatchComposite(stack, cmd, compSets[0], 0);
             }
             barrier(stack, cmd, outColor.image);
         } else {
             return false;
         }
 
+        if (needsHistoryClear || hardReset) {
+            clearHistoryBuffers(stack, cmd);
+            needsHistoryClear = false;
+        }
+
         int flags = 0;
         boolean reset = hardReset || !shadowHistoryValid;
 
-        // --- Shadow denoise ---
+        // --- Shadow prepare (8x4 hitmask + dense) ---
+        if (prepPipe != 0L && hitMask != null && shadowDense != null && shadowHit != null) {
+            try {
+                bindImages(ctx, prepSet, shadowHit, hitMask, shadowDense);
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "ffx-off shadow prepare")) {
+                    VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, prepPipe);
+                    VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, prepLayout, 0,
+                            stack.longs(prepSet), null);
+                    ByteBuffer push = stack.malloc(16);
+                    push.putInt(0, width);
+                    push.putInt(4, height);
+                    push.putInt(8, hitMask.width);
+                    push.putInt(12, hitMask.height);
+                    VK10.vkCmdPushConstants(cmd, prepLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
+                    VK10.vkCmdDispatch(cmd, hitMask.width, hitMask.height, 1);
+                }
+                barrier(stack, cmd, shadowDense.image);
+                barrier(stack, cmd, hitMask.image);
+            } catch (Throwable t) {
+                CausticaMod.LOGGER.warn("OfficialFfx shadow prepare failed", t);
+            }
+        }
+
+        // --- Shadow denoise only (reflection delta was darkening the plate when history was garbage) ---
         RtImage cleanShadow = shSpatA;
-        if (shReproPipe != 0L && shSpatPipe != 0L && historyShadow != null
+        RtImage shadowSrc = shadowDense;
+        if (shReproPipe != 0L && shSpatPipe != 0L && historyShadow != null && shadowSrc != null
                 && inNormal != null && inDepth != null && inMotion != null) {
             try {
-                bindImages(ctx, shReproSet, shadowHit, inDepth, inNormal, inMotion, historyShadow, shReproBuf);
+                bindImages(ctx, shReproSet, shadowSrc, inDepth, inNormal, inMotion, historyShadow, shReproBuf, hitMask);
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "ffx-off shadow reproject")) {
-                    dispatchPush(stack, cmd, shReproPipe, shReproLayout, shReproSet, true, reset);
+                    dispatchPush(stack, cmd, shReproPipe, shReproLayout, shReproSet, reset);
                 }
                 barrier(stack, cmd, shReproBuf.image);
 
-                cleanShadow = spatialPingPong(stack, cmd, ctx, shSpatPipe, shSpatLayout, shSpatSet,
+                cleanShadow = spatialPingPong(stack, cmd, ctx, shSpatPipe, shSpatLayout, shSpatSets,
                         shReproBuf, shSpatA, shSpatB, inDepth, inNormal, "shadow");
                 copyImage(stack, cmd, cleanShadow, historyShadow);
                 shadowHistoryValid = true;
@@ -228,53 +310,64 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
                 flags |= 1;
                 lastCleanShadow = cleanShadow;
             } catch (Throwable t) {
-                CausticaMod.LOGGER.warn("OfficialFfx shadow path failed; skipping shadow delta", t);
+                CausticaMod.LOGGER.warn("OfficialFfx shadow path failed; keeping beauty seed", t);
                 cleanShadow = shSpatA;
+                flags &= ~1;
             }
         }
 
-        // --- Reflection denoise ---
+        // Reflection path updates history every frame so the delta is stable the first frame it is
+        // applied. The composite bit is config-gated: the uninitialised-history bug that used to
+        // zero the plate was the missing transfer→compute barrier after the history clear (fixed);
+        // the composite's ±2.0 delta cap and 0.35*beauty floor remain as fail-open guards.
         RtImage cleanRefl = rfSpatA;
         RtImage reflMv = (specMotion != null) ? specMotion : inMotion;
-        reset = hardReset || !reflHistoryValid;
+        boolean reflReset = hardReset || !reflHistoryValid;
+        boolean reflectionComposite = CausticaConfig.Rt.Denoise.FFX_REFLECTION_COMPOSITE.value();
         if (rfReproPipe != 0L && rfSpatPipe != 0L && historyRefl != null
-                && reflection != null && inNormal != null && inDepth != null && reflMv != null) {
+                && reflection != null && inNormal != null && inDepth != null && reflMv != null
+                && depthMip1 != null && depthPyrPipe != 0L) {
             try {
-                bindImages(ctx, rfReproSet, reflection, inDepth, inNormal, reflMv, historyRefl, rfReproBuf);
+                downsampleDepth(stack, cmd, ctx, depthPyrSets[0], inDepth, depthMip1);
+                downsampleDepth(stack, cmd, ctx, depthPyrSets[1], depthMip1, depthMip2);
+                downsampleDepth(stack, cmd, ctx, depthPyrSets[2], depthMip2, depthMip3);
+                bindImages(ctx, rfReproSet, reflection, inDepth, inNormal, reflMv, historyRefl, rfReproBuf,
+                        depthMip1, depthMip2, depthMip3);
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "ffx-off refl reproject")) {
-                    dispatchPush(stack, cmd, rfReproPipe, rfReproLayout, rfReproSet, true, reset);
+                    dispatchPush(stack, cmd, rfReproPipe, rfReproLayout, rfReproSet, reflReset);
                 }
                 barrier(stack, cmd, rfReproBuf.image);
-
-                cleanRefl = spatialPingPong(stack, cmd, ctx, rfSpatPipe, rfSpatLayout, rfSpatSet,
+                cleanRefl = spatialPingPong(stack, cmd, ctx, rfSpatPipe, rfSpatLayout, rfSpatSets,
                         rfReproBuf, rfSpatA, rfSpatB, inDepth, inNormal, "refl");
                 copyImage(stack, cmd, cleanRefl, historyRefl);
                 reflHistoryValid = true;
                 barrier(stack, cmd, historyRefl.image);
-                flags |= 2;
                 lastCleanReflection = cleanRefl;
+                if (reflectionComposite) {
+                    flags |= 2;
+                }
             } catch (Throwable t) {
-                CausticaMod.LOGGER.warn("OfficialFfx reflection path failed; skipping reflection delta", t);
-                cleanRefl = rfSpatA;
+                CausticaMod.LOGGER.warn("OfficialFfx reflection path failed; ignored (shadow-only composite)", t);
             }
         }
 
         hardReset = false;
         lastCompositeFlags = flags;
 
-        // Final composite (also the hybrid FFX stage output before NRD residual)
         try {
-            bindComposite(ctx, diffuse, shadowHit, cleanShadow, inColor, reflection, cleanRefl, outColor);
+            bindComposite(ctx, compSets[1], unshadowed, shadowHit, cleanShadow,
+                    inColor, reflection, cleanRefl, outColor);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "ffx-off composite f=" + flags)) {
-                dispatchComposite(stack, cmd, flags);
+                dispatchComposite(stack, cmd, compSets[1], flags);
             }
             barrier(stack, cmd, outColor.image);
             return true;
         } catch (Throwable t) {
             CausticaMod.LOGGER.warn("OfficialFfx composite failed; restoring beauty seed", t);
             try {
-                bindComposite(ctx, diffuse, shadowHit, shSpatA, inColor, reflection, rfSpatA, outColor);
-                dispatchComposite(stack, cmd, 0);
+                bindComposite(ctx, compSets[0], unshadowed, shadowHit, shSpatA,
+                        inColor, reflection, rfSpatA, outColor);
+                dispatchComposite(stack, cmd, compSets[0], 0);
                 lastCompositeFlags = 0;
             } catch (Throwable ignored) {
             }
@@ -282,8 +375,73 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
         }
     }
 
+    private void clearHistoryBuffers(MemoryStack stack, VkCommandBuffer cmd) {
+        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(RtContext.get(), cmd, "ffx-off clear history")) {
+            VkClearColorValue black = VkClearColorValue.calloc(stack);
+            for (int i = 0; i < 4; i++) {
+                black.float32(i, 0.0f);
+            }
+            // Shadow history: r=1 (fully lit) so a missed write never applies a dark delta.
+            VkClearColorValue litShadow = VkClearColorValue.calloc(stack);
+            litShadow.float32(0, 1.0f);
+            litShadow.float32(1, 0.0f);
+            litShadow.float32(2, 0.0f);
+            litShadow.float32(3, 1.0f);
+            VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, stack);
+            range.get(0).aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+            if (historyShadow != null) {
+                VK10.vkCmdClearColorImage(cmd, historyShadow.image, VK10.VK_IMAGE_LAYOUT_GENERAL, litShadow, range);
+            }
+            if (shReproBuf != null) {
+                VK10.vkCmdClearColorImage(cmd, shReproBuf.image, VK10.VK_IMAGE_LAYOUT_GENERAL, litShadow, range);
+            }
+            if (shSpatA != null) {
+                VK10.vkCmdClearColorImage(cmd, shSpatA.image, VK10.VK_IMAGE_LAYOUT_GENERAL, litShadow, range);
+            }
+            if (shSpatB != null) {
+                VK10.vkCmdClearColorImage(cmd, shSpatB.image, VK10.VK_IMAGE_LAYOUT_GENERAL, litShadow, range);
+            }
+            if (shadowDense != null) {
+                VK10.vkCmdClearColorImage(cmd, shadowDense.image, VK10.VK_IMAGE_LAYOUT_GENERAL, litShadow, range);
+            }
+            if (historyRefl != null) {
+                VK10.vkCmdClearColorImage(cmd, historyRefl.image, VK10.VK_IMAGE_LAYOUT_GENERAL, black, range);
+            }
+            if (rfReproBuf != null) {
+                VK10.vkCmdClearColorImage(cmd, rfReproBuf.image, VK10.VK_IMAGE_LAYOUT_GENERAL, black, range);
+            }
+            if (rfSpatA != null) {
+                VK10.vkCmdClearColorImage(cmd, rfSpatA.image, VK10.VK_IMAGE_LAYOUT_GENERAL, black, range);
+            }
+            if (rfSpatB != null) {
+                VK10.vkCmdClearColorImage(cmd, rfSpatB.image, VK10.VK_IMAGE_LAYOUT_GENERAL, black, range);
+            }
+        }
+        // vkCmdClearColorImage is a TRANSFER write. A compute→compute barrier does
+        // not make those clears visible on RADV and left stale/random history in
+        // exactly the buffers sampled by the first denoise frame.
+        barrierTransferToCompute(stack, cmd,
+                historyShadow.image, shReproBuf.image, shSpatA.image, shSpatB.image,
+                shadowDense.image, historyRefl.image, rfReproBuf.image,
+                rfSpatA.image, rfSpatB.image);
+    }
+
+    private void downsampleDepth(MemoryStack stack, VkCommandBuffer cmd, RtContext ctx, long set,
+                                 RtImage src, RtImage dst) {
+        bindImages(ctx, set, src, dst);
+        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd,
+                "ffx-off depth pyr " + dst.width + "x" + dst.height)) {
+            VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, depthPyrPipe);
+            VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, depthPyrLayout, 0,
+                stack.longs(set), null);
+            VK10.vkCmdDispatch(cmd, (dst.width + 7) / 8, (dst.height + 7) / 8, 1);
+        }
+        barrier(stack, cmd, dst.image);
+    }
+
     private RtImage spatialPingPong(MemoryStack stack, VkCommandBuffer cmd, RtContext ctx,
-                                    long pipe, long layout, long set,
+                                    long pipe, long layout, long[] sets,
                                     RtImage input, RtImage a, RtImage b,
                                     RtImage depth, RtImage normal, String tag) {
         RtImage finalDst = a;
@@ -301,6 +459,7 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
                 dst = a;
             }
             finalDst = dst;
+            long set = sets[i];
             bindImages(ctx, set, src, depth, normal, dst);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "ffx-off " + tag + " spat s" + SPATIAL_STEPS[i])) {
                 VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
@@ -320,7 +479,7 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
     }
 
     private void dispatchPush(MemoryStack stack, VkCommandBuffer cmd, long pipe, long layout, long set,
-                              boolean reproject, boolean reset) {
+                              boolean reset) {
         VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
         VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0,
                 stack.longs(set), null);
@@ -333,10 +492,10 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
         VK10.vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
     }
 
-    private void dispatchComposite(MemoryStack stack, VkCommandBuffer cmd, int useFlags) {
+    private void dispatchComposite(MemoryStack stack, VkCommandBuffer cmd, long set, int useFlags) {
         VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, compPipe);
         VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, compLayout, 0,
-                stack.longs(compSet), null);
+                stack.longs(set), null);
         ByteBuffer push = stack.malloc(16);
         push.putInt(0, useFlags);
         push.putFloat(4, 0.0f);
@@ -351,6 +510,7 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
         hardReset = true;
         shadowHistoryValid = false;
         reflHistoryValid = false;
+        needsHistoryClear = true;
     }
 
     @Override
@@ -361,7 +521,8 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
             destroyPipelines(ctx);
         }
         shadowHit = null;
-        diffuse = null;
+        unshadowedDirect = null;
+        diffuseFallback = null;
         reflection = null;
         specMotion = null;
         ready = false;
@@ -373,17 +534,12 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
 
     @Override
     public boolean isReady() {
-        // v0.6: FFX denoiser disabled at source level. The SPIR-V shadow+reflection
-        // filters were amplifying SPP=1 noise on the way into NRD REBLUR (the prepass
-        // weights its input by the FFX shadow/reflection channels, which carry
-        // their own per-sample variance at SPP=1). CausticaConfig.Denoise.FFX_TEMPORAL_WEIGHT_MAX
-        // is also dead now -- see Denoise mode options in caustica.toml (NRD, REBLUR, TAAU only).
-        return false;
+        return ready;
     }
 
     @Override
     public boolean supportsAsyncCompute() {
-        return true; // FFX denoiser is compute-based, supports async (when enabled)
+        return true;
     }
 
     @Override
@@ -394,40 +550,53 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
             RtImage inColor, RtImage inNormal, RtImage inDepth, RtImage inMotion,
             float mvScaleX, float mvScaleY,
             RtImage outColor) {
-        // FFX is compute-based - can directly use compute command buffer
         dispatch(stack, computeCmd, inColor, inNormal, inDepth, inMotion, mvScaleX, mvScaleY, outColor);
     }
 
     private void createPipelines(RtContext ctx) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            shReproDsl = createDsl(ctx, stack, 6);
-            shReproPool = createPool(ctx, stack, 6);
+            // prepare: shadowHit, hitMask, dense
+            prepDsl = createDsl(ctx, stack, 3);
+            prepPool = createPool(ctx, stack, 3);
+            prepSet = allocSet(ctx, stack, prepPool, prepDsl);
+            prepLayout = createLayout(ctx, stack, prepDsl, 16);
+            prepPipe = createPipeline(ctx, stack, prepLayout, "shadow_prepare.comp.spv");
+
+            // shadow reproject: dense, depth, normal, motion, history, out, hitmask
+            shReproDsl = createDsl(ctx, stack, 7);
+            shReproPool = createPool(ctx, stack, 7);
             shReproSet = allocSet(ctx, stack, shReproPool, shReproDsl);
             shReproLayout = createLayout(ctx, stack, shReproDsl, 16);
             shReproPipe = createPipeline(ctx, stack, shReproLayout, "shadow_reproject.comp.spv");
 
             shSpatDsl = createDsl(ctx, stack, 4);
-            shSpatPool = createPool(ctx, stack, 4);
-            shSpatSet = allocSet(ctx, stack, shSpatPool, shSpatDsl);
+            shSpatPool = createPool(ctx, stack, 4, SPATIAL_STEPS.length);
+            shSpatSets = allocSets(ctx, stack, shSpatPool, shSpatDsl, SPATIAL_STEPS.length);
             shSpatLayout = createLayout(ctx, stack, shSpatDsl, 16);
             shSpatPipe = createPipeline(ctx, stack, shSpatLayout, "shadow_spatial.comp.spv");
 
-            rfReproDsl = createDsl(ctx, stack, 6);
-            rfReproPool = createPool(ctx, stack, 6);
+            depthPyrDsl = createDsl(ctx, stack, 2);
+            depthPyrPool = createPool(ctx, stack, 2, 3);
+            depthPyrSets = allocSets(ctx, stack, depthPyrPool, depthPyrDsl, 3);
+            depthPyrLayout = createLayout(ctx, stack, depthPyrDsl, 0);
+            depthPyrPipe = createPipeline(ctx, stack, depthPyrLayout, "depth_pyramid.comp.spv");
+
+            // reflection reproject: refl, depth, normal, mv, history, out, mip1, mip2, mip3
+            rfReproDsl = createDsl(ctx, stack, 9);
+            rfReproPool = createPool(ctx, stack, 9);
             rfReproSet = allocSet(ctx, stack, rfReproPool, rfReproDsl);
             rfReproLayout = createLayout(ctx, stack, rfReproDsl, 16);
             rfReproPipe = createPipeline(ctx, stack, rfReproLayout, "reflection_reproject.comp.spv");
 
             rfSpatDsl = createDsl(ctx, stack, 4);
-            rfSpatPool = createPool(ctx, stack, 4);
-            rfSpatSet = allocSet(ctx, stack, rfSpatPool, rfSpatDsl);
+            rfSpatPool = createPool(ctx, stack, 4, SPATIAL_STEPS.length);
+            rfSpatSets = allocSets(ctx, stack, rfSpatPool, rfSpatDsl, SPATIAL_STEPS.length);
             rfSpatLayout = createLayout(ctx, stack, rfSpatDsl, 16);
             rfSpatPipe = createPipeline(ctx, stack, rfSpatLayout, "reflection_spatial.comp.spv");
 
-            // unshadowed, shadowRaw, shadowClean, beauty, specRaw, specClean, out
             compDsl = createDsl(ctx, stack, 7);
-            compPool = createPool(ctx, stack, 7);
-            compSet = allocSet(ctx, stack, compPool, compDsl);
+            compPool = createPool(ctx, stack, 7, 2);
+            compSets = allocSets(ctx, stack, compPool, compDsl, 2);
             compLayout = createLayout(ctx, stack, compDsl, 16);
             compPipe = createPipeline(ctx, stack, compLayout, "denoise_composite.comp.spv");
         }
@@ -435,16 +604,25 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
 
     private void destroyPipelines(RtContext ctx) {
         VkDevice vk = ctx.vk();
+        destroyPipe(vk, prepPipe, prepLayout, prepPool, prepDsl);
         destroyPipe(vk, shReproPipe, shReproLayout, shReproPool, shReproDsl);
         destroyPipe(vk, shSpatPipe, shSpatLayout, shSpatPool, shSpatDsl);
+        destroyPipe(vk, depthPyrPipe, depthPyrLayout, depthPyrPool, depthPyrDsl);
         destroyPipe(vk, rfReproPipe, rfReproLayout, rfReproPool, rfReproDsl);
         destroyPipe(vk, rfSpatPipe, rfSpatLayout, rfSpatPool, rfSpatDsl);
         destroyPipe(vk, compPipe, compLayout, compPool, compDsl);
+        prepPipe = prepLayout = prepPool = prepDsl = prepSet = 0L;
         shReproPipe = shReproLayout = shReproPool = shReproDsl = shReproSet = 0L;
-        shSpatPipe = shSpatLayout = shSpatPool = shSpatDsl = shSpatSet = 0L;
+        shSpatPipe = shSpatLayout = shSpatPool = shSpatDsl = 0L;
+        shSpatSets = new long[0];
+        depthPyrPipe = depthPyrLayout = depthPyrPool = depthPyrDsl = 0L;
+        depthPyrSets = new long[0];
         rfReproPipe = rfReproLayout = rfReproPool = rfReproDsl = rfReproSet = 0L;
-        rfSpatPipe = rfSpatLayout = rfSpatPool = rfSpatDsl = rfSpatSet = 0L;
-        compPipe = compLayout = compPool = compDsl = compSet = 0L;
+        rfSpatPipe = rfSpatLayout = rfSpatPool = rfSpatDsl = 0L;
+        rfSpatSets = new long[0];
+        compPipe = compLayout = compPool = compDsl = 0L;
+        compSets = new long[0];
+        descriptorBindings.clear();
     }
 
     private static void destroyPipe(VkDevice vk, long pipeline, long layout, long pool, long dsl) {
@@ -455,22 +633,35 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
     }
 
     private void destroyImages() {
+        if (hitMask != null) { hitMask.destroy(); hitMask = null; }
+        if (shadowDense != null) { shadowDense.destroy(); shadowDense = null; }
         if (historyShadow != null) { historyShadow.destroy(); historyShadow = null; }
         if (shReproBuf != null) { shReproBuf.destroy(); shReproBuf = null; }
         if (shSpatA != null) { shSpatA.destroy(); shSpatA = null; }
         if (shSpatB != null) { shSpatB.destroy(); shSpatB = null; }
+        if (depthMip1 != null) { depthMip1.destroy(); depthMip1 = null; }
+        if (depthMip2 != null) { depthMip2.destroy(); depthMip2 = null; }
+        if (depthMip3 != null) { depthMip3.destroy(); depthMip3 = null; }
         if (historyRefl != null) { historyRefl.destroy(); historyRefl = null; }
         if (rfReproBuf != null) { rfReproBuf.destroy(); rfReproBuf = null; }
         if (rfSpatA != null) { rfSpatA.destroy(); rfSpatA = null; }
         if (rfSpatB != null) { rfSpatB.destroy(); rfSpatB = null; }
     }
 
-    private void bindComposite(RtContext ctx, RtImage unshadowed, RtImage shadowRaw, RtImage shadowClean,
+    private void bindComposite(RtContext ctx, long set,
+                               RtImage unshadowed, RtImage shadowRaw, RtImage shadowClean,
                                RtImage beauty, RtImage specRaw, RtImage specClean, RtImage out) {
-        bindImages(ctx, compSet, unshadowed, shadowRaw, shadowClean, beauty, specRaw, specClean, out);
+        bindImages(ctx, set, unshadowed, shadowRaw, shadowClean, beauty, specRaw, specClean, out);
     }
 
-    private static void bindImages(RtContext ctx, long set, RtImage... images) {
+    private void bindImages(RtContext ctx, long set, RtImage... images) {
+        long[] views = new long[images.length];
+        for (int i = 0; i < images.length; i++) {
+            views[i] = images[i].view;
+        }
+        if (Arrays.equals(descriptorBindings.get(set), views)) {
+            return;
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(images.length, stack);
             for (int i = 0; i < images.length; i++) {
@@ -481,6 +672,7 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
             }
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
         }
+        descriptorBindings.put(set, views);
     }
 
     private static long createDsl(RtContext ctx, MemoryStack stack, int count) {
@@ -496,9 +688,15 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
     }
 
     private static long createPool(RtContext ctx, MemoryStack stack, int count) {
+        return createPool(ctx, stack, count, 1);
+    }
+
+    private static long createPool(RtContext ctx, MemoryStack stack, int count, int setCount) {
         VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(1, stack);
-        poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(count);
-        VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(1).pPoolSizes(poolSizes);
+        poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                .descriptorCount(Math.max(count * setCount, 1));
+        VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default()
+                .maxSets(setCount).pPoolSizes(poolSizes);
         LongBuffer p = stack.mallocLong(1);
         check(VK10.vkCreateDescriptorPool(ctx.vk(), dpci, null, p), "vkCreateDescriptorPool(ffx-off)");
         return p.get(0);
@@ -512,11 +710,22 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
         return pSet.get(0);
     }
 
+    private static long[] allocSets(RtContext ctx, MemoryStack stack, long pool, long dsl, int count) {
+        long[] sets = new long[count];
+        for (int i = 0; i < count; i++) {
+            sets[i] = allocSet(ctx, stack, pool, dsl);
+        }
+        return sets;
+    }
+
     private static long createLayout(RtContext ctx, MemoryStack stack, long dsl, int pushSize) {
-        VkPushConstantRange.Buffer pcr = VkPushConstantRange.calloc(1, stack)
-                .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(pushSize);
         VkPipelineLayoutCreateInfo plci = VkPipelineLayoutCreateInfo.calloc(stack).sType$Default()
-                .pSetLayouts(stack.longs(dsl)).pPushConstantRanges(pcr);
+                .pSetLayouts(stack.longs(dsl));
+        if (pushSize > 0) {
+            VkPushConstantRange.Buffer pcr = VkPushConstantRange.calloc(1, stack)
+                    .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(pushSize);
+            plci.pPushConstantRanges(pcr);
+        }
         LongBuffer p = stack.mallocLong(1);
         check(VK10.vkCreatePipelineLayout(ctx.vk(), plci, null, p), "vkCreatePipelineLayout(ffx-off)");
         return p.get(0);
@@ -546,7 +755,7 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
             }
             bytes = in.readAllBytes();
         } catch (IOException e) {
-            throw new IllegalStateException("failed to read SPIR-V: " + name, e);
+            throw new IllegalStateException("failed to read SPIR-V resource: " + SHADER_DIR + name, e);
         }
         ByteBuffer code = MemoryUtil.memAlloc(bytes.length).put(bytes);
         code.flip();
@@ -576,12 +785,59 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
         KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, dep);
     }
 
+    private static void barrierTransferToCompute(MemoryStack stack, VkCommandBuffer cmd, long... images) {
+        VkImageMemoryBarrier2.Buffer barriers = VkImageMemoryBarrier2.calloc(images.length, stack);
+        for (int i = 0; i < images.length; i++) {
+            barriers.get(i).sType$Default()
+                    .srcStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
+                    .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .dstStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                    .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                    .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                    .newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                    .image(images[i])
+                    .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                            .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
+        }
+        KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd,
+                VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(barriers));
+    }
+
     private static void copyImage(MemoryStack stack, VkCommandBuffer cmd, RtImage src, RtImage dst) {
+        // The source was written by compute and history dst was read by compute.
+        // Synchronize both hazards before the transfer copy; the old helper used a
+        // compute→compute barrier, which does not cover vkCmdCopyImage at all.
+        VkImageMemoryBarrier2.Buffer before = VkImageMemoryBarrier2.calloc(2, stack);
+        before.get(0).sType$Default()
+                .srcStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                .srcAccessMask(VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                .dstStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
+                .dstAccessMask(VK10.VK_ACCESS_TRANSFER_READ_BIT)
+                .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                .image(src.image)
+                .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
+        before.get(1).sType$Default()
+                .srcStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                .srcAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                .dstStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
+                .dstAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                .image(dst.image)
+                .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
+        KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd,
+                VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(before));
+
         VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
-        region.srcSubresource().set(VK10.VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1);
-        region.dstSubresource().set(VK10.VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1);
-        region.extent().set(src.width, src.height, 1);
+        region.get(0)
+                .srcSubresource(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0)
+                        .baseArrayLayer(0).layerCount(1))
+                .dstSubresource(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0)
+                        .baseArrayLayer(0).layerCount(1))
+                .extent(it -> it.width(src.width).height(src.height).depth(1));
         VK10.vkCmdCopyImage(cmd, src.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                 dst.image, VK10.VK_IMAGE_LAYOUT_GENERAL, region);
+        barrierTransferToCompute(stack, cmd, dst.image);
     }
 }

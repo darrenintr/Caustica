@@ -3,12 +3,9 @@ package dev.comfyfluffy.caustica.mixin;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.mojang.blaze3d.pipeline.RenderTarget;
-import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.vulkan.VulkanDevice;
 import dev.comfyfluffy.caustica.client.VanillaRenderController;
 import dev.comfyfluffy.caustica.client.WorldRenderScaler;
 import dev.comfyfluffy.caustica.rt.RtComposite;
-import dev.comfyfluffy.caustica.rt.RtReflex;
 import dev.comfyfluffy.caustica.rt.RtUiOverlay;
 import dev.comfyfluffy.caustica.rt.overlay.RtWorldOverlay;
 import net.minecraft.client.DeltaTracker;
@@ -47,16 +44,6 @@ public abstract class GameRendererMixin {
 		// Clear the stale HDR-present flag every frame: composite() only runs while a level renders, so on
 		// menu frames it would otherwise stay true from the last world frame and present a black HDR image.
 		RtComposite.INSTANCE.beginFrame();
-		// Reflex RENDERSUBMIT_START: render-graph recording begins here; RENDERSUBMIT_END is set at
-		// VulkanGpuSurface.present() HEAD (VulkanGpuSurfaceMixin), just before the real present.
-		if (RtReflex.enabled()) {
-			long swapchain = RtReflex.INSTANCE.appliedSwapchain();
-			if (swapchain != 0L
-					&& ((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device) {
-				RtReflex.INSTANCE.marker(device.vkDevice(), swapchain, RtReflex.MARKER_RENDERSUBMIT_START,
-						RtReflex.INSTANCE.currentSimFrameId());
-			}
-		}
 	}
 
 	@Inject(method = "render(Lnet/minecraft/client/DeltaTracker;Z)V", at = @At("TAIL"))
@@ -71,8 +58,8 @@ public abstract class GameRendererMixin {
 		WorldRenderScaler.INSTANCE.begin(this.mainRenderTarget);
 	}
 
-	// Redirect the held-item/hand render into the combined UI overlay. SDR and HDR then feed DLSS-FG the same
-	// shape: hudless excludes the screen-fixed hand, while pUI carries hand + screen effects + GUI overlays.
+	// Redirect the held-item/hand render into the combined UI overlay. SDR and HDR then feed the active
+	// frame-generation backend the same shape: hudless excludes the screen-fixed hand, while pUI carries hand + screen effects + GUI overlays.
 	// try/finally guarantees the output overrides are cleared even if the hand render throws.
 	@WrapOperation(method = "renderLevel(Lnet/minecraft/client/DeltaTracker;)V",
 			at = @At(value = "INVOKE",
@@ -171,8 +158,8 @@ public abstract class GameRendererMixin {
 					target = "Lnet/minecraft/client/gui/render/GuiRenderer;render()V",
 					shift = At.Shift.AFTER))
 	private void caustica$compositeUiOverlay(DeltaTracker deltaTracker, boolean advanceGameTime, CallbackInfo ci) {
-		// DLSS-FG quality: snapshot the main target before the combined UI overlay composites back below.
-		// Hand/screen effects, world overlays and GUI are carried by the optional DLSSG UI resource.
+		// Frame-generation quality: snapshot the main target before the combined UI overlay composites back below.
+		// Hand/screen effects, world overlays and GUI are carried by the optional provider UI resource.
 		RtComposite.INSTANCE.captureFgHudless(this.mainRenderTarget);
 		dev.comfyfluffy.caustica.rt.RtUiOverlay.compositeIfUsed();
 	}

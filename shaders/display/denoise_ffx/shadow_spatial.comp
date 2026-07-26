@@ -1,18 +1,17 @@
-// FidelityFX Shadow Denoiser — spatial filter pass (Caustica-hosted SPIR-V).
-// Edge-stopping blur on the scalar shadow mask (depth + normal). Multi-step
-// like FFX soft-shadow filter passes 0/1/2. Sample-count from .g drives kernel
-// aggressiveness (thin history → stronger blur).
+// FidelityFX Shadow Denoiser — spatial EAW-style filter (Caustica-hosted).
+// Variance from reproject (.b) drives blur strength; thins off over 3 dilated passes.
+// Input/output rgba16f: r=shadow, g=count, b=variance, a=mean.
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(binding = 0, rg16f) readonly  uniform image2D gIn;     // r=shadow g=count
-layout(binding = 1, r32f)  readonly  uniform image2D gDepth;
-layout(binding = 2, rgba16f) readonly uniform image2D gNormal;
-layout(binding = 3, rg16f) writeonly uniform image2D gOut;
+layout(binding = 0, rgba16f) readonly  uniform image2D gIn;
+layout(binding = 1, r32f)    readonly  uniform image2D gDepth;
+layout(binding = 2, rgba16f) readonly  uniform image2D gNormal;
+layout(binding = 3, rgba16f) writeonly uniform image2D gOut;
 
 layout(push_constant) uniform Push {
-    int step;           // atrous-style dilation: 1, 2, 4
+    int step;           // 1, 2, 4  (EAW dilation)
     float depthSigma;
     float normalSigma;
     float pad;
@@ -25,27 +24,32 @@ void main() {
         return;
     }
 
-    vec2 center = imageLoad(gIn, pix).rg;
+    vec4 center = imageLoad(gIn, pix);
     float cShadow = center.r;
     float cCount = center.g;
+    float cVar = center.b;
+    float cMean = center.a;
     float cDepth = imageLoad(gDepth, pix).r;
     vec3 cN = normalize(imageLoad(gNormal, pix).xyz + 1e-6);
 
-    // No surface: passthrough.
     if (length(imageLoad(gNormal, pix).xyz) < 1e-4 || cDepth <= 1e-6) {
-        imageStore(gOut, pix, vec4(cShadow, cCount, 0.0, 0.0));
+        imageStore(gOut, pix, center);
         return;
     }
 
-    // Thin history → stronger spatial (FFX variance boost idea).
-    float spatialBoost = mix(2.5, 1.0, clamp(cCount / 16.0, 0.0, 1.0));
+    // Keep spatial mild — over-blur turns player/leaves contact shadows into soft ghosts.
+    float spatialBoost = mix(1.25, 1.0, clamp(cCount / 12.0, 0.0, 1.0));
+    spatialBoost *= (1.0 + 0.25 * clamp(cVar, 0.0, 1.0));
     float depthSigma = max(pc.depthSigma * spatialBoost, 1e-4);
     float normalSigma = max(pc.normalSigma, 1e-4);
 
-    // 5x5 kernel with step dilation (FFX soft-shadow style).
-    const float k[3] = float[3](0.4, 0.25, 0.05); // |offset| weights for 0,1,2
+    // Tight phi preserves hard umbra edges (player silhouette under sun).
+    float phiShadow = max(sqrt(cVar) * 0.75 + 0.02, 0.02);
+
+    const float k[3] = float[3](0.4, 0.25, 0.05);
     float wSum = 0.0;
     float sSum = 0.0;
+    float vSum = 0.0;
     int step = max(pc.step, 1);
 
     for (int dy = -2; dy <= 2; dy++) {
@@ -54,20 +58,25 @@ void main() {
             if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size))) {
                 continue;
             }
-            float s = imageLoad(gIn, q).r;
+            vec4 sPack = imageLoad(gIn, q);
+            float s = sPack.r;
             float d = imageLoad(gDepth, q).r;
             vec3 n = normalize(imageLoad(gNormal, q).xyz + 1e-6);
 
             float wSpatial = k[min(abs(dx), 2)] * k[min(abs(dy), 2)];
             float wDepth = exp(-abs(cDepth - d) / (depthSigma * max(cDepth, 1e-3)));
             float wNormal = exp(-max(0.0, 1.0 - dot(cN, n)) / normalSigma);
-            float w = wSpatial * wDepth * wNormal;
+            float wShadow = exp(-abs(cShadow - s) / phiShadow);
+            float w = wSpatial * wDepth * wNormal * wShadow;
             wSum += w;
             sSum += s * w;
+            vSum += sPack.b * w;
         }
     }
 
     float outShadow = (wSum > 1e-5) ? (sSum / wSum) : cShadow;
     outShadow = clamp(outShadow, 0.0, 1.0);
-    imageStore(gOut, pix, vec4(outShadow, cCount, 0.0, 0.0));
+    // Variance cools after each blur pass (official behaviour).
+    float outVar = (wSum > 1e-5) ? (vSum / wSum) * 0.65 : cVar * 0.65;
+    imageStore(gOut, pix, vec4(outShadow, cCount, outVar, cMean));
 }

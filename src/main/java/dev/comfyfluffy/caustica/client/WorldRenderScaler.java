@@ -5,12 +5,12 @@ import dev.comfyfluffy.caustica.rt.RtComposite;
 
 /**
  * RT composite seam. Brackets vanilla's level-rendering section in {@code GameRenderer.render}: the
- * world renders at full resolution, then the ray-traced composite (DLSS-RR denoise + upscale, see
+ * world renders at full resolution, then the ray-traced composite (denoise + temporal upscale, see
  * {@link RtComposite}) runs once at the before-hand seam, before vanilla's pre-GUI depth clear, so the
  * hand and HUD draw at native resolution on top.
  *
- * <p>This used to host the FSR/DLSS-SR low-res render-scale path; that has been removed — the RT
- * renderer owns reconstruction via DLSS Ray Reconstruction. With {@code -Dcaustica.rt=false} this is an
+ * <p>This used to host the legacy low-resolution raster scaling path; that has been removed — the RT
+ * renderer owns denoise and reconstruction through modular providers. With {@code -Dcaustica.rt=false} this is an
  * inert passthrough.
  */
 public final class WorldRenderScaler {

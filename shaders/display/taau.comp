@@ -37,7 +37,9 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba16f) readonly  uniform image2D inColorLow;
+// inColorLow is the beauty plate (B10G11R11). historyOut stays rgba16f so .a can
+// carry device depth for the next-frame disocclusion test (same contract as temporal_accumulate).
+layout(set = 0, binding = 0, r11f_g11f_b10f) readonly  uniform image2D inColorLow;
 layout(set = 0, binding = 1, r32f)    readonly  uniform image2D inDepthLow;
 layout(set = 0, binding = 2, rgba16f) readonly  uniform image2D inMotionLow;
 layout(set = 0, binding = 3, rgba16f) readonly  uniform image2D inNormalLow;
@@ -45,7 +47,17 @@ layout(set = 0, binding = 4, rgba16f) readonly  uniform image2D inAlbedoLow;
 
 layout(set = 0, binding = 5) uniform sampler2D historySampler;
 
-layout(set = 0, binding = 6, rgba16f) writeonly uniform image2D outColor;
+// v0.6.8+ per-tile jitter guide. R8G8_UNORM encoded as (offset + 0.5) so the
+// [-0.5, +0.5] render-pixel range maps to [0, 1]. World.rgen writes the per-tile
+// offset used by the path tracer's primary ray; TAAU adds this to the reproject
+// UV so the history sample corresponds to the current sample's sub-pixel position.
+// Without this, the 1/8-px per-tile offset leaves a small per-frame reproject error
+// that averages over ~8 frames (less visible than the NRD error since TAA is plain
+// temporal averaging, not NRD's complex reprojection weights) — fix here for parity
+// with NRD pre-warp. See docs/TILE_JITTER_GUIDE_DESIGN.md.
+layout(set = 0, binding = 8) uniform sampler2D jitterGuide;
+
+layout(set = 0, binding = 6, r11f_g11f_b10f) writeonly uniform image2D outColor;
 layout(set = 0, binding = 7, rgba16f) writeonly uniform image2D historyOut;
 
 layout(push_constant) uniform TaauParams {
@@ -67,6 +79,17 @@ const float HUGE_MOTION_UV = 0.20;
 const float NORMAL_REJECT_DOT = 0.70; // cos(45deg)
 
 // YCoCg color space (chroma-stable temporal blend).
+//
+// Forward: y = r+g+b, co = r-b, cg = g - 0.5(r+b).
+// Inverse (true mathematical inverse, verified by round-trip on r=0.2,g=0.6,b=0.5):
+//   tmp = y - cg
+//   t3  = tmp / 3
+//   r = t3 + 0.5 * co
+//   b = t3 - 0.5 * co
+//   g = cg + t3
+// The previous inverse was wrong (verified on 2026-07-21: r=0.2 became 0.9 after
+// round-trip, every blended pixel was being pushed toward (R=high, G=low, B=high)
+// which encodes as saturated magenta/pink in B10G11R11). 2026-07-21 fix.
 vec3 rgb2yCoCg(vec3 c) {
     float co = c.r - c.b;
     float cg = c.g - 0.5 * (c.r + c.b);
@@ -75,9 +98,10 @@ vec3 rgb2yCoCg(vec3 c) {
 }
 vec3 yCoCg2rgb(vec3 c) {
     float tmp = c.x - c.z;
-    float r = tmp + 0.5 * c.y;
-    float g = c.z + 0.5 * (c.x - tmp);
-    float b = tmp - 0.5 * c.y;
+    float t3  = tmp / 3.0;
+    float r = t3 + 0.5 * c.y;
+    float b = t3 - 0.5 * c.y;
+    float g = c.z + t3;
     return vec3(r, g, b);
 }
 
@@ -226,12 +250,34 @@ void main() {
     // Therefore the stable, unjittered output pixel reads current data at -jitter.
     vec2 currentUV = dstUV - pc.jitterPixels / srcSize;
 
-    // ---- 1. Current frame upsample (3x3 median + RCAS edge-aware) ----
-    // The 3x3 median removes single-pixel HDR fireflies from SPP=1 path tracing
-    // *before* they enter TAAU's temporal history (one firefly out of 9
-    // neighbours can't dominate). The RCAS then sharpens around the median
-    // for edge-aware upsampling. Together: no fireflies + sharp render.
-    vec3 currColor = rcasMedianColor(currentUV, srcSize, pc.sharpness * 1.2);
+    // v0.6.8+ per-tile jitter correction. world.rgen applies an 8x8-tile-quantized sub-pixel
+    // offset (in addition to the global Halton jitter above) for software SER substitution.
+    // Without correction, the reproject at prevUV = dstUV + mv would sample the history at
+    // a sub-pixel position that doesn't match the current sample's sub-pixel position
+    // (off by the per-tile offset). We add the current frame's per-tile offset to prevUV
+    // so the history is sampled at the corresponding previous-frame position.
+    //
+    // Read at the dst pixel's render position (currentUV is in render UV space, which is
+    // the same as the guide buffer's UV space since both are [0, 1]).
+    vec2 tileOffsetGuide = texture(jitterGuide, currentUV).rg - 0.5; // [-0.5, +0.5] render px
+
+    // ---- 1. Current frame upsample ----
+    // Composite already runs firefly_kill + NRD before TAAU. An always-on 3x3 median
+    // here re-blurs every denoised texel (the "blur as fuck" symptom on grass/snow).
+    // Use bilinear for spatial upsample; optional light edge sharpen only.
+    // Outlier fireflies that slip past NRD are still rejected in the history path below.
+    vec3 currColor = bilinearColor(currentUV, srcSize);
+    if (pc.sharpness > 1e-4) {
+        // Cheap unsharp from 4-neighbour ring — far less destructive than full 3x3 median.
+        vec2 s = 1.0 / srcSize;
+        vec3 ring = (
+            bilinearColor(currentUV + vec2( s.x, 0.0), srcSize) +
+            bilinearColor(currentUV + vec2(-s.x, 0.0), srcSize) +
+            bilinearColor(currentUV + vec2(0.0,  s.y), srcSize) +
+            bilinearColor(currentUV + vec2(0.0, -s.y), srcSize)
+        ) * 0.25;
+        currColor = mix(currColor, currColor + (currColor - ring), clamp(pc.sharpness * 0.6, 0.0, 0.6));
+    }
 
     float currDepth = bilinearDepth(currentUV, srcSize);
     vec3 currNormal = bilinearNormal(currentUV, srcSize);
@@ -252,7 +298,12 @@ void main() {
     }
 
     // ---- 3. Reproject history ----
-    vec2 prevUV = dstUV + mv;
+    // Add the per-tile offset (in render pixels, divided by srcSize to get UV) so the
+    // history is sampled at the previous-frame position that corresponds to the current
+    // sample's actual sub-pixel position. The 3x3 median of the current frame's source
+    // pixels already absorbs the per-tile offset on the read side, so we only need to
+    // correct the reproject.
+    vec2 prevUV = dstUV + mv + tileOffsetGuide / srcSize;
     bool prevInBounds = pc.frameHistoryReady > 0u
             && all(greaterThanEqual(prevUV, vec2(0.0)))
             && all(lessThanEqual(prevUV, vec2(1.0)));
@@ -356,12 +407,12 @@ void main() {
         }
     }
 
-    // ---- 5. YCoCg blend with motion-adaptive + roughness-adaptive alpha ----
-    // Roughness-adaptive: matte surfaces trust the current frame more (direct
-    // /indirect blend doesn't benefit from temporal reuse as much); glossy
-    // surfaces lock to history harder (mirror reflections shouldn't flicker).
+    // ---- 5. YCoCg blend with motion-adaptive alpha ----
+    // Do NOT halve alpha on matte surfaces: after NRD the plate is already smooth,
+    // and mix(alpha, alpha*0.5, rough=1) → 0.27 current / 0.73 history is pure milk.
+    // Keep mild glossy bias only (glossy still wants a bit more history for AA).
     float motionAlpha = clamp(mvLen / 0.10, 0.0, 1.0);
-    float baseAlpha = mix(pc.alpha, pc.alpha * 0.5, clamp(currRough, 0.0, 1.0));
+    float baseAlpha = mix(pc.alpha, min(1.0, pc.alpha * 1.1), clamp(1.0 - currRough, 0.0, 1.0));
     float effectiveAlpha = mix(baseAlpha, 1.0, motionAlpha);
 
     vec3 outRgb;
@@ -372,6 +423,16 @@ void main() {
         vec3 hisYCoCg = rgb2yCoCg(historyColor);
         vec3 blendYCoCg = mix(hisYCoCg, curYCoCg, effectiveAlpha);
         outRgb = yCoCg2rgb(blendYCoCg);
+    }
+
+    // NaN/Inf guard. Without this, a single bad pixel in the upstream denoise
+    // (Bilateral / FFX residual / etc.) feeds NaN into the TAAU history; subsequent
+    // frames then sample NaN from history, clamp() doesn't catch NaN on Mesa+radv,
+    // and the bad value propagates forward forever, painting the whole frame
+    // saturated pink (NaN-to-display-path encodes as max positive RGB on this
+    // B10G11R11 swapchain). 2026-07-21.
+    if (any(isnan(outRgb)) || any(isinf(outRgb))) {
+        outRgb = currColor;
     }
 
     imageStore(outColor, pos, vec4(outRgb, 1.0));

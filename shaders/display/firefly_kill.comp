@@ -17,12 +17,12 @@
 // with probability ~100%.
 //
 // 8x8 workgroups; one invocation per output pixel. Reads from binding 0,
-// writes to binding 1. Both are rgba16f at render resolution.
+// writes to binding 1. Both are r11f_g11f_b10f (32bpp pure RGB) at render resolution.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba16f) readonly  uniform image2D inRadiance;
-layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D outRadiance;
+layout(set = 0, binding = 0, r11f_g11f_b10f) readonly  uniform image2D inRadiance;
+layout(set = 0, binding = 1, r11f_g11f_b10f) writeonly uniform image2D outRadiance;
 
 void main() {
     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
@@ -65,7 +65,8 @@ void main() {
     // at least one neighbour within 4x of the centre, so this filter
     // leaves legitimate lights alone while still killing single-pixel
     // SPP=1 fireflies.
-    if (centerLuma > 4.0 * max(neighborMaxLuma, 1e-3)) {
+    // Absolute floor: don't thrash mid-grey noise into median every other frame (terrain flash).
+    if (centerLuma > 0.15 && centerLuma > 5.0 * max(neighborMaxLuma, 1e-3)) {
         // Outlier -- replace with a 3x3 median so the firefly is squashed
         // down to a normal value. The median is the 5th of 9 sorted values,
         // safe to compute here because the neighbourhood by definition is

@@ -42,16 +42,15 @@ import org.lwjgl.vulkan.VkSamplerCreateInfo;
 
 import dev.comfyfluffy.caustica.denoise.CausticaDenoiseBackend;
 import dev.comfyfluffy.caustica.denoise.DenoiseBackendSelector;
+import dev.comfyfluffy.caustica.framegen.FrameGen;
+import dev.comfyfluffy.caustica.framegen.FrameGenSelector;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
-import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
-import dev.comfyfluffy.caustica.rt.material.RtEntityMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialSystem;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDisplayPipeline;
-import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
-import dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr;
 import dev.comfyfluffy.caustica.rt.pipeline.RtExposure;
 import dev.comfyfluffy.caustica.rt.pipeline.RtHdrCompositePipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
@@ -61,19 +60,21 @@ import dev.comfyfluffy.caustica.rt.overlay.RtWorldOverlay;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import dev.comfyfluffy.caustica.upscale.Upscaler;
 import dev.comfyfluffy.caustica.upscale.UpscalerSelector;
+import dev.comfyfluffy.caustica.rt.plate.RtPlateBridge;
+import dev.comfyfluffy.caustica.rt.plate.RtPlateProfile;
 
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
 
 /**
- * On-screen composite. Each frame, ray-trace into a render-res storage image (+ guide buffers), use
- * DLSS Ray Reconstruction to denoise and upscale it to display res, write that into a storage-capable
- * copy of the world color, and copy the result back to the world target at the
- * end-of-world seam. Gated by {@code -Dcaustica.rt=true}.
+ * On-screen composite. Each frame, ray-trace into render-resolution storage images and guide buffers,
+ * denoise the clean radiance plate, then route it through the selected modular upscaler before copying the
+ * display-resolution result back to the world target at the end-of-world seam. Gated by
+ * {@code -Dcaustica.rt=true}.
  *
- * <p>The path tracer and its guide buffers run at the configured render scale of display res with a per-frame
- * sub-pixel camera jitter; DLSS-RR ({@link RtDlssRr}) reconstructs the display-res image. With RR
- * disabled the trace runs at 1:1 and a linear blit stands in for the upscale (a raw, noisy reference).
+ * <p>The path tracer and guide buffers run at the configured render scale with a per-frame sub-pixel camera
+ * jitter. Temporal upscalers consume the denoised plate; when no upscaler is active, a linear blit provides
+ * the display-resolution fallback.
  *
  * <p>Traces the extracted {@link RtTerrain} with perspective camera rays (camera matrices captured
  * each frame via {@link #captureFrame}); writes nothing until terrain is available.
@@ -88,7 +89,7 @@ public final class RtComposite {
 
     // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80) + debugView(@88) + frameIndex(@92)
     // + prevViewProj(@96) + camDelta(@160) + spp(@172) + jitter(@176) + entityTableAddr(@184)
-    // + flags(@192): bit 0 = camera submerged, bit 1 = PBR BRDF enabled, bit 4 = water waves
+    // + flags(@192): bit 0 = camera submerged, bit 1 = PBR BRDF enabled, bit 4 = water waves, bit 5 = tile jitter
     // + maxBounces(@196) + maxRayDistance(@200)
     // + dynamic sky (16-byte aligned vec4s): sunDir+dayFactor(@208) + lightDir(@224) + lightRadiance(@240)
     // + sky rewrite: moonDir+moonPhase(@256) + celestialAxis+starAngle(@272) + sunUv(@288) + moonUv(@304)
@@ -117,10 +118,12 @@ public final class RtComposite {
     // the BDA struct since it's cold or only read once per ray-gen invocation.
     // layout: worldPushAddr(@0, 8B) + tableAddr(@8, 8B) + entityTableAddr(@16, 8B) + frameIndex(@24, 4B)
     private static final int WORLD_PUSH_CONST_SIZE = 32;
-    // RR guides (6) + split lighting + ReSTIR (3) + light field SSBO (1) + ReSTIR GI (4).
+    // RR guides (6) + split lighting + ReSTIR (3) + light field SSBO (1) + ReSTIR GI (4)
+    // + tile-jitter guide (1) for NRD pre-warp (v0.6.8+).
     // Slots 0..8 images, 9 SSBO lights, 10-11 reservoir images, 12 SSBO light field,
-    // 13-16 GI reservoir images (currA, currB, prevA, prevB).
-    private static final int GUIDE_COUNT = 23; // bindings 3..25 (guides + standard RT outputs)
+    // 13-16 GI reservoir images (currA, currB, prevA, prevB), 17-22 misc guides,
+    // 23 tile-jitter guide (R8G8).
+    private static final int GUIDE_COUNT = 24; // bindings 3..26 (guides + standard RT outputs)
 
     // ReSTIR Direct Illumination feature flag
     // ReSTIR DI currently loses the AMD device after the live light set grows while NRD is
@@ -137,7 +140,9 @@ public final class RtComposite {
     private static final boolean ENABLE_VRS = false;
     private static final boolean ENABLE_ASYNC_COMPUTE = false;
     private static final boolean ENABLE_DRS = false;
-    private static final boolean ENABLE_ADAPTIVE_SPP = false;
+    // Adaptive SPP: path tracer spends extra samples on transparent/water/emissive-adjacent pixels.
+    // Hard-disabled during RADV isolation; re-enabled now that the RT path is stable.
+    private static final boolean ENABLE_ADAPTIVE_SPP = true;
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
     // the composite frame counter has advanced this far past it (so no in-flight frame still reads it).
@@ -148,11 +153,15 @@ public final class RtComposite {
     }
 
     private static int spp() {
-        return 1;
+        // Honour config. Hardcoded 1 during GPUVM isolation left every pixel as a single Monte-Carlo
+        // sample → SPP=1 fireflies that NRD cannot fully erase. Cap at 4 for interactive pacing.
+        return Math.min(4, Math.max(1, CausticaConfig.Rt.Composite.SPP.value()));
     }
 
     private static int maxBounces() {
-        return 2;
+        // Config default is 4; isolation hard-capped at 2 which cut GI/spec tails but also left
+        // single-bounce sun NEE as the only energy path (more visible firefly grain on snow/grass).
+        return Math.min(6, Math.max(1, CausticaConfig.Rt.Composite.MAX_BOUNCES.value()));
     }
 
     private static float maxRayDistance() {
@@ -164,47 +173,31 @@ public final class RtComposite {
     }
 
     /**
-     * DLSS-RR owns the full stack (raw SPP → RR). Must not run FFX/NRD/beauty-TAA before it.
+     * Temporal reconstruction providers run after denoise on a clean plate and own
+     * their own history. Capability routing keeps this independent of selector keys.
      */
-    private static boolean isDlssRr(Upscaler activeUpscaler) {
-        return activeUpscaler != null && activeUpscaler.mode() == UpscalerSelector.Mode.DLSS_RR;
-    }
-
-    /**
-     * TAAU / FSR2/3/4 / XeSS: temporal upscale <b>after</b> denoise on a clean plate
-     * (Radiance-style NRD → FSR). Earlier we skipped these because raw PT + FSR swam;
-     * with NRD/FFX cleaning first, they are the real super-res path on AMD/Intel.
-     */
-    private static boolean isSpatialUpscaler(Upscaler activeUpscaler) {
-        if (activeUpscaler == null) {
-            return false;
-        }
-        UpscalerSelector.Mode m = activeUpscaler.mode();
-        return m == UpscalerSelector.Mode.TAAU
-                || m == UpscalerSelector.Mode.FSR_3
-                || m == UpscalerSelector.Mode.FSR_4
-                || m == UpscalerSelector.Mode.XESS;
+    private static boolean isTemporalUpscaler(Upscaler activeUpscaler) {
+        return activeUpscaler != null && activeUpscaler.performsTemporalReconstruction();
     }
 
     private static boolean temporalAccumEnabled(Upscaler activeUpscaler) {
         if (debugView() != 0) {
             return false;
         }
+        // AMD_FIDELITYFX preset was removed in commit 1 (2026-07-20): AMD AUTO now routes
+        // to NRD, so there is no FFX-history-double-up case to suppress here. NRD already
+        // owns temporal; we let beauty TAA on top if the user enabled it.
         if (!CausticaConfig.Rt.Composite.TEMPORAL_ACCUM.value()) {
             return false;
         }
-        // DLSS-RR and FSR/XeSS own temporal — stacking beauty TAA milks the image.
-        return !isDlssRr(activeUpscaler) && !isSpatialUpscaler(activeUpscaler);
+        // The selected temporal upscaler owns history; stacking beauty TAA softens and ghosts the plate.
+        return !isTemporalUpscaler(activeUpscaler);
     }
 
     private static int activeUpscalerQuality(Upscaler activeUpscaler) {
-        if (isDlssRr(activeUpscaler)) {
-            return RtDlssRr.quality();
-        }
-        if (isSpatialUpscaler(activeUpscaler)) {
-            return CausticaConfig.Rt.Upscaler.QUALITY.value();
-        }
-        return Integer.MIN_VALUE;
+        return isTemporalUpscaler(activeUpscaler)
+                ? CausticaConfig.Rt.Upscaler.QUALITY.value()
+                : Integer.MIN_VALUE;
     }
 
     private static float temporalAlpha() {
@@ -223,8 +216,8 @@ public final class RtComposite {
     // Celestial rotation axis (the pole the sun/moon arc about): perpendicular to the east-west arc,
     // tilted by SUN_NOON_SOUTH_TILT. Pushed so the sky shader can build the sun/moon square's tangent
     // frame (right = travel direction) and wheel the starfield. = normalize(noonDir x sunriseDir).
-    // Sign of the sub-pixel jitter as reported to DLSS-RR + applied to the primary ray, mirroring the
-    // validated DLSS-SR convention (Vulkan flipped clip space wants Y negated).
+    // Sign of the sub-pixel jitter applied to the primary ray and reported to temporal upscalers.
+    // Vulkan flipped clip space uses a negated Y convention.
     private static float jitterSignX() {
         return CausticaConfig.Rt.Composite.JITTER_SIGN_X.value();
     }
@@ -279,13 +272,18 @@ public final class RtComposite {
     private int bindlessTextureCapacity;
     // True after the LabPBR atlases have been resolved/bound for the currently alive world pipeline.
     private boolean materialBindingsReady;
-    // World push data (256 B) lives in a host-visible BDA ring; only the 8-byte slot address is pushed
-    // inline (256-byte NVIDIA push constant ceiling is otherwise exhausted by the world push struct).
-    // One slot per in-flight frame, cycled per frame so an in-flight slot is never overwritten.
+    // World push data lives in a dual host/device BDA ring; only the 8-byte *device* slot address is
+    // pushed inline (the portable minimum push-constant budget is otherwise exhausted by the world push
+    // struct). CPU writes the host slot, the frame command buffer copies host → pure device-local before
+    // trace (RADV GPUVM-faults when raygen follows a host-visible push BDA). One slot per in-flight frame.
     private static final int PUSH_RING = 6;
-    private RtBuffer[] pushRing;
+    private RtBuffer[] pushHostRing;
+    private RtBuffer[] pushDeviceRing;
     private int pushSlot;
     private RtDisplayPipeline displayPipeline;
+    /** FidelityFX CAS-style sharpen after upscale (display-res). */
+    private final dev.comfyfluffy.caustica.display.CasSharpenPass casSharpen =
+            new dev.comfyfluffy.caustica.display.CasSharpenPass();
     private RtImage output;
     // Denoised path-traced color (input to the upscaler / display pipeline). The path tracer writes the
     // raw noisy color into {@code output}; the active denoise backend reads {@code output} + the guide
@@ -293,6 +291,14 @@ public final class RtComposite {
     // {@code denoisedColor} when denoise is enabled, otherwise from {@code output} (the noisy color).
     // Sized at render resolution (same as {@code output}).
     private RtImage denoisedColor;
+
+    /**
+     * Format-adaptation bridge that owns the staging images and conversion compute pipelines
+     * for both the raw → denoise and the post-denoise → upscaler seams. Created lazily on
+     * the first {@code composite()} call (when {@link RtContext} is available) and reused
+     * for the lifetime of the device.
+     */
+    private RtPlateBridge plateBridge;
 
     // Variable Rate Shading for adaptive sampling
     private RtVariableRateShading vrs;
@@ -320,8 +326,8 @@ public final class RtComposite {
     // Per-frame observability for the in-game debug overlay. Written by recordFrame; read by
     // CausticaDebugOverlay and RtVideoOptions' upscaler setter (the latter sees stale values between
     // frames, which is fine because the overlay is a snapshot, not a frame-perfect read).
-    private volatile int lastRrRc;
-    private volatile boolean lastRrOk;
+    private volatile int lastUpscalerRc;
+    private volatile boolean lastUpscalerOk;
     private volatile boolean lastDenoiseOn;
     /** Short path label for the debug overlay (e.g. {@code nrd}, {@code ffx→nrd + beauty TAA}). */
     private volatile String lastDenoisePath = "off";
@@ -331,15 +337,14 @@ public final class RtComposite {
     private volatile boolean lastNrdComposeOk;
     private volatile float lastJitterPixelsX;
     private volatile float lastJitterPixelsY;
-    // DLSS-FG "hudless" resource: a copy of the main render target before the combined UI overlay
+    // Frame-generation "hudless" resource: a copy of the main render target before the combined UI overlay
     // composites back on top. Lazily allocated (only meaningful once FG + the UI overlay redirect are both
     // active), resized on demand.
     private RtImage fgHudlessImage;
     // Same idea as fgHudlessImage but for the HDR present path: a copy of hdrDisplayImage taken in
     // presentHdr right before its own combined-UI composite dispatch overwrites it in place (see
-    // captureFgHdrHudless). Already PQ-encoded (same as hdrDisplayImage), so this is a plain image copy, not
-    // a format conversion — DLSS-FG requires a display-ready EOTF-encoded [0,1] signal (its programming
-    // guide explicitly disallows scRGB), and PQ is exactly that.
+    // captureFgHdrHudless). It is already PQ-encoded like hdrDisplayImage, so this is a plain image copy,
+    // not a format conversion; every provider receives the same display-ready [0,1] signal.
     private RtImage fgHdrHudlessImage;
     // Step C.2: composites the combined UI overlay over hdrDisplayImage at paper white, just before present.
     private RtHdrCompositePipeline hdrCompositePipeline;
@@ -349,9 +354,9 @@ public final class RtComposite {
     // raw-copied (misdisplayed). Lazily created; the image is sized to the swapchain.
     private RtSdrPresentPipeline sdrPresentPipeline;
     private RtImage sdrPresentImage;
-    // DLSS Frame Generation: per-generated-frame interpolated output images (backbuffer size/format), and
-    // the jitter-free reprojection matrices derived from the MV view-projections each frame. In HDR mode
-    // these hold DLSSG's raw PQ-encoded output, which is blitted straight to the (PQ) swapchain — no decode
+    // Frame generation: per-generated-frame interpolated output images (backbuffer size/format), and
+    // jitter-free reprojection matrices derived from the MV view-projections. In HDR mode these hold the
+    // provider's PQ-encoded output, which is blitted straight to the PQ swapchain — no decode
     // needed since the swapchain itself is PQ-native.
     private RtImage[] fgInterp = new RtImage[0];
     private int fgInterpW = -1;
@@ -361,7 +366,7 @@ public final class RtComposite {
     private final Matrix4f fgClipToPrev = new Matrix4f();
     private final Matrix4f fgPrevToClip = new Matrix4f();
     private final Matrix4f fgMatTmp = new Matrix4f();
-    // Guide buffers (first-hit attributes for DLSS-RR): normal+roughness, albedo, depth, motion,
+    // Guide buffers (first-hit attributes for denoise and temporal upscalers): normal+roughness, albedo, depth, motion,
     // specular albedo, and reflection motion.
     private RtImage gNormal;
     private RtImage gAlbedo;
@@ -382,9 +387,19 @@ public final class RtComposite {
     private RtImage gViewZ;
     private RtImage gConfidenceDisocclusion;
     private RtImage gMaterialFlags;
-    // Display-res RT image the display mapper reads: DLSS-RR writes it (render -> display denoise+upscale), or a
+    /**
+     * Per-tile sub-pixel jitter offset written by world.rgen at render res (R8G8_UNORM, encoded
+     * as {@code (offset + 0.5)} so the full [-0.5, +0.5] render-pixel range maps to [0, 1]). The
+     * NRD pre-warp pass (nrd_prewarp.comp) reads this and re-samples the current frame's NRD
+     * input by {@code -tileJitter/size} so NRD's internal reproject math (which is told the
+     * unjittered pixel position via {@code cameraJitter}) lines up with the per-tile-quantized
+     * primary-ray sampling pattern used by the path tracer. See TILE_JITTER_GUIDE_DESIGN.md.
+     */
+    private RtImage gJitterGuide;
+    // Display-resolution RT image the display mapper reads: an upscaler writes it, or a
     // linear blit of `output` fills it when RR is off/unavailable (the no-RR reference / fallback).
     private RtImage rrOutput;
+    private int rrOutputFormat = -1;
     private final RtExposure exposure = new RtExposure();
 
     // ReSTIR Direct Illumination for block lights (torches, glowstone, lava) and dynamic lights (entities).
@@ -498,6 +513,7 @@ public final class RtComposite {
      * runtime change takes effect on the next frame instead of waiting for an MC restart.
      */
     public void invalidateUpscalerSelection() {
+        FrameGenSelector.invalidate();
         this.caustica$upscalerResolvedOnce = false;
     }
 
@@ -517,8 +533,7 @@ public final class RtComposite {
      * and from the Video Settings denoise-mode setter (so a backend swap doesn't
      * smear the old backend's accumulated color into the new backend's first frames).
      *
-     * <p>Also asks the active upscaler to drop its own internal temporal history
-     * (DLSS-RR's NGX accumulator, FSR / XeSS when the SDK exposes a reset path) so
+     * <p>Also asks the active upscaler to drop its own internal temporal history so
      * the new scene's colour palette does not smear from the previous view's
      * accumulated color. Safe to call on a no-history backend (Bilateral, Noop) and
      * on an upscaler with no SDK reset path (default no-op on the interface).
@@ -539,8 +554,7 @@ public final class RtComposite {
         if (temporalAccum != null) {
             temporalAccum.resetHistory();
         }
-        // Upscaler-side reset: DLSS-RR has a per-evaluate reset flag (RtDlssRr.resetHistory);
-        // FSR / XeSS use the default no-op unless their SDK exposes one. Both cases are safe.
+        // Provider-side reset is a no-op when the selected implementation has no temporal history.
         try {
             UpscalerSelector.current().requestResetHistory();
         } catch (Throwable t) {
@@ -548,14 +562,14 @@ public final class RtComposite {
         }
     }
 
-    /** True iff the last frame's upscaler dispatch produced a valid display-res image. */
-    public boolean getLastRrOk() {
-        return lastRrOk;
+    /** True iff the last frame's upscaler dispatch produced a valid display-resolution image. */
+    public boolean getLastUpscalerOk() {
+        return lastUpscalerOk;
     }
 
-    /** Return code from the last frame's upscaler evaluate (0 = success, otherwise NVSDK-style rc). */
-    public int getLastRrRc() {
-        return lastRrRc;
+    /** Generic result code for the last upscaler evaluate (0 = success, -1 = provider/fallback failure). */
+    public int getLastUpscalerRc() {
+        return lastUpscalerRc;
     }
 
     /** Whether the last frame's denoise pass actually ran (mirrors {@link #caustica$denoiseEnabled()}). */
@@ -598,7 +612,7 @@ public final class RtComposite {
                 dev.comfyfluffy.caustica.CausticaConfig.Rt.Denoise.MODE.get(),
                 renderW, renderH, displayW, displayH,
                 frameCounter,
-                lastRrOk ? "ok" : String.format("0x%X", lastRrRc));
+                lastUpscalerOk ? "ok" : Integer.toString(lastUpscalerRc));
 
         // Append DRS info if enabled
         if (drs != null) {
@@ -748,9 +762,7 @@ public final class RtComposite {
                         t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage());
             }
             try {
-                dev.comfyfluffy.caustica.framegen.FrameGenSelector.resolve(
-                        dev.comfyfluffy.caustica.vendor.GpuVendor.detect(),
-                        UpscalerSelector.resolvedMode());
+                FrameGenSelector.resolve(UpscalerSelector.current());
             } catch (Throwable t) {
                 CausticaMod.LOGGER.warn("FrameGenSelector.resolve() threw; falling back to frame-gen off", t);
             }
@@ -789,9 +801,6 @@ public final class RtComposite {
         }
         lastDimension = dim;
         try {
-            if (displayPipeline == null) {
-                displayPipeline = RtDisplayPipeline.create(ctx);
-            }
             // A resource reload re-stitches the block atlas. We've already torn down the world pipeline
             // (onResourceReloadStart) so nothing references the old atlas, but MC's deferred free keeps the
             // old view handle live for a few frames, then swaps in the new atlas (whose GPU upload may lag,
@@ -807,7 +816,7 @@ public final class RtComposite {
             // Cheap idempotent check every frame (not just on resize): if the exposure mode is switched
             // manual -> auto at runtime (video settings), the auto-mode histogram/state/pipeline must be
             // allocated before recordFrame's exposure.record() below needs them, or it throws.
-            exposure.ensureResources(ctx);
+            exposure.ensureResources(ctx, rrOutputFormat);
             refreshPipelineShapeIfNeeded(ctx);
             RtPipeline active = ensureWorld(ctx);
             refreshMaterialBindingsIfNeeded(ctx);
@@ -851,16 +860,35 @@ public final class RtComposite {
 
     private RtPipeline ensureWorld(RtContext ctx) {
         if (worldPipeline == null) {
-            bindlessTextureCapacity = RtEntityTextures.maxTextures();
+            int requestedBindlessCapacity = RtMaterialSystem.INSTANCE.bindlessTextureCapacity();
+            bindlessTextureCapacity = RtPipeline.compatibleBindlessTextureCapacity(
+                    ctx, requestedBindlessCapacity, true, true, true);
+            if (bindlessTextureCapacity < requestedBindlessCapacity) {
+                CausticaMod.LOGGER.warn("Clamping RT bindless texture capacity from {} to {} for device descriptor limits",
+                        requestedBindlessCapacity, bindlessTextureCapacity);
+            }
+            // Full multi-geometry SBT table is always allocated (hitGroupCount fixed). Full closest-hit +
+            // any-hit restored after stub/minimal isolation: AS/SBT/trace and full chit BDA loads are
+            // stable on RADV with single-geom BLAS. FSR2 remains forced OFF separately.
             worldPipeline = RtPipeline.create(ctx, RtDeviceBringup.worldRaygenShader(),
-                    new String[]{"world.rmiss.spv", "shadow.rmiss.spv"}, "world.rchit.spv", "world.rahit.spv",
+                    new String[]{"world.rmiss.spv", "shadow.rmiss.spv"}, RtDeviceBringup.worldClosestHitShader(), "world.rahit.spv",
                     WORLD_PUSH_CONST_SIZE, true, GUIDE_COUNT, bindlessTextureCapacity, true, true);
+            if (RtDeviceBringup.isRadv()) {
+                CausticaMod.LOGGER.info("RADV path: closest-hit={}, any-hit=world.rahit.spv, single-geom BLAS",
+                        RtDeviceBringup.worldClosestHitShader());
+            }
             // Per-frame push data lives in this BDA ring; the pipeline only pushes its address.
-            if (pushRing == null) {
-                pushRing = new RtBuffer[PUSH_RING];
+            if (pushHostRing == null) {
+                pushHostRing = new RtBuffer[PUSH_RING];
+                pushDeviceRing = new RtBuffer[PUSH_RING];
                 for (int i = 0; i < PUSH_RING; i++) {
-                    pushRing[i] = ctx.createBuffer(WORLD_PUSH_SIZE,
-                            VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "rt world push " + i);
+                    // Host staging: CPU packs WorldPush here. Device: pure VRAM BDA raygen actually reads.
+                    // WorldPush is buffer_reference_align=16 — the device slot BDA must itself be 16B-aligned.
+                    pushHostRing[i] = ctx.createBuffer(WORLD_PUSH_SIZE,
+                            VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "rt world push host " + i);
+                    pushDeviceRing[i] = ctx.createBdaBuffer(WORLD_PUSH_SIZE,
+                            VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            false, "rt world push device " + i);
                 }
             }
             if (output != null) {
@@ -879,7 +907,8 @@ public final class RtComposite {
         if (worldPipeline == null || reloadRebindRequested) {
             return;
         }
-        int desiredBindlessCapacity = RtEntityTextures.maxTextures();
+        int desiredBindlessCapacity = RtPipeline.compatibleBindlessTextureCapacity(
+                ctx, RtMaterialSystem.INSTANCE.bindlessTextureCapacity(), true, true, true);
         if (desiredBindlessCapacity <= bindlessTextureCapacity) {
             return;
         }
@@ -904,26 +933,24 @@ public final class RtComposite {
         long atlasView = blockAtlasView();
         boundAtlasHandle = atlasView; // remember what we bound so a reload can detect the new atlas
         worldPipeline.setAtlasSampler(atlasView, sampler);
-        // Bindless slot 0 = fallback texture (the block atlas) so an entity whose texture can't be
-        // resolved samples something defined rather than an unbound (partially-bound) descriptor.
-        RtEntityTextures.INSTANCE.reset(bindlessTextureCapacity);
+        // Fully initialize all three bindless arrays in every descriptor-ring slot. Missing entity
+        // textures/material maps therefore sample a defined fallback without partially-bound descriptors.
+        worldPipeline.initializeBindlessFallback(atlasView, sampler);
+        // Bindless slot 0 remains the canonical block-atlas fallback used by terrain-derived entities.
+        RtMaterialSystem.BlockAtlasViews materialViews = RtMaterialSystem.INSTANCE.prepareForPipeline(
+                bindlessTextureCapacity, worldPipeline.hasBlockMaterialAtlases());
         worldPipeline.setBindlessTexture(0, 0, atlasView, sampler); // binding 0 (albedo), slot 0 fallback
-        // LabPBR _s + _n parallel atlases. Bind the (block-atlas-sized) atlases; their pixels fill
-        // lazily as terrain extraction encounters sprites and refresh via flush(). Fall back to the block
-        // atlas view if an atlas didn't initialize so material bindings always hold a valid descriptor —
-        // the shader only samples them when a prim is flagged (mat.z/mat.w), so the fallback is never read.
-        // materialBase = firstExtra(3)+GUIDE_COUNT(13)=16 → _s@16, _n@17, sky@18.
+        // LabPBR _s + _n parallel atlases. The material system builds them before terrain tessellates so
+        // ensure() is a pure lookup on the build path. Fall back to albedo only to keep every descriptor
+        // valid; prim presence flags prevent the shader from sampling a missing material map.
+        // materialBase = firstExtra(3)+GUIDE_COUNT(24)=27 → _s@27, _n@28, sky@29.
         if (worldPipeline.hasBlockMaterialAtlases()) {
-            RtBlockMaterials.INSTANCE.reset();
-            // Build the full _s/_n atlases now (parallel decode + blit), before terrain tessellates, so
-            // ensure() is a pure lookup on the build path instead of decoding each sprite's maps lazily.
-            RtBlockMaterials.INSTANCE.prepareAll();
-            long specView = RtBlockMaterials.INSTANCE.viewS();
-            long normalView = RtBlockMaterials.INSTANCE.viewN();
+            long specView = materialViews.specular();
+            long normalView = materialViews.normal();
             worldPipeline.setBlockSpecAtlas(specView != 0L ? specView : atlasView, sampler);
             worldPipeline.setBlockNormalAtlas(normalView != 0L ? normalView : atlasView, sampler);
-            materialBindingsReady = true;
         }
+        materialBindingsReady = true;
         // Sky rewrite: bind the vanilla celestials atlas (sun + moon phases) for world.rmiss. The view
         // handle is stable across frames; the shader only samples it inside the sun/moon discs (sky
         // directions), so the block-atlas fallback is never read if the celestials atlas isn't ready.
@@ -956,29 +983,23 @@ public final class RtComposite {
     }
 
     /**
-     * Whether the resolved active denoise backend should run this frame. OFF is never
-     * active. AUTO is active unless the resolved upscaler is DLSS-RR and DLSS-RR is
-     * actually usable (DLSS-RR has its own denoise). FORCED (FFX / NRD) is always active.
+     * Whether the resolved active denoise backend should run this frame. OFF is never active;
+     * AUTO and every explicitly selected backend run independently of the selected upscaler.
      */
     private static boolean caustica$denoiseEnabled() {
-        // Re-enabled for official FFX shadow-split path only (selector refuses
-        // hand-written whole-radiance FFX / bilateral that black-screened on RADV).
-        // OFF → skip. AUTO → on unless DLSS-RR owns denoise. Forced FFX → on.
+        // The modular upscaler boundary never owns denoise. OFF skips; AUTO and supported forced modes run.
         dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind mode =
                 dev.comfyfluffy.caustica.CausticaConfig.Rt.Denoise.MODE.value();
         if (mode == dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.OFF) {
             return false;
         }
         if (mode != dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.AUTO) {
+            // AMD_FIDELITYFX removed in commit 1 (2026-07-20) — AMD AUTO routes to NRD now.
             return mode == dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.FFX
                     || mode == dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.NRD
                     || mode == dev.comfyfluffy.caustica.CausticaConfig.DenoiserKind.HYBRID;
         }
-        UpscalerSelector.Mode resolved = UpscalerSelector.resolvedMode();
-        if (resolved != UpscalerSelector.Mode.DLSS_RR) {
-            return true;
-        }
-        return !dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr.dlssdProbeAvailable();
+        return true;
     }
 
     /**
@@ -1031,6 +1052,13 @@ public final class RtComposite {
             worldPipeline = null;
             bindlessTextureCapacity = 0;
         }
+        // The descriptor owner is gone, so release old-pack dynamic textures immediately rather than
+        // retaining them until a later world frame happens to rebuild the pipeline. If the context vanished
+        // while a pipeline object is still present, keep its referenced resources alive rather than free them
+        // out from under an undestroyed descriptor set.
+        if (worldPipeline == null) {
+            RtMaterialSystem.INSTANCE.releaseAfterPipelineDestroy();
+        }
         // Drop the denoise + TAA history. The reload re-stitches the block atlas, so
         // a frame's worth of old-block-texel history will be sampled against the new
         // atlas in the next world frame — even though the guides (gNormal/gAlbedo) are
@@ -1081,6 +1109,9 @@ public final class RtComposite {
         worldPipeline.setExtraStorageImage(20, gConfidenceDisocclusion.view);
         worldPipeline.setExtraStorageImage(21, gMaterialFlags.view);
         worldPipeline.setExtraStorageImage(22, gUnshadowedDirect.view);
+        if (gJitterGuide != null) {
+            worldPipeline.setExtraStorageImage(23, gJitterGuide.view);
+        }
     }
 
     private void destroyGuideImages() {
@@ -1129,6 +1160,7 @@ public final class RtComposite {
         if (gViewZ != null) { gViewZ.destroy(); gViewZ = null; }
         if (gConfidenceDisocclusion != null) { gConfidenceDisocclusion.destroy(); gConfidenceDisocclusion = null; }
         if (gMaterialFlags != null) { gMaterialFlags.destroy(); gMaterialFlags = null; }
+        if (gJitterGuide != null) { gJitterGuide.destroy(); gJitterGuide = null; }
         if (rrOutput != null) {
             rrOutput.destroy();
             rrOutput = null;
@@ -1158,12 +1190,15 @@ public final class RtComposite {
 
     private void ensureOutput(RtContext ctx, int width, int height) {
         Upscaler activeUpscaler = UpscalerSelector.current();
-        // Reduced internal res: DLSS-RR (raw→RR) and FSR/XeSS (denoise→upscale).
-        // Off / noop: full display 1:1 + beauty TAA blit.
-        boolean reducedRender = isDlssRr(activeUpscaler) || isSpatialUpscaler(activeUpscaler)
-                || activeUpscaler.mode() == UpscalerSelector.Mode.TAAU;
+        // Temporal upscalers run at reduced internal resolution after denoise. Off/noop remains 1:1.
+        boolean reducedRender = isTemporalUpscaler(activeUpscaler);
         int upscalerQuality = activeUpscalerQuality(activeUpscaler);
+        int desiredRrOutputFormat = activeUpscaler != null
+                ? activeUpscaler.displayColorFormat(
+                        RtContext.HDR_RADIANCE_FORMAT, CausticaConfig.Rt.Hdr.enabled())
+                : RtContext.HDR_RADIANCE_FORMAT;
         if (output != null && displayImage != null && hdrDisplayImage != null && rrOutput != null && exposure.ready()
+                && displayPipeline != null && rrOutputFormat == desiredRrOutputFormat
                 && displayW == width && displayH == height
                 && renderSizeRrEnabled == reducedRender && renderSizeRrQuality == upscalerQuality) {
             return;
@@ -1216,11 +1251,21 @@ public final class RtComposite {
         renderH = targetRenderH;
         renderSizeRrEnabled = reducedRender;
         renderSizeRrQuality = upscalerQuality;
+        if (displayPipeline != null && rrOutputFormat != desiredRrOutputFormat) {
+            displayPipeline.destroy();
+            displayPipeline = null;
+        }
+        rrOutputFormat = desiredRrOutputFormat;
+        if (displayPipeline == null) {
+            displayPipeline = RtDisplayPipeline.create(ctx, rrOutputFormat);
+        }
 
-        // RT traces into an HDR (R16G16B16A16_SFLOAT) target so radiance > 1 survives to the display
-        // mapping seam. displayImage stays R8G8B8A8 to match the main target it is copied into
+        // Pure RGB beauty plates: B10G11R11_UFLOAT (32bpp) — half the bandwidth of RGBA16F while
+        // still carrying HDR radiance to the display mapping seam. Alpha is unused on this path.
+        // Guide buffers / NRD YCoCg packs / TAA history (depth-in-alpha) stay RGBA16F.
+        // displayImage stays R8G8B8A8 to match the main target it is copied into
         // (vkCmdCopyImage requires texel-size-compatible formats).
-        output = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "trace color " + renderW + "x" + renderH);
+        output = ctx.createStorageImage(renderW, renderH, RtContext.HDR_RADIANCE_FORMAT, "trace color " + renderW + "x" + renderH);
         // Firefly-killed radiance: 3x3 median over `output` (the path-tracer result).
         // Both NRD and TAAU read from this instead of `output` so SPP=1 fireflies
         // never enter temporal history or the final composite.
@@ -1228,7 +1273,7 @@ public final class RtComposite {
             fireflyKilled.destroy();
             fireflyKilled = null;
         }
-        fireflyKilled = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+        fireflyKilled = ctx.createStorageImage(renderW, renderH, RtContext.HDR_RADIANCE_FORMAT,
                 "firefly-killed radiance " + renderW + "x" + renderH);
         fireflyKill.ensureSized(ctx, renderW, renderH, fireflyKilled);
         // Denoised color: same size + format as output, lives at render res. The active backend owns its
@@ -1236,16 +1281,16 @@ public final class RtComposite {
         if (denoisedColor != null) {
             denoisedColor.destroy();
         }
-        denoisedColor = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+        denoisedColor = ctx.createStorageImage(renderW, renderH, RtContext.HDR_RADIANCE_FORMAT,
                 "denoise color " + renderW + "x" + renderH);
         // Temporal-accumulation visible output: same size + format as the noisy trace so it can
         // drop straight into the denoise/upscaler input slot. Allocated unconditionally (the
         // temporal pass is gated per-frame by temporalAccumEnabled()); the history ring lives in
-        // RtTemporalAccumulation and is sized lazily on its ensureSized().
+        // RtTemporalAccumulation (still RGBA16F — alpha carries depth) and is sized lazily on its ensureSized().
         if (accumulatedColor != null) {
             accumulatedColor.destroy();
         }
-        accumulatedColor = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+        accumulatedColor = ctx.createStorageImage(renderW, renderH, RtContext.HDR_RADIANCE_FORMAT,
                 "temporal accum color " + renderW + "x" + renderH);
         if (temporalAccum != null) {
             temporalAccum.ensureSized(renderW, renderH);
@@ -1253,7 +1298,7 @@ public final class RtComposite {
         displayImage = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R8G8B8A8_UNORM, "RT display image " + width + "x" + height);
         // PQ-encoded ([0,1], ST.2084) HDR display image, written in parallel by display.comp when HDR mode is active.
         hdrDisplayImage = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "RT HDR display image " + width + "x" + height);
-        // Guide buffers match the trace (render) resolution; DLSS-RR consumes them at render res.
+        // Guide buffers match the trace resolution; denoise and temporal upscalers consume them there.
         gNormal = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide normal roughness " + renderW + "x" + renderH);
         gAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide diffuse albedo " + renderW + "x" + renderH);
         gDepth = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT, "guide linear depth " + renderW + "x" + renderH);
@@ -1272,9 +1317,16 @@ public final class RtComposite {
         gViewZ = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT, "view z " + renderW + "x" + renderH);
         gConfidenceDisocclusion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "confidence disocclusion " + renderW + "x" + renderH);
         gMaterialFlags = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_UINT, "material flags " + renderW + "x" + renderH);
-        // Display-res RT image the display mapper reads. Always present (DLSS-RR target, or blit-upscale fallback).
-        rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
-        exposure.ensureResources(ctx);
+        // Tile-jitter guide (v0.6.8+): per-tile sub-pixel offset written by world.rgen, read by
+        // nrd_prewarp.comp. R8G8_UNORM is the minimum precision that fits the ±0.5 render-pixel
+        // range with 1/256 quantisation (current 1/8 step uses ~0.055 px, so 1/256 is ample).
+        gJitterGuide = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R8G8_UNORM, "tile jitter guide " + renderW + "x" + renderH);
+        // Display-res linear beauty. HDR + classic FSR2 stays RGBA16F all the way from
+        // Hybrid compose through FSR2 and into the display/PQ mapper; other paths retain
+        // the bandwidth-oriented B10G11R11 plate.
+        rrOutput = ctx.createStorageImage(width, height, rrOutputFormat,
+                "upscaler output " + width + "x" + height + " fmt=0x" + Integer.toHexString(rrOutputFormat));
+        exposure.ensureResources(ctx, rrOutputFormat);
 
         // ReSTIR Direct Illumination: reservoir images + light buffer. Real emissive blocks are
         // harvested each frame by UnifiedLightManager.rescanAround() — no fake test lights.
@@ -1367,17 +1419,22 @@ public final class RtComposite {
         RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "composite command buffer");
         try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope frameLabel = RtDebugLabels.scope(ctx, cmd, "composite frame")) {
             // Post stack:
-            //   DLSS-RR: raw + jitter → RR evaluate
-            //   FSR/XeSS: denoise (FFX/NRD) at render res + jitter → FSR evaluate
-            //   Off: denoise → beauty TAA → 1:1 blit
+            //   temporal upscaler: denoise at render resolution + jitter → provider evaluate
+            //   off/noop: denoise → optional beauty TAA → 1:1 blit
             int debugView = debugView();
             Upscaler activeUpscaler = UpscalerSelector.current();
-            boolean vendorTemporal = isDlssRr(activeUpscaler) && debugView == 0;
-            boolean spatialUpscale = isSpatialUpscaler(activeUpscaler) && debugView == 0 && !vendorTemporal;
-            boolean playablePath = !vendorTemporal && debugView == 0;
+            boolean temporalUpscale = isTemporalUpscaler(activeUpscaler) && debugView == 0;
+            boolean playablePath = debugView == 0;
             float jitterX = 0f;
             float jitterY = 0f;
-            if (vendorTemporal || spatialUpscale) {
+            // 2026-07-20: the playable path (FFX denoise + 1:1 blit) was excluded from jitter
+            // generation because it was assumed to be raw + post-TAA. But FFX's whole-radiance
+            // temporal accumulator (reproject + resolve + atrous) needs per-frame sub-pixel
+            // input variance to smooth SPP-2 noise — without jitter, every frame samples the
+            // same sub-pixel, history == current, and the output is just the raw radiance
+            // (static scene looks identical frame-to-frame). Adding playablePath to the
+            // jitter branch so FFX on a FSR=off path actually has variance to smooth.
+            if (temporalUpscale || playablePath) {
                 CausticaJitter.INSTANCE.prepare(renderW, renderH, displayW);
                 jitterX = CausticaJitter.INSTANCE.jitterPixelsX() * jitterSignX();
                 jitterY = CausticaJitter.INSTANCE.jitterPixelsY() * jitterSignY();
@@ -1392,8 +1449,9 @@ public final class RtComposite {
             // Write this frame's push data into the next BDA ring slot (cycled so an in-flight slot is
             // never overwritten). The std430 WorldPush layout matches these byte offsets exactly.
             pushSlot = (pushSlot + 1) % PUSH_RING;
-            RtBuffer pushBuf = pushRing[pushSlot];
-            ByteBuffer push = MemoryUtil.memByteBuffer(pushBuf.mapped, WORLD_PUSH_SIZE);
+            RtBuffer pushHost = pushHostRing[pushSlot];
+            RtBuffer pushDevice = pushDeviceRing[pushSlot];
+            ByteBuffer push = MemoryUtil.memByteBuffer(pushHost.mapped, WORLD_PUSH_SIZE);
             frameInvViewProj.set(frameProjection).mul(frameViewRotation).invert().get(0, push);
             mvCurProjView.get(352, push); // forward camera-relative view-projection: HW depth guide + water MV
             push.putFloat(64, (float) (camX - terrain.blockX));
@@ -1415,7 +1473,10 @@ public final class RtComposite {
             var level = Minecraft.getInstance().level;
             if (level != null) {
                 cameraBlockPos.set(Mth.floor(camX), Mth.floor(camY), Mth.floor(camZ));
-                if (level.getFluidState(cameraBlockPos).is(FluidTags.WATER)) {
+                // Height-aware, mirroring vanilla Camera.getFluidInCamera(): a plain block-granular
+                // test wrongly flags the eye submerged anywhere in a water column's top block.
+                net.minecraft.world.level.material.FluidState fs = level.getFluidState(cameraBlockPos);
+                if (fs.is(FluidTags.WATER) && camY < cameraBlockPos.getY() + fs.getHeight(level, cameraBlockPos)) {
                     flags |= 0b01;
                 }
             }
@@ -1432,6 +1493,12 @@ public final class RtComposite {
             // transparent / water / emissive-adjacent pixels and leaves sky at SPP 1.
             if (ENABLE_ADAPTIVE_SPP && CausticaConfig.Rt.Composite.ADAPTIVE_SPP.value()) {
                 flags |= 0b1000;
+            }
+            // bit 5 = opt-in tile-coalesced jitter. It improves traversal coherence on some GPUs,
+            // but the quantized pattern is extra temporal work and is visibly noisy when convergence
+            // is still warming up. Quality defaults to off; use the config for a performance A/B test.
+            if (CausticaConfig.Rt.Composite.TILE_JITTER.value()) {
+                flags |= 0b100000;
             }
             push.putInt(192, flags);
             push.putInt(196, maxBounces());
@@ -1569,96 +1636,165 @@ public final class RtComposite {
             push.putFloat(hybridOffset + 8, CausticaConfig.Rt.Hybrid.LIGHTFIELD_THRESHOLD.value());
             push.putFloat(hybridOffset + 12, 0.0f);
 
-            // Upload any entity textures registered this frame into the bindless set before the trace.
-            RtEntityTextures.INSTANCE.uploadPending(active, atlasSampler(ctx));
-            // Re-upload the LabPBR _s atlas if extraction added sprites since the last frame (the
-            // view handle is stable, so no re-bind needed). Before the trace records, like uploadPending.
-            RtBlockMaterials.INSTANCE.flush();
-            RtEntityMaterials.INSTANCE.flushAll(); // block-entity parallel _s/_n blitted during capture
-            // Build the entity BLAS this frame, then the TLAS that references them (+ the already-built
-            // terrain BLAS), then the trace — each separated by a barrier. The frame TLAS is retired
-            // KEEP_FRAMES later (entity meshes/BLAS are retired by RtEntities on the same horizon).
-            if (!fe.blas().isEmpty()) {
-                try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.blasRecord")) {
-                    RtAccel.recordBlasBuilds(ctx, cmd, fe.blas());
-                }
-                VulkanCommandEncoder.memoryBarrier(cmd, stack); // entity BLAS writes visible to the TLAS build
+            // Flush host push staging, then copy into pure device-local VRAM before raygen reads it.
+            // RADV GPUVM-faults at a fixed doorbell VA when WorldPushRef follows a host-visible BDA
+            // (observed next='rt world push N').
+            pushHost.flush();
+            {
+                org.lwjgl.vulkan.VkBufferCopy.Buffer region = org.lwjgl.vulkan.VkBufferCopy.calloc(1, stack)
+                        .srcOffset(0L).dstOffset(0L).size(WORLD_PUSH_SIZE);
+                VK10.vkCmdCopyBuffer(cmd, pushHost.handle, pushDevice.handle, region);
+                org.lwjgl.vulkan.VkBufferMemoryBarrier.Buffer barrier =
+                        org.lwjgl.vulkan.VkBufferMemoryBarrier.calloc(1, stack).sType$Default()
+                                .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                                .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT)
+                                .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                                .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                                .buffer(pushDevice.handle)
+                                .offset(0L)
+                                .size(WORLD_PUSH_SIZE);
+                VK10.vkCmdPipelineBarrier(cmd,
+                        VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        0, null, barrier, null);
             }
-            RtAccel.PreparedTlas frameTlas;
-            try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.prepareTlas")) {
-                frameTlas = RtAccel.prepareTlas(ctx, fe.instances(), tlasRing);
-            }
-            active.setTlas(frameTlas.accel.handle);
-            currentTlasHandle = frameTlas.accel.handle;
-            try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.recordTlas")) {
-                RtAccel.recordTlasBuild(ctx, cmd, frameTlas);
-            }
-            VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
+            // Section table is also dual host/device; hit shaders follow tableAddr every hit.
+            terrain.recordSectionTableUpload(cmd);
 
-            // Initialize VRS on first use (lazy init)
-            if (ENABLE_VRS && vrs == null && RtDeviceBringup.vrsEnabled()) {
-                try {
-                    vrs = new RtVariableRateShading(ctx);
-                    CausticaMod.LOGGER.info("Variable Rate Shading lazy initialized");
-                } catch (Exception e) {
-                    CausticaMod.LOGGER.error("Failed to lazy init VRS", e);
-                }
-            }
-
-            // Generate shading rate before raygen (if VRS enabled and resources created)
-            if (vrs != null && gDepth != null && gAlbedo != null) {
-                try {
-                    // Create/resize VRS resources if needed
-                    if (vrs.getShadingRateImageView() == 0L) {
-                        vrs.createResources(renderW, renderH);
+            // Skip the whole AS build + trace while the world still has zero TLAS instances (initial
+            // stream window). Empty TLAS + full-screen trace on Mesa 26.1/NAVI33 is the sequence that
+            // hard-recovers the device; the fault is only reported on the next submitSync (terrain upload).
+            boolean hasTraceGeometry = !fe.instances().isEmpty();
+            if (hasTraceGeometry) {
+                // Build the entity BLAS this frame, then the TLAS that references them (+ the already-built
+                // terrain BLAS), then the trace — each separated by a barrier. The frame TLAS is retired
+                // KEEP_FRAMES later (entity meshes/BLAS are retired by RtEntities on the same horizon).
+                if (!fe.blas().isEmpty()) {
+                    // Entity mesh buffers are still host-mapped; make those puts visible before the BLAS build.
+                    RtContext.hostWriteBarrier(cmd,
+                            org.lwjgl.vulkan.KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                            org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                                    | org.lwjgl.vulkan.VK10.VK_ACCESS_SHADER_READ_BIT);
+                    try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.blasRecord")) {
+                        RtAccel.recordBlasBuilds(ctx, cmd, fe.blas());
                     }
-                    // Generate shading rate from depth and albedo
-                    vrs.generateShadingRate(cmd, gDepth, gAlbedo, renderW, renderH);
-                } catch (Exception e) {
-                    CausticaMod.LOGGER.error("VRS generation failed", e);
+                    VulkanCommandEncoder.memoryBarrier(cmd, stack); // entity BLAS writes visible to the TLAS build
                 }
+                RtAccel.PreparedTlas frameTlas;
+                try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.prepareTlas")) {
+                    frameTlas = RtAccel.prepareTlas(ctx, fe.instances(), tlasRing);
+                }
+                // prepareTlas packs host staging; recordTlasBuild copies host → device-local then builds.
+                // Still emit a HOST barrier so the staging flush is ordered before the transfer.
+                RtContext.hostWriteBarrier(cmd,
+                        VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK10.VK_ACCESS_TRANSFER_READ_BIT);
+                active.setTlas(frameTlas.accel.handle);
+                currentTlasHandle = frameTlas.accel.handle;
+                // setTlas advances both descriptor rings to a long-unused slot. Upload newly registered
+                // bindless textures only after that advance, so ordinary (non-update-after-bind) descriptor
+                // writes cannot race an older submitted frame. Parallel LabPBR atlas views remain stable.
+                RtMaterialSystem.INSTANCE.flushBeforeTrace(active, atlasSampler(ctx));
+                try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.recordTlas")) {
+                    RtAccel.recordTlasBuild(ctx, cmd, frameTlas);
+                }
+                VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
+
+                // Initialize VRS on first use (lazy init)
+                if (ENABLE_VRS && vrs == null && RtDeviceBringup.vrsEnabled()) {
+                    try {
+                        vrs = new RtVariableRateShading(ctx);
+                        CausticaMod.LOGGER.info("Variable Rate Shading lazy initialized");
+                    } catch (Exception e) {
+                        CausticaMod.LOGGER.error("Failed to lazy init VRS", e);
+                    }
+                }
+
+                // Generate shading rate before raygen (if VRS enabled and resources created)
+                if (vrs != null && gDepth != null && gAlbedo != null) {
+                    try {
+                        // Create/resize VRS resources if needed
+                        if (vrs.getShadingRateImageView() == 0L) {
+                            vrs.createResources(renderW, renderH);
+                        }
+                        // Generate shading rate from depth and albedo
+                        vrs.generateShadingRate(cmd, gDepth, gAlbedo, renderW, renderH);
+                    } catch (Exception e) {
+                        CausticaMod.LOGGER.error("VRS generation failed", e);
+                    }
+                }
+
+                ByteBuffer pushAddr = stack.malloc(WORLD_PUSH_CONST_SIZE)
+                        .putLong(0, pushDevice.deviceAddress)
+                        .putLong(8, terrain.tableAddress())
+                        .putLong(16, fe.geomTableAddr())
+                        .putInt(24, (int) frameCounter);
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world trace");
+                     RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.trace")) {
+                    if (active == null) {
+                        System.err.println("[Caustica RT] ALARM: active pipeline is null in recordFrame");
+                    } else if (renderW <= 0 || renderH <= 0) {
+                        System.err.println("[Caustica RT] ALARM: trace dispatched with zero size " + renderW + "x" + renderH);
+                    }
+                    active.trace(cmd, renderW, renderH, pushAddr);
+                    if (dbgCount <= 5 || dbgCount % 60 == 0) {
+                        System.err.println("[Caustica RT] trace dispatched #" + dbgCount + " size=" + renderW + "x" + renderH
+                                + " instances=" + fe.instances().size());
+                    }
+                }
+                VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to denoise + upscaler reads
+            } else if (dbgCount <= 5 || dbgCount % 60 == 0) {
+                System.err.println("[Caustica RT] skip trace: zero TLAS instances (waiting for terrain residency)");
             }
 
-            ByteBuffer pushAddr = stack.malloc(WORLD_PUSH_CONST_SIZE)
-                    .putLong(0, pushBuf.deviceAddress)
-                    .putLong(8, terrain.tableAddress())
-                    .putLong(16, fe.geomTableAddr())
-                    .putInt(24, (int) frameCounter);
-            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world trace");
-                 RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.trace")) {
-                if (active == null) {
-                    System.err.println("[Caustica RT] ALARM: active pipeline is null in recordFrame");
-                } else if (renderW <= 0 || renderH <= 0) {
-                    System.err.println("[Caustica RT] ALARM: trace dispatched with zero size " + renderW + "x" + renderH);
+            // Firefly-kill pre-pass (always, before any denoise). The shader only replaces the centre when
+            // it is a >4× outlier vs EVERY neighbour — isolated SPP=1 spikes die; real emissives that
+            // light 2+ neighbour texels pass through. Without this, NRD-only gets raw single-sample
+            // HDR spikes and REBLUR leaves them as white grit on snow/grass (the screenshot case).
+            RtImage beautyForDenoise = output;
+            if (fireflyKilled != null && output != null && fireflyKill.isReady()) {
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "firefly kill");
+                     RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.firefly")) {
+                    fireflyKill.dispatch(cmd.address(), ctx, output, fireflyKilled);
                 }
-                active.trace(cmd, renderW, renderH, pushAddr);
-                if (dbgCount <= 5 || dbgCount % 60 == 0) {
-                    System.err.println("[Caustica RT] trace dispatched #" + dbgCount + " size=" + renderW + "x" + renderH);
-                }
+                VulkanCommandEncoder.memoryBarrier(cmd, stack);
+                beautyForDenoise = fireflyKilled;
             }
-            VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to denoise + DLSS reads
-
-            // Firefly-kill pass: disabled by default (v0.6 revert). The 3x3 median outlier rejection
-            // was correctly killing *isolated* bright pixels (real SPP=1 fireflies) but it ALSO
-            // killed legitimate light-source contributions in enclosed rooms: a single bright
-            // pixel from a sea-lantern NEE hit is statistically indistinguishable from a firefly
-            // (centre > 4x all 8 neighbours) so the pass clobbered the light contribution, and
-            // the rest of the room (which depends on that contribution for GI propagation) went
-            // dark. Disabled by default -- can be re-enabled via a future `firefly_kill.enabled`
-            // config flag once the discrimination heuristic improves (likely needs a depth/normal
-            // guard around the median).
-            // (Kept the dispatch point + image allocation + pipeline alive in case the future
-            // flag lands; just not invoked here.)
-            //if (fireflyKilled != null && output != null && fireflyKill.isReady()) {
-            //    try (...) { fireflyKill.dispatch(cmd.address(), ctx, output, fireflyKilled); }
-            //    VulkanCommandEncoder.memoryBarrier(cmd, stack);
-            //}
 
             // --- Playable stack: Official FFX (shadow+reflection) THEN beauty TAA ---
             // Order matters: denoise cleans noisy shadow/spec layers; TAA stabilizes residual GI/sky.
             lastDenoiseOn = false;
             lastDenoisePath = "off";
-            RtImage beautyAfterDenoise = output;
+            RtImage beautyAfterDenoise = beautyForDenoise;
+            int beautyAfterDenoiseFormat = RtContext.HDR_RADIANCE_FORMAT;
+            CausticaDenoiseBackend backend = null;
+            if (playablePath && caustica$denoiseEnabled() && denoisedColor != null) {
+                try {
+                    backend = DenoiseBackendSelector.current(ctx.device());
+                } catch (Throwable t) {
+                    CausticaMod.LOGGER.warn("DenoiseBackendSelector.current() threw; denoise=OFF this frame", t);
+                    try { DenoiseBackendSelector.invalidate(); } catch (Throwable t2) { }
+                }
+                if (backend instanceof dev.comfyfluffy.caustica.denoise.NoopDenoiseBackend) {
+                    backend = null;
+                }
+            }
+
+            // RtComposite owns the single format bridge. Resolve it before either denoise or
+            // upscale so Hybrid can compose directly into RGBA16F and FSR2 can consume that
+            // image by identity instead of round-tripping through B10G11R11.
+            RtPlateProfile plateProfile = null;
+            boolean plateReady = false;
+            if (playablePath && activeUpscaler != null) {
+                if (plateBridge == null) {
+                    plateBridge = new RtPlateBridge(ctx);
+                }
+                plateProfile = RtPlateProfile.resolve(
+                        RtContext.HDR_RADIANCE_FORMAT, backend, activeUpscaler);
+                plateReady = plateBridge.ensureSized(
+                        plateProfile, renderW, renderH, displayW, displayH);
+                activeUpscaler.setPlateBridge(plateBridge);
+            }
             // Any denoise (NRD REBLUR or FFX temporal) already owns temporal accumulation — stacking the
             // standalone beauty TAA on top makes the image milky/soft and produces ghost trails along
             // motion vectors. Used to be gated only on NRD (`nrdOwnsTemporal`) which let FFX-only paths
@@ -1667,15 +1803,7 @@ public final class RtComposite {
             lastNrdPrepareOk = false;
             lastNrdDispatchOk = false;
             lastNrdComposeOk = false;
-            if (playablePath && caustica$denoiseEnabled() && denoisedColor != null) {
-                CausticaDenoiseBackend backend = null;
-                try {
-                    backend = DenoiseBackendSelector.current(ctx.device());
-                } catch (Throwable t) {
-                    CausticaMod.LOGGER.warn("DenoiseBackendSelector.current() threw; denoise=OFF this frame", t);
-                    try { DenoiseBackendSelector.invalidate(); } catch (Throwable t2) { }
-                }
-                if (backend != null && !(backend instanceof dev.comfyfluffy.caustica.denoise.NoopDenoiseBackend)) {
+            if (backend != null && plateReady && plateProfile != null) {
                     try {
                         backend.ensureSized(renderW, renderH);
                     } catch (Throwable t) {
@@ -1684,8 +1812,19 @@ public final class RtComposite {
                     try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "denoise:" + backend.name());
                          RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.denoise")) {
                         if (gShadowHit != null && gDiffuse != null && gReflection != null) {
-                            if (backend instanceof dev.comfyfluffy.caustica.denoise.OfficialFfxDenoiseBackend official) {
+                            if (backend instanceof dev.comfyfluffy.caustica.denoise.AmdFidelityFxDenoiseBackend amd) {
+                                amd.setSplitBuffers(gShadowHit, gDiffuse, gReflection);
+                                if (gUnshadowedDirect != null) {
+                                    amd.setUnshadowedDirect(gUnshadowedDirect);
+                                }
+                                if (gSpecMotion != null) {
+                                    amd.setSpecMotion(gSpecMotion);
+                                }
+                            } else if (backend instanceof dev.comfyfluffy.caustica.denoise.OfficialFfxDenoiseBackend official) {
                                 official.setSplitBuffers(gShadowHit, gDiffuse, gReflection);
+                                if (gUnshadowedDirect != null) {
+                                    official.setUnshadowedDirect(gUnshadowedDirect);
+                                }
                                 if (gSpecMotion != null) {
                                     official.setSpecMotion(gSpecMotion);
                                 }
@@ -1713,6 +1852,19 @@ public final class RtComposite {
                                 if (gConfidenceDisocclusion != null) {
                                     hybrid.setConfidenceDisocclusionGuide(gConfidenceDisocclusion);
                                 }
+                                // Tile-jitter guide for NRD pre-warp (v0.6.8+). Without this,
+                                // NRD's reproject samples previous history at the wrong sub-pixel
+                                // offset (NRD sees only the global jitter, not the per-tile one).
+                                if (gJitterGuide != null) {
+                                    hybrid.setJitterGuide(gJitterGuide);
+                                }
+                                // Same guide for the TAAU upscaler (if active). TAAU's reproject
+                                // reads this and adds the per-tile offset to prevUV so the temporal
+                                // blend lines up with the path tracer's actual sampling. Default
+                                // no-op on upscalers that do not use the guide (FSR, XeSS).
+                                if (activeUpscaler != null && gJitterGuide != null) {
+                                    activeUpscaler.setJitterGuide(gJitterGuide);
+                                }
                                 hybrid.setLightDirection(push.getFloat(224), push.getFloat(228), push.getFloat(232));
                                 // NRD needs camera-relative worldToView + camDelta so walking
                                 // does not leave milky trails; jitter must be UV not pixels.
@@ -1725,16 +1877,26 @@ public final class RtComposite {
                         // Denoise dispatch
                         // Note: True async compute (dual-queue overlap) requires fundamental refactoring
                         // of composite() to split submissions. For now, use single-queue path.
-                        boolean denoiseSucceeded = backend.dispatch(stack, cmd, output, gNormal, gDepth, gMotion,
+                        RtImage denoiseTarget = plateBridge.denoiseOutputColor() != null
+                                ? plateBridge.denoiseOutputColor()
+                                : denoisedColor;
+                        boolean denoiseSucceeded = backend.dispatch(stack, cmd,
+                                plateBridge.adaptToDenoise(cmd, beautyForDenoise), gNormal, gDepth, gMotion,
                                 1.0f / Math.max(1, renderW), 1.0f / Math.max(1, renderH),
-                                denoisedColor);
+                                denoiseTarget);
 
                         if (asyncCompute != null) {
                             asyncCompute.recordFallbackFrame();
                         }
 
                         lastDenoiseOn = denoiseSucceeded;
-                        beautyAfterDenoise = denoiseSucceeded ? denoisedColor : output;
+                        if (denoiseSucceeded) {
+                            beautyAfterDenoise = plateBridge.finalizeDenoise(cmd, denoiseTarget);
+                            beautyAfterDenoiseFormat = plateProfile.denoiseOutputFormat;
+                        } else {
+                            beautyAfterDenoise = beautyForDenoise;
+                            beautyAfterDenoiseFormat = RtContext.HDR_RADIANCE_FORMAT;
+                        }
                         lastDenoisePath = backend.name();
                         // Both NRD and FFX paths own their own temporal accumulation — flag both so the
                         // standalone beauty TAA below correctly skips regardless of which backend ran.
@@ -1744,18 +1906,40 @@ public final class RtComposite {
                             lastNrdDispatchOk = hybrid.lastDispatchOk();
                             lastNrdComposeOk = hybrid.lastComposeOk();
                             lastDenoisePath = hybrid.lastPathLabel();
+                            // Inject NRD guides for FSR2's self-derived reactive mask
+                            // (motion+depth divergence → R32F, see
+                            // shaders/display/denoise_ffx/fsr2_reactive_mask.comp).
+                            // No-op on upscalers that own their own reactive path
+                            // (for example XeSS). Falls back to no-reactive v1 dispatch
+                            // for any path where the SO lacks the v2 entry point.
+                            if (activeUpscaler != null) {
+                                activeUpscaler.setReactiveMaskGuides(gViewZ, hybrid.getDisocclusionMix());
+                            }
+                        } else if (backend instanceof dev.comfyfluffy.caustica.denoise.AmdFidelityFxDenoiseBackend amd) {
+                            lastDenoisePath = amd.lastPathLabel();
+                            if (activeUpscaler != null) {
+                                activeUpscaler.setReactiveMaskGuides(null, null);
+                            }
                         } else if (backend instanceof dev.comfyfluffy.caustica.denoise.OfficialFfxDenoiseBackend) {
                             lastDenoisePath = "ffx";
+                            if (activeUpscaler != null) {
+                                activeUpscaler.setReactiveMaskGuides(null, null);
+                            }
                         }
                     } catch (Throwable t) {
-                        CausticaMod.LOGGER.warn("Denoise backend '{}' threw; raw beauty this frame", backend.name(), t);
+                        CausticaMod.LOGGER.warn("Denoise backend '{}' threw; firefly-killed beauty this frame", backend.name(), t);
                         try { DenoiseBackendSelector.invalidate(); } catch (Throwable t2) { }
                         lastDenoiseOn = false;
                         lastDenoisePath = "off";
-                        beautyAfterDenoise = output;
+                        beautyAfterDenoise = beautyForDenoise;
+                        beautyAfterDenoiseFormat = RtContext.HDR_RADIANCE_FORMAT;
+                        // Clear reactive guides so FSR2 doesn't reuse the last
+                        // healthy frame's NRD outputs against this frame's raw beauty.
+                        if (activeUpscaler != null) {
+                            activeUpscaler.setReactiveMaskGuides(null, null);
+                        }
                     }
                     VulkanCommandEncoder.memoryBarrier(cmd, stack);
-                }
             }
 
             boolean temporalAccumRan = false;
@@ -1788,61 +1972,73 @@ public final class RtComposite {
                 VulkanCommandEncoder.memoryBarrier(cmd, stack);
             }
 
-            // Display plate: TAA → denoise beauty → raw (FSR/XeSS/RR read this at render res)
-            RtImage displayPlate = temporalAccumRan ? accumulatedColor
-                    : (lastDenoiseOn ? denoisedColor : output);
+            // Display plate: TAA → denoised beauty → raw; temporal upscalers consume it at render resolution
+            RtImage displayPlate = temporalAccumRan ? accumulatedColor : beautyAfterDenoise;
+            int displayPlateFormat = temporalAccumRan
+                    ? RtContext.HDR_RADIANCE_FORMAT
+                    : beautyAfterDenoiseFormat;
+            if (activeUpscaler != null) {
+                activeUpscaler.setPlateBridge(plateBridge);
+                activeUpscaler.setInputColorFormat(displayPlateFormat);
+            }
 
             int upscalerQuality = activeUpscalerQuality(activeUpscaler);
-            if (vendorTemporal && activeUpscaler.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH,
+            // NRD/FFX already own temporal history on the beauty plate. Stacking TAAU's second
+            // temporal accumulator on top (with its own de-jitter + variance clip) makes static
+            // terrain twinkle/flash — the screenshot "grass/snow flicker" case. Only run a temporal
+            // upscaler after denoise when we still need spatial scale-up (render < display).
+            boolean needSpatialUpscale = renderW < displayW - 1 || renderH < displayH - 1;
+            boolean runTemporalUpscaler = temporalUpscale
+                    && (!denoiseWillRun || needSpatialUpscale);
+            if (runTemporalUpscaler && activeUpscaler.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH,
                     upscalerQuality, 0)) {
-                // DLSS-RR: raw path-traced samples (RR is the denoise).
-                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, activeUpscaler.mode().key() + " evaluate");
-                     RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.upscaler")) {
-                    rrDone = activeUpscaler.evaluate(cmd.address(), output, gDepth, gMotion,
-                            gAlbedo, gSpecAlbedo, gNormal, gSpecMotion, null,
-                            rrOutput, renderW, renderH, displayW, displayH,
-                            -jitterX, -jitterY, frameViewRotation, frameProjection);
-                }
-            } else if (spatialUpscale && activeUpscaler.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH,
-                    upscalerQuality, 0)) {
-                // FSR2/XeSS: upscale the *denoised* plate (Radiance NRD→FSR).
-                // Critical: NRD already resolved temporal AA onto a stable grid. Feeding the
-                // same Halton jitter FSR expects for raw samples makes the whole frame swim
-                // (camera shake). Pass zero jitter for post-denoise plates; keep real jitter
-                // only when FSR sees raw SPP-1 (no NRD/FFX).
+                // FSR2/XeSS: upscale the *denoised* plate (Radiance denoise → temporal upscale).
+                // Denoising does not undo the primary-ray sample position: depth, motion and
+                // colour remain on this frame's jittered render grid. FSR must therefore receive
+                // non-zero jitter every frame, including after denoise, or its history locks
+                // never see sub-pixel coverage.
+                //
+                // SDK-backed temporal upscalers expect camera-jitter semantics: the offset applied to the projection matrix,
+                // where +X shifts the camera right → objects appear left.  Caustica applies jitter
+                // to the RAY direction instead: +X shifts the ray right → the sample at pixel (x)
+                // reads from (x + jitterX).  This is the OPPOSITE effect of camera jitter, so the
+                // camera-equivalent jitter for all temporal upscalers is (-jitterX, -jitterY).
+                // TAAU is the exception: its shader knows the raw ray offset in render pixels.
+                //
+                // After NRD, the plate is already temporally resolved; feeding the raw ray jitter
+                // into TAAU's currentUV = dstUV - jitter re-introduces sub-pixel swim. Zero it.
                 float fsrJx;
                 float fsrJy;
-                if (activeUpscaler.mode() == UpscalerSelector.Mode.TAAU) {
-                    // TAAU receives the signed offset applied to primary rays, in render pixels;
-                    // its shader performs the inverse lookup explicitly.
+                if (denoiseWillRun) {
+                    fsrJx = 0.0f;
+                    fsrJy = 0.0f;
+                } else if (activeUpscaler.expectsRawRenderJitter()) {
                     fsrJx = jitterX;
                     fsrJy = jitterY;
-                } else if (lastDenoiseOn) {
-                    fsrJx = 0f;
-                    fsrJy = 0f;
                 } else {
                     fsrJx = -jitterX;
                     fsrJy = -jitterY;
                 }
-                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, activeUpscaler.mode().key() + " evaluate");
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, activeUpscaler.id() + " evaluate");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.upscaler")) {
                     rrDone = activeUpscaler.evaluate(cmd.address(), displayPlate, gDepth, gMotion,
                             gAlbedo, gSpecAlbedo, gNormal, gSpecMotion, null,
                             rrOutput, renderW, renderH, displayW, displayH,
                             fsrJx, fsrJy, frameViewRotation, frameProjection);
                 }
+                // Provider-owned output validation may quarantine a path that reported success
+                // without producing a usable plate. Fail open to the renderer's blit path.
+                if (rrDone && activeUpscaler.consumeFailOpen()) {
+                    rrDone = false;
+                    CausticaMod.LOGGER.warn(
+                            "Upscaler output validation failed — falling back to 1:1 blit until the provider recovers");
+                }
             }
-            lastUpscalerPath = (vendorTemporal || spatialUpscale) && rrDone;
-            if (isDlssRr(activeUpscaler)) {
-                lastRrOk = rrDone;
-                lastRrRc = RtDlssRr.INSTANCE.lastEvaluateRc();
-            } else if (spatialUpscale) {
-                lastRrOk = rrDone;
-                lastRrRc = rrDone ? 0 : -1;
-            } else {
-                lastRrOk = true;
-                lastRrRc = 0;
-            }
+            // Use the actual decision (runTemporalUpscaler), not mere capability (temporalUpscale).
+            // After NRD at native res we intentionally skip TAAU — report that as blit, not "ran".
+            lastUpscalerPath = runTemporalUpscaler && rrDone;
+            lastUpscalerOk = !runTemporalUpscaler || rrDone;
+            lastUpscalerRc = lastUpscalerOk ? 0 : -1;
 
             if (!rrDone) {
                 VulkanCommandEncoder.memoryBarrier(cmd, stack);
@@ -1853,10 +2049,53 @@ public final class RtComposite {
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // rrOutput visible to exposure histogram
 
-            // Auto-exposure meters rrOutput (the post-RR, denoised/converged image), not the raw
-            // pre-RR trace: RR has no notion of exposure (DLSS-RR Integration Guide §3.7 — ignore
-            // exposure/auto-exposure/sharpness entirely for RR), so this is purely our own metering
-            // choice, independent of RR's pipeline placement. Metering the noisy pre-RR buffer made
+            // Real-time pipeline flow capture (not code inference): log what actually ran this frame.
+            // Every 60 frames after the first few — answers "did firefly/NRD/TAAU execute?" from live state.
+            if (dbgCount <= 8 || dbgCount % 60 == 0) {
+                String plateName = temporalAccumRan ? "temporalAccum"
+                        : (beautyAfterDenoise == beautyForDenoise
+                        ? (beautyForDenoise != output ? "fireflyKilled" : "rawOutput")
+                        : "denoiseOut");
+                System.err.println("[Caustica PIPE] #" + dbgCount
+                        + " spp=" + spp()
+                        + " bounces=" + maxBounces()
+                        + " render=" + renderW + "x" + renderH
+                        + " display=" + displayW + "x" + displayH
+                        + " firefly=" + (beautyForDenoise != output)
+                        + " denoiseOn=" + lastDenoiseOn
+                        + " denoisePath=" + lastDenoisePath
+                        + " nrdPrep=" + lastNrdPrepareOk
+                        + " nrdDisp=" + lastNrdDispatchOk
+                        + " nrdComp=" + lastNrdComposeOk
+                        + " plate=" + plateName
+                        + " needSpatialUp=" + needSpatialUpscale
+                        + " runTaaU=" + runTemporalUpscaler
+                        + " taaUdone=" + rrDone
+                        + " upscalerPath=" + lastUpscalerPath
+                        + " instances=" + (hasTraceGeometry ? fe.instances().size() : 0));
+            }
+
+            // Optional renderer CAS polish after upscale. Providers that already apply their
+            // configured sharpening advertise that capability so the compositor does not double-filter.
+            if (playablePath && debugView == 0
+                    && CausticaConfig.Rt.Upscaler.SHARPEN.value()
+                    && rrOutput != null
+                    && lastUpscalerPath
+                    && !activeUpscaler.includesSharpening()) {
+                try {
+                    casSharpen.ensureSized(displayW, displayH);
+                    float sharpness = Math.min(0.45f, CausticaConfig.Rt.Upscaler.SHARPNESS.value() * 0.5f);
+                    if (casSharpen.dispatchInPlace(stack, cmd, rrOutput, sharpness)) {
+                        VulkanCommandEncoder.memoryBarrier(cmd, stack);
+                    }
+                } catch (Throwable t) {
+                    CausticaMod.LOGGER.warn("CAS sharpen threw; continuing without sharpen", t);
+                }
+            }
+
+            // Auto-exposure meters rrOutput (the post-upscale, denoised/converged image), not the raw
+            // trace. This is a renderer-owned metering choice independent of provider implementation;
+            // metering the noisy pre-upscale buffer made
             // the histogram's log-luminance average biased by Monte-Carlo noise (Jensen's inequality
             // on the concave log()), so the computed exposure drifted with SPP; rrOutput is stable
             // regardless of SPP, keeping exposure consistent.
@@ -2016,7 +2255,7 @@ public final class RtComposite {
             atmosphereTransmittance(moonX, moonY, moonZ, trans);
             float moonStrength = smoothstep(0.04f, 0.22f, -sunY);
             float litFraction = 1.0f - Math.abs(moonPhase - 4.0f) / 4.0f; // 0 new .. 1 full
-            float moonPeak = 0.30f * (0.15f + 0.85f * litFraction);
+            float moonPeak = 0.20f * (0.15f + 0.85f * litFraction);
             lx = moonX; ly = moonY; lz = moonZ;
             rr = 0.30f * moonPeak * moonStrength * trans[0];
             rg = 0.36f * moonPeak * moonStrength * trans[1];
@@ -2120,6 +2359,14 @@ public final class RtComposite {
         // longer in flight and can be freed immediately.
         tlasRing.destroy();
         UpscalerSelector.shutdown();
+        if (plateBridge != null) {
+            try {
+                plateBridge.destroy();
+            } catch (Throwable t) {
+                CausticaMod.LOGGER.warn("RtPlateBridge destroy failed", t);
+            }
+            plateBridge = null;
+        }
         if (asyncCompute != null) {
             asyncCompute.destroy();
             asyncCompute = null;
@@ -2164,6 +2411,7 @@ public final class RtComposite {
         DenoiseBackendSelector.invalidate();
         destroyGuideImages();
         exposure.destroy();
+        casSharpen.destroy();
         if (displayPipeline != null) {
             displayPipeline.destroy();
             displayPipeline = null;
@@ -2202,13 +2450,21 @@ public final class RtComposite {
         }
         bindlessTextureCapacity = 0;
         materialBindingsReady = false;
-        if (pushRing != null) {
-            for (RtBuffer b : pushRing) {
+        if (pushHostRing != null) {
+            for (RtBuffer b : pushHostRing) {
                 if (b != null) {
                     b.destroy();
                 }
             }
-            pushRing = null;
+            pushHostRing = null;
+        }
+        if (pushDeviceRing != null) {
+            for (RtBuffer b : pushDeviceRing) {
+                if (b != null) {
+                    b.destroy();
+                }
+            }
+            pushDeviceRing = null;
         }
         if (atlasSampler != 0L) {
             RtContext ctx = RtContext.currentOrNull();
@@ -2276,10 +2532,10 @@ public final class RtComposite {
     }
 
     /**
-     * DLSS-FG: the PQ-encoded HDR backbuffer (view/image), valid only right after {@link #presentHdr} has run
+     * PQ-encoded HDR backbuffer (view/image), valid only right after {@link #presentHdr} has run
      * this frame (it's the same image {@code presentHdr} just composited UI into and blitted to the
      * swapchain) — used as the interpolation source for HDR frame generation instead of the SDR main target.
-     * Already display-ready PQ, so it's fed to DLSSG directly with no extra encode step. 0 if HDR isn't
+     * Already display-ready PQ, so it is fed to the active frame-generation provider without another encode. 0 if HDR isn't
      * active this frame.
      */
     public long hdrBackbufferView() {
@@ -2305,11 +2561,11 @@ public final class RtComposite {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
 
-            // DLSS-FG "hudless" capture: hdrDisplayImage right now holds the RT world before the combined
+            // Frame-generation "hudless" capture: hdrDisplayImage right now holds the RT world before the combined
             // UI overlay is blended in. Snapshot it before that composite overwrites it in place, mirroring
             // captureFgHudless's SDR pattern (pre-UI copy) but reusing this frame's already-open command
             // buffer.
-            if (RtDlssFg.enabled()) {
+            if (FrameGenSelector.current().isEnabled()) {
                 captureFgHdrHudless(cmd, stack, src);
             }
 
@@ -2514,8 +2770,8 @@ public final class RtComposite {
     }
 
     /**
-     * DLSS Frame Generation quality: capture a copy of {@code main} (the main render target) into
-     * {@link #fgHudlessImage} for {@link #fgInterpolate} to feed DLSSG as the "hudless" resource. Call from
+     * Frame-generation quality input: capture a copy of {@code main} (the main render target) into
+     * {@link #fgHudlessImage} for {@link #fgInterpolate} to feed the provider as its "hudless" resource. Call from
      * {@code GameRendererMixin} right after {@code GuiRenderer.render()} but BEFORE
      * {@link RtUiOverlay#compositeIfUsed()} — at that point, when the UI overlay redirect is active, {@code
      * main} still has no combined UI baked in (world overlays, hand/screen effects and GUI went to the
@@ -2524,7 +2780,8 @@ public final class RtComposite {
      * copy the ALREADY-composited backbuffer, which is useless as a distinct hudless input.
      */
     public void captureFgHudless(RenderTarget main) {
-        if (!RtDlssFg.enabled() || !RtUiOverlay.enabled() || main == null || main.getColorTexture() == null) {
+        if (!FrameGenSelector.current().isEnabled() || !RtUiOverlay.enabled()
+                || main == null || main.getColorTexture() == null) {
             return;
         }
         RtContext ctx = RtContext.currentOrNull();
@@ -2563,9 +2820,9 @@ public final class RtComposite {
     /**
      * HDR counterpart of {@link #captureFgHudless} — copies {@code src} (this frame's {@code hdrDisplayImage},
      * before the combined UI overlay is blended in) into {@link #fgHdrHudlessImage} for {@link
-     * #fgInterpolate}'s HDR path to feed DLSSG as the "hudless" resource. A plain copy, not a format
+     * #fgInterpolate}'s HDR path as the "hudless" resource. A plain copy, not a format
      * conversion: both images are
-     * already PQ-encoded (the display-ready EOTF-encoded [0,1] signal DLSS-FG's programming guide requires),
+     * already PQ-encoded as a display-ready EOTF-encoded [0,1] signal,
      * so no encode step is needed. Called from {@link #presentHdr} using its already-open {@code cmd}/
      * {@code stack}, right before that method's own combined-UI composite dispatch overwrites
      * {@code hdrDisplayImage} in place — same "capture before the UI gets baked back in" timing as the SDR
@@ -2584,8 +2841,8 @@ public final class RtComposite {
                     "FG HDR hudless capture (PQ) " + src.width + "x" + src.height);
         }
         // Make composite()'s writes to hdrDisplayImage (an earlier submit this frame) visible to this copy;
-        // the copy's write is then made visible to the UI-composite dispatch that follows (and to DLSSG's
-        // read, in a later command buffer) by the same idiom.
+        // the copy's write is then made visible to the UI-composite dispatch and the provider read in a
+        // later command buffer by the same idiom.
         VulkanCommandEncoder.memoryBarrier(cmd, stack);
         VK10.vkCmdCopyImage(cmd, src.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                 fgHdrHudlessImage.image, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, src.width, src.height));
@@ -2593,33 +2850,15 @@ public final class RtComposite {
     }
 
     /**
-     * DLSS Frame Generation: record the DLSSG evaluate for generated frame {@code index} of {@code count}
-     * (backbuffer = the final frame; HW depth = {@code gDepth}; motion = {@code gMotion}) into Minecraft's
-     * command encoder, returning the interpolated output image (backbuffer size) for {@link RtFramePresenter}
-     * to blit into a generated swapchain image. On {@code index == 1} it ensures the feature (created in its
-     * own synchronous submit), the per-index output images, and the jitter-free reprojection matrices.
-     * Returns {@code null} (caller falls back to duplicating the real frame for this one frame, no session
-     * impact) when there's simply no captured RT frame to interpolate from right now — routine and expected
-     * on menu/loading/transition frames, since {@link RtFramePresenter#isActive} only gates on being in a
-     * world, not on RT having actually produced a frame this tick. Throws instead for failures that should
-     * never happen once RT is actively producing frames (DLSSG feature creation failing, an out-of-range
-     * index, the evaluate itself failing) — the caller treats those as fatal and disables FG for the
-     * session, same as any other FG present-record failure, rather than silently degrading to duplicated
-     * (non-interpolated) frames forever with no visible sign anything is wrong. Rotation-only matrices;
-     * camera translation is carried by the mvecs (cameraMotionIncluded).
+     * Record interpolation for generated frame {@code index} of {@code count} through the selected
+     * {@link FrameGen} provider. The final color, depth, motion, optional hudless/UI resources, and
+     * jitter-free reprojection matrices are passed through the generic interface. Returns {@code null}
+     * when no captured RT frame is available (menus/loading/transitions), allowing the presenter to duplicate
+     * the real frame. Provider failures throw so the presenter can fail open and disable generation for the
+     * session rather than silently emitting non-interpolated frames forever.
      *
-     * <p>{@code hdrBackbuffer} selects the HDR path. Per the DLSS-FG programming guide's HDR section, scRGB is
-     * explicitly unsupported as a DLSS-FG input ("not suitable as inputs to DLSS-FG" — it wants a
-     * display-ready, EOTF-encoded [0,1] signal, recommending HDR10/ST.2084) — since the renderer's whole HDR
-     * pipeline is natively PQ-encoded, every image fed to {@code RtDlssFg.evaluate} in HDR mode is already in
-     * that format with no extra conversion needed: the backbuffer is the raw {@code backbufferView}/
-     * {@code backbufferImage} the caller passed in ({@link #hdrBackbufferView()}, already PQ + UI-composited
-     * by {@link #presentHdr}); the hudless resource is {@link #fgHdrHudlessImage} (copied by {@link
-     * #presentHdr} <em>before</em> its own UI composite ran, mirroring {@link #captureFgHudless}'s pre-UI
-     * timing); and DLSSG's own (also PQ-encoded) output is returned as-is, since the swapchain itself is
-     * PQ-native and can blit it directly. The UI resource itself needs no HDR-specific handling — it's the
-     * same combined {@link RtUiOverlay} texture used by both present paths (only the *compositing* math that
-     * consumes it differs, done separately by {@code presentHdr}/{@code RtUiOverlay}, not here).
+     * <p>HDR inputs and outputs are already display-ready PQ in {@code R16G16B16A16_SFLOAT}; SDR uses the
+     * vanilla RGBA8 target. No provider-specific color conversion is performed at this boundary.
      */
     public RtImage fgInterpolate(VulkanCommandEncoder enc, long backbufferView, long backbufferImage,
             int swapW, int swapH, int index, int count, boolean hdrBackbuffer) {
@@ -2633,7 +2872,8 @@ public final class RtComposite {
         final int fmt = hdrBackbuffer ? VK10.VK_FORMAT_R16G16B16A16_SFLOAT : VK10.VK_FORMAT_R8G8B8A8_UNORM;
         if (index == 1) {
             if (!ensureFgFeature(ctx, swapW, swapH, renderW, renderH, fmt)) {
-                throw new IllegalStateException("DLSSG feature not ready (ensureFgFeature failed)");
+                throw new IllegalStateException(FrameGenSelector.current().name()
+                        + " feature not ready (ensureFgFeature failed)");
             }
             ensureFgInterp(ctx, count, swapW, swapH, fmt);
             // clipToPrevClip = prevVP * inverse(curVP); prevClipToClip = curVP * inverse(prevVP). Both from
@@ -2649,7 +2889,7 @@ public final class RtComposite {
         }
         RtImage out = fgInterp[index - 1];
         // Only feed hudless/ui when they exist AND match this frame's backbuffer size — a stale or mismatched
-        // size (e.g. mid-resize) is worse than skipping, so fall back to 0/0/0 (DLSSG just does without).
+        // size (e.g. mid-resize) is worse than skipping, so fall back to 0/0/0 so the provider can proceed without it.
         RtImage hudlessSrc = hdrBackbuffer ? fgHdrHudlessImage : fgHudlessImage;
         boolean hudlessReady = hudlessSrc != null && hudlessSrc.width == swapW && hudlessSrc.height == swapH;
         long hudlessView = hudlessReady ? hudlessSrc.view : 0L;
@@ -2661,49 +2901,28 @@ public final class RtComposite {
         long uiImg = uiReady ? RtUiOverlay.overlayColorImage() : 0L;
 
         VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
-        // Active FrameGen. Currently only the noop stub ships in this build (TAAU-only refactor);
-        // the DLSSG direct call through RtDlssFg below stays compiled but is unreachable while
-        // FrameGenSelector resolves to NOOP. The duplicate-frame blit is the fallthrough when
-        // fg.interpolate(...) returns false.
-        dev.comfyfluffy.caustica.framegen.FrameGen fg = dev.comfyfluffy.caustica.framegen.FrameGenSelector.current();
-        boolean ok = false;
-        if (fg.isAvailable() && fg.sourceMode() == dev.comfyfluffy.caustica.upscale.UpscalerSelector.Mode.DLSS_RR) {
-            ok = RtDlssFg.INSTANCE.evaluate(cmd.address(),
-                    backbufferView, backbufferImage, fmt,
-                    gDepth.view, gDepth.image, VK10.VK_FORMAT_R32_SFLOAT,
-                    gMotion.view, gMotion.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
-                    hudlessView, hudlessImg, hudlessReady ? hudlessFmt : 0,
-                    uiView, uiImg, uiReady ? VK10.VK_FORMAT_R8G8B8A8_UNORM : 0,
-                    out.view, out.image, fmt,
-                    swapW, swapH, renderW, renderH, count, index, 1.0f, 1.0f,
-                    true /* depthInverted (reversed-Z) */, hdrBackbuffer /* colorBuffersHDR */,
-                    true /* cameraMotionIncluded (in mvecs) */, fgReset,
-                    fgClipToPrev, fgPrevToClip);
-            if (!ok) {
-                throw new IllegalStateException("ngxshim_evaluate_dlssg failed (RtDlssFg.evaluate returned false)");
-            }
-        } else if (fg.isAvailable() && fg.isReady()) {
-            // FSR / XeSS frame gen go through the abstract FrameGen.interpolate(...) call.
-            ok = fg.interpolate(cmd.address(),
-                    backbufferView, backbufferImage, fmt,
-                    gDepth.view, gDepth.image, VK10.VK_FORMAT_R32_SFLOAT,
-                    gMotion.view, gMotion.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
-                    hudlessView, hudlessImg, hudlessReady ? hudlessFmt : 0,
-                    uiView, uiImg, uiReady ? VK10.VK_FORMAT_R8G8B8A8_UNORM : 0,
-                    out.view, out.image, fmt,
-                    backbufferView, backbufferImage, fmt, // prevColor = current backbuffer (single-frame history)
-                    swapW, swapH, index, count, hdrBackbuffer,
-                    mvCurProjView, mvCurProjView, fgClipToPrev, fgPrevToClip);
-            // Adapter failure (e.g. backend stub): fall through to the duplicate-frame blit below.
+        FrameGen provider = FrameGenSelector.current();
+        boolean ok = provider.isAvailable() && provider.isReady()
+                && provider.interpolate(cmd.address(),
+                        backbufferView, backbufferImage, fmt,
+                        gDepth.view, gDepth.image, VK10.VK_FORMAT_R32_SFLOAT,
+                        gMotion.view, gMotion.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                        hudlessView, hudlessImg, hudlessReady ? hudlessFmt : 0,
+                        uiView, uiImg, uiReady ? VK10.VK_FORMAT_R8G8B8A8_UNORM : 0,
+                        out.view, out.image, fmt,
+                        swapW, swapH, renderW, renderH, count, index, 1.0f, 1.0f,
+                        true /* depthInverted (reversed-Z) */, hdrBackbuffer /* colorBuffersHDR */,
+                        true /* cameraMotionIncluded (in mvecs) */, fgReset,
+                        fgClipToPrev, fgPrevToClip);
+        if (!ok && provider.isAvailable()) {
+            throw new IllegalStateException(provider.name() + " frame interpolation failed");
         }
         if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
             throw new IllegalStateException("vkEndCommandBuffer(fg interpolate) failed");
         }
         fgReset = false;
         enc.execute(cmd);
-        // If the active FrameGen was a no-op (mode == OFF, or the backend stubbed interpolate),
-        // return null so the caller falls back to a duplicate-frame blit. The DlssFg path always
-        // returns a non-null RtImage (or throws) above.
+        // A no-op/unavailable provider returns null so menu/loading frames retain the duplicate-blit fallback.
         if (ok) {
             return out;
         }
@@ -2711,13 +2930,17 @@ public final class RtComposite {
     }
 
     private boolean ensureFgFeature(RtContext ctx, int w, int h, int rw, int rh, int fmt) {
-        if (RtDlssFg.INSTANCE.featureReadyFor(w, h, rw, rh, fmt)) {
+        FrameGen provider = FrameGenSelector.current();
+        if (!provider.isAvailable()) {
+            return false;
+        }
+        if (provider.featureReadyFor(w, h, rw, rh, fmt)) {
             return true;
         }
         // Create the feature in its own submit + wait (not folded into MC's frame submit).
-        ctx.submitSync(c -> RtDlssFg.INSTANCE.ensureFeature(c.address(), w, h, rw, rh, fmt));
+        ctx.submitSync(c -> provider.ensureFeature(c.address(), w, h, rw, rh, fmt));
         fgReset = true; // fresh feature has no temporal history
-        return RtDlssFg.INSTANCE.featureReadyFor(w, h, rw, rh, fmt);
+        return provider.featureReadyFor(w, h, rw, rh, fmt);
     }
 
     private void ensureFgInterp(RtContext ctx, int count, int w, int h, int fmt) {

@@ -30,7 +30,7 @@ import dev.comfyfluffy.caustica.rt.accel.RtImage;
 
 /**
  * The world-space overlay seam: full-res raster content prepared after the RT world has been upscaled
- * (nothing thin/crisp survives DLSS-RR, so overlays must not be traced/rastered at render res) and folded
+ * (nothing thin/crisp survives temporal reconstruction, so overlays must not be traced/rastered at render res) and folded
  * into the shared transparent UI image before the hand/screen-effects/GUI layers draw over it. Called once
  * per frame from {@code GameRendererMixin} at the before-hand seam.
  *

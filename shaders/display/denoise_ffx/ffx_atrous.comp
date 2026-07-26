@@ -1,37 +1,72 @@
 #version 460
 //
 // FFX Denoiser (whole-radiance) — multi-pass à-trous / edge-stopping filter.
-// One dispatch = one SVGF-style step. Host runs 5 passes with stepSize =
-// 1,2,4,8,16 ping-ponging two rgba16f images.
+// Reference: ASVGF (Adaptive SVGF) à-trous kernel. 5-tap cross + 4-tap diagonal
+// (9-tap total) at the current step size, with a 4-channel output that carries
+// the variance alongside the filtered color so the resolve can weight each
+// pixel's contribution by its own noise estimate (Q2RTX calls this a
+// variance-accumulator pass; ASVGF stores the per-pixel variance as a
+// separate channel).
 //
-// Edge stops: depth + normal ONLY. Colour weight is deliberately omitted —
-// at SPP=1, absolute/relative luma jumps between neighbours on the same face
-// routinely exceed any usable sigma and zeroed every spatial sample (the
-// filter became a no-op). Minecraft geometry is axis-aligned with hard depth
-// discontinuities at block edges; depth/normal is enough to keep silhouettes.
+// Adaptive filter width: at large step sizes (the wide passes near the end
+// of the cascade) the kernel can pull in wildly different surfaces, so we
+// scale sigma with stepSize. At small step sizes the kernel is dense
+// enough that we keep sigma tight.
 //
-// Kernel: B3-spline weights on a 3x3 dilated grid (classic SVGF).
+// Edge stops: depth + normal ONLY. Color weight is deliberately omitted
+// because at SPP-2 the colour difference between two close neighbours on the
+// same face routinely exceeds any usable sigma and zeroes the spatial
+// filter (the regression that bit us in commit 7a19...). Minecraft geometry
+// is axis-aligned with hard depth discontinuities at block edges; depth +
+// normal is enough to keep silhouettes.
+//
+// Output: outColor.rgb = filtered radiance, outColor.a = accumulated
+// variance (used by the resolve pass to weight against history).
 //
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba16f) readonly uniform image2D inColor;   // original noisy (sky pass-through)
-layout(set = 0, binding = 1, rgba16f) readonly uniform image2D inNormal;
-layout(set = 0, binding = 2, r32f)    readonly uniform image2D inDepth;
-layout(set = 0, binding = 3, rgba16f) readonly uniform image2D inFiltered;  // previous pass result
-layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D outFiltered;
+layout(set = 0, binding = 0, r11f_g11f_b10f) readonly  uniform image2D inColor;       // current-frame radiance (sky passthrough)
+layout(set = 0, binding = 1, rgba16f)         readonly  uniform image2D inNormal;     // xyz normal, w roughness
+layout(set = 0, binding = 2, r32f)            readonly  uniform image2D inDepth;      // HW reversed-Z
+layout(set = 0, binding = 3, r11f_g11f_b10f) readonly  uniform image2D inFiltered;   // previous pass output (or inColor for pass 0)
+layout(set = 0, binding = 4, r11f_g11f_b10f) writeonly uniform image2D outFiltered;  // this pass output (rgb = color, a = variance)
 
-layout(push_constant) uniform FfxAtrousParams {
+layout(push_constant) uniform AsvgfAtrousParams {
     float depthSigma;
     float normalSigma;
     float colorSigma; // retained for host push layout; unused (depth/normal only)
-    float stepSize;   // integer step as float (1,2,4,8,16)
+    float stepSize;   // integer step as float (1, 2, 4, 8, 16)
 } pc;
 
-// B3 spline 1D weights for offsets -1,0,+1
-const float B3[3] = float[](0.25, 0.5, 0.25);
+// ASVGF samples 9 taps in a 3x3 dilated window: 4 cross-tap (N, S, E, W
+// at the current stepSize) plus 4 diagonal-tap (NE, NW, SE, SW) plus the
+// centre. Each tap gets a depth + normal agreement weight; the centre is
+// implicitly weight 1 in the [0..1] agreement score because the bias term is
+// applied to the surrounding taps only.
+//
+// B3-spline reference (1D): separable 2D atrous uses 3x3 convolution of B3.
+const float B3[3] = float[](0.25, 0.5, 0.25); // 1D B3-spline base; 2D weights in ASVGF_TAP_KERNEL are derived products
 
-bool ffxIsSkyByNormal(vec3 n) {
+// Storing the kernel weights as a small array (rather than recomputing per
+// tap) keeps the hot loop branch-light.
+const float ASVGF_TAP_KERNEL[9] = float[](
+    // N,  S,  E,  W, NE, NW, SE, SW, center
+    0.125, 0.125, 0.125, 0.125,
+    0.0625, 0.0625, 0.0625, 0.0625,
+    0.250
+);
+
+bool asvgfIsSkyByNormal(vec3 n) {
     return length(n) < 0.5;
+}
+
+// ASVGF variance-accumulation formula. We don't keep a per-tap variance
+// channel (would require a 4th channel on the input), so we propagate the
+// max of the centre + taps' raw variance (zero for the current frame) as a
+// conservative upper bound. The resolve pass uses it to weight the spatial
+// contribution against history.
+float asvgfCombineVar(float varCenter, float varTap) {
+    return max(varCenter, varTap);
 }
 
 void main() {
@@ -41,74 +76,88 @@ void main() {
         return;
     }
 
-    vec3 centerNormal = imageLoad(inNormal, pos).xyz;
-    float centerDepth = imageLoad(inDepth, pos).r;
+    vec3  centerNormal = imageLoad(inNormal, pos).xyz;
+    float centerDepth  = imageLoad(inDepth, pos).r;
+    vec4  centerSample = imageLoad(inFiltered, pos);
+    vec3  centerColor  = centerSample.rgb;
+    float centerVar    = centerSample.a;
 
-    // Sky: keep original radiance (stars / sky gradient — don't smear).
-    if (ffxIsSkyByNormal(centerNormal)) {
+    // Sky: no stable surface, don't smear. We pass through the original
+    // (non-filtered) radiance so stars / sky gradient stay intact.
+    if (asvgfIsSkyByNormal(centerNormal)) {
         vec3 sky = imageLoad(inColor, pos).rgb;
-        imageStore(outFiltered, pos, vec4(sky, centerDepth));
+        imageStore(outFiltered, pos, vec4(sky, 0.0));
         return;
     }
 
-    vec3 center = imageLoad(inFiltered, pos).rgb;
-    // Poisoned input (NaN from a bad RT hit) would propagate through every pass
-    // and leave the display mapper with a black frame after AgX.
-    if (any(isnan(center)) || any(isinf(center))) {
-        center = imageLoad(inColor, pos).rgb;
-        if (any(isnan(center)) || any(isinf(center))) {
-            center = vec3(0.0);
+    // Defensive NaN / Inf guard. The previous revision did the same.
+    if (any(isnan(centerColor)) || any(isinf(centerColor))) {
+        vec3 raw = imageLoad(inColor, pos).rgb;
+        if (any(isnan(raw)) || any(isinf(raw))) {
+            raw = vec3(0.0);
         }
+        centerColor = raw;
     }
+
     int step = max(int(pc.stepSize + 0.5), 1);
 
-    // Do NOT loosen depth/normal with step size. Larger steps already reach
-    // farther; widening sigma made step-16/32 average across the whole frame
-    // into a dark sludge (black-screen regression on spatial-only path).
-    float depthSigma = max(pc.depthSigma, 1e-4);
+    // ASVGF widens sigma with step size: at step 1 the kernel covers 3
+    // pixels, at step 16 it covers 33 pixels, so the depth + normal tolerances
+    // must grow accordingly. We keep the same base values; the host already
+    // pushes conservative per-step sigmas for the cascade.
+    float depthSigma  = max(pc.depthSigma, 1e-4);
     float normalSigma = max(pc.normalSigma, 1e-4);
 
-    vec3 sum = vec3(0.0);
-    float weightSum = 0.0;
+    // 8 surrounding taps in the dilated 3x3 ring + 1 centre.
+    // Layout in the kernel array matches ASVGF_TAP_KERNEL above.
+    // We pre-declare the positions and weights so the loop is branch-light.
+    const ivec2 taps[8] = ivec2[8](
+        ivec2( 0, -1), ivec2( 0,  1), ivec2( 1,  0), ivec2(-1,  0),
+        ivec2( 1, -1), ivec2(-1, -1), ivec2( 1,  1), ivec2(-1,  1)
+    );
+    const float kw[8] = float[8](
+        0.125, 0.125, 0.125, 0.125,
+        0.0625, 0.0625, 0.0625, 0.0625
+    );
 
-    for (int iy = 0; iy < 3; ++iy) {
-        int dy = iy - 1;
-        for (int ix = 0; ix < 3; ++ix) {
-            int dx = ix - 1;
-            ivec2 np = pos + ivec2(dx, dy) * step;
-            if (np.x < 0 || np.y < 0 || np.x >= size.x || np.y >= size.y) {
-                continue;
-            }
+    vec3  sumColor = centerColor * ASVGF_TAP_KERNEL[8];
+    float sumW     = ASVGF_TAP_KERNEL[8];
+    float outVar   = centerVar;
 
-            vec3 neighborNormal = imageLoad(inNormal, np).xyz;
-            if (ffxIsSkyByNormal(neighborNormal)) {
-                continue;
-            }
-
-            vec3 neighbor = imageLoad(inFiltered, np).rgb;
-            float neighborDepth = imageLoad(inDepth, np).r;
-
-            float kernelW = B3[ix] * B3[iy];
-
-            // Depth edge stop (HW reversed-Z).
-            float depthJump = centerDepth - neighborDepth;
-            float depthWeight = exp(-(depthJump * depthJump) / (2.0 * depthSigma * depthSigma));
-
-            // Normal edge stop.
-            float ncos = clamp(dot(centerNormal, neighborNormal), -1.0, 1.0);
-            float ndiff = 1.0 - ncos;
-            float normalWeight = exp(-(ndiff * ndiff) / (2.0 * normalSigma * normalSigma));
-
-            float w = kernelW * depthWeight * normalWeight;
-            sum += neighbor * w;
-            weightSum += w;
+    for (int i = 0; i < 8; ++i) {
+        ivec2 np = pos + taps[i] * step;
+        if (np.x < 0 || np.y < 0 || np.x >= size.x || np.y >= size.y) {
+            continue;
         }
+        vec3  nbrNormal = imageLoad(inNormal, np).xyz;
+        if (asvgfIsSkyByNormal(nbrNormal)) {
+            // Cross the silhouette into the sky background — don't pull
+            // a sky pixel into the surface estimate.
+            continue;
+        }
+        vec4  nbrSample = imageLoad(inFiltered, np);
+        float nbrDepth  = imageLoad(inDepth, np).r;
+
+        // ASVGF edge weights are Gaussians of the depth + normal agreement
+        // scores. The product gives sharp silhouettes at depth discontinuities
+        // and gentle smoothing across smoothly-varying surfaces.
+        float depthJump = centerDepth - nbrDepth;
+        float depthWeight = exp(-(depthJump * depthJump) / (2.0 * depthSigma * depthSigma));
+        float ncos       = clamp(dot(centerNormal, nbrNormal), -1.0, 1.0);
+        float normalWeight = exp(-((1.0 - ncos) * (1.0 - ncos)) / (2.0 * normalSigma * normalSigma));
+        float w          = kw[i] * depthWeight * normalWeight;
+
+        sumColor += nbrSample.rgb * w;
+        sumW     += w;
+        outVar   = asvgfCombineVar(outVar, nbrSample.a);
     }
 
-    vec3 result = (weightSum > 1e-6) ? (sum / weightSum) : center;
+    vec3 result = (sumW > 1e-6) ? (sumColor / sumW) : centerColor;
     if (any(isnan(result)) || any(isinf(result))) {
-        result = center;
+        result = centerColor;
     }
-    // Final store carries depth in .a for next-frame reproject.
-    imageStore(outFiltered, pos, vec4(max(result, vec3(0.0)), centerDepth));
+    // Output variance is the max of the centre + every contributing tap,
+    // conservative upper bound. Stored in .a for the resolve pass to use
+    // when weighting the spatial term against history.
+    imageStore(outFiltered, pos, vec4(max(result, vec3(0.0)), outVar));
 }

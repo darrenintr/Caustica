@@ -65,8 +65,8 @@ public final class RtEntityTextures {
     // Resolved image-view handle → bindless slot. The slot identifies a *texture*, not a RenderType, so
     // many render types that differ only by a texture transform we don't replicate (the swirl's scroll)
     // collapse to ONE slot — instead of leaking a slot per frame until the array exhausts and everything
-    // falls back to slot 0 (the block atlas). Append-only: a handle's slot never changes once assigned,
-    // so update-after-bind writes for new slots never disturb in-flight frames.
+    // falls back to slot 0 (the block atlas). Append-only: a handle's slot never changes once assigned;
+    // RtPipeline propagates new descriptors through its frames-in-flight-safe bindless ring.
     private final Map<Long, Integer> viewSlotCache = new HashMap<>();
     // Atlas-location → bindless slot, for items/blocks (which texture from an atlas, not a per-type
     // file). Seeded with the block atlas = slot 0 (also the fallback). Items use a separate item atlas.
@@ -81,6 +81,10 @@ public final class RtEntityTextures {
     private int nextSlot = 1;
     private boolean loggedFailure;
     private boolean loggedMaterialFailure;
+    // 1x1 solid-white texture for untextured geometry (leash/line ribbons). This registry owns it
+    // directly instead of installing it in Minecraft's global texture manager, so pipeline recreation
+    // has one explicit close path and cannot accumulate/re-register a global resource under one key.
+    private DynamicTexture whiteTexture;
 
     // Entity LabPBR: per-type _n/_s textures cached by resource Identifier (null = known-missing), closed
     // on reset(). Per-slot presence (→ prim mat.w/mat.z) + a guard so a slot's _n/_s are resolved once
@@ -183,19 +187,34 @@ public final class RtEntityTextures {
      * same texture). Retried each frame until the source atlas is ready. Block-atlas geometry uses the
      * fixed terrain atlases instead, so callers route the block atlas elsewhere — never here.
      */
+
+    /**
+     * Bindless slot of a solid-white 1x1 texture for untextured geometry (leashes, custom line
+     * ribbons). Colour comes from per-prim tint. Slot 0 (block atlas) is NOT a substitute.
+     */
+    public int whiteSlot() {
+        if (whiteTexture == null) {
+            NativeImage image = new NativeImage(1, 1, false);
+            image.setPixel(0, 0, 0xFFFFFFFF);
+            whiteTexture = new DynamicTexture(() -> "caustica RT white", image);
+        }
+        return slotForView(vkImageView(whiteTexture.getTextureView()));
+    }
+
     public int slotForBlockEntityAtlas(Identifier atlasLocation) {
         int slot = slotForAtlas(atlasLocation);
         if (entityPbr() && slot > 0 && !atlasMaterialBound.contains(slot)) {
             RtParallelAtlas pa = RtEntityMaterials.INSTANCE.atlasFor(atlasLocation);
             if (pa != null) {
-                atlasMaterialBound.add(slot);
                 long nView = pa.viewN();
                 long sView = pa.viewS();
-                if (nView != 0L) {
+                // Both backing DynamicTextures are created together. Only latch the slot once both
+                // views are usable; a transient zero view is retried next frame instead of leaving one
+                // parallel descriptor permanently unbound for this pipeline lifetime.
+                if (nView != 0L && sView != 0L) {
                     pending.add(new Pending(1, slot, nView));
-                }
-                if (sView != 0L) {
                     pending.add(new Pending(2, slot, sView));
+                    atlasMaterialBound.add(slot);
                 }
             }
         }
@@ -236,20 +255,23 @@ public final class RtEntityTextures {
         pending.clear();
     }
 
-    /** Drop the registry (call when the world pipeline / bindless set is recreated, or textures reload). */
-    public void reset() {
-        reset(maxTextures());
-    }
-
-    /** Drop the registry for a pipeline whose bindless descriptor arrays have this capacity. */
-    public void reset(int descriptorCapacity) {
+    /**
+     * Rebuild the descriptor-coupled registry for a world pipeline with this bindless capacity. This also
+     * releases standalone entity material textures and block-entity parallel atlases, whose image views
+     * belonged to the previous bindless descriptor set.
+     */
+    public void resetForPipeline(int descriptorCapacity) {
         capacity = Math.max(1, descriptorCapacity);
         viewCache.clear();
         viewSlotCache.clear();
         atlasSlotCache.clear();
+        if (whiteTexture != null) {
+            whiteTexture.close();
+            whiteTexture = null;
+        }
         atlasSlotCache.put(TextureAtlas.LOCATION_BLOCKS, 0); // block atlas = the slot-0 fallback
         atlasMaterialBound.clear();
-        RtEntityMaterials.INSTANCE.reset(); // block-entity parallel _s/_n atlases are slot-bound → rebuild in lockstep
+        RtEntityMaterials.INSTANCE.destroy(); // slot-bound parallel atlases share this registry's lifetime
         pending.clear();
         nextSlot = 1;
         for (DynamicTexture dt : materialCache.values()) {
@@ -261,6 +283,11 @@ public final class RtEntityTextures {
         slotHasN = new boolean[capacity];
         slotHasS = new boolean[capacity];
         materialResolved = new boolean[capacity];
+    }
+
+    /** Release every owned texture/cache after the world pipeline descriptor set has been destroyed. */
+    public void destroy() {
+        resetForPipeline(maxTextures());
     }
 
     private int slotLimit() {

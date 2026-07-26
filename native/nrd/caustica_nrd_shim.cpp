@@ -28,6 +28,10 @@
 
 #define NRD_ARRAYSIZE(x) (sizeof(x) / sizeof(*(x)))
 static constexpr uint32_t FALLBACK_DESCRIPTOR_VARIANTS = 8;
+// NRD 4.17 validates screen-space motionVectorScale.xy as nonzero. This tiny
+// scale makes the shared full-camera motion guide effectively zero while camera
+// reprojection remains driven by the current/previous matrices.
+static constexpr float NRD_STATIC_SCENE_MOTION_SCALE = 1.0e-20f;
 
 static const VkFormat g_NRDFormatToVkFormat[] = {
     VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT,
@@ -319,6 +323,15 @@ static int createPipelines(CausticaNrd* c) {
     }
     return 0;
 }
+
+// Tag the context with which denoiser path it hosts so dispatch can pick the right pipelines.
+// Both REBLUR and RELAX are usable in the same context type — the only difference is
+// how the pipeline indices are enumerated by NRD's GetComputeDispatches.
+enum class NrdDenoiserKind : uint8_t { REBLUR = 0, RELAX = 1 };
+
+struct CausticaNrdRelax : public CausticaNrd {
+    NrdDenoiserKind kind = NrdDenoiserKind::REBLUR;
+};
 
 static int recreatePools(CausticaNrd* c, uint32_t w, uint32_t h) {
     if (c->resourcePool) {
@@ -622,49 +635,39 @@ extern "C" int caustica_nrd_create_v2(
         return -8;
     }
 
-    // Conservative one-path-per-pixel baseline. Valid guides, confidence and disocclusion
-    // drive rejection; spatial radius is not a substitute for the standard NRD contract.
+    // Dielectric-aware REBLUR baseline (water/glass now feed specular + diffuse lobes).
+    // Temporal is primary; spatial prepass stays modest so near-field edges don't fall back to raw.
     nrd::ReblurSettings reblur{};
-    reblur.maxAccumulatedFrameNum = 24;
-    reblur.maxFastAccumulatedFrameNum = 4;
-    reblur.maxStabilizedFrameNum = 24;
+    reblur.maxAccumulatedFrameNum = 32;
+    reblur.maxFastAccumulatedFrameNum = 6;
+    reblur.maxStabilizedFrameNum = 32;
     reblur.historyFixFrameNum = 3;
     reblur.historyFixBasePixelStride = 6;
     reblur.historyFixAlternatePixelStride = 12;
-    // Spatial: ADAPTIVE prepass blur (v0.6.11) - fix near-field raw noise.
-    // Problem: 120px prepass works at distance but FAILS at near-field (1-2 blocks).
-    // Root cause: At near-field, 120px radius samples across HUGE depth discontinuities
-    //             (edge of nearby wall) → invalid samples → NRD falls back to raw input.
-    // Solution: Use SMALLER prepass at near-field, LARGER at distance.
-    // But NRD doesn't support per-pixel radius, so we choose a MIDDLE GROUND:
-    //   - Reduce from 120/150 to 60/80 (still aggressive but won't fail near-field)
-    //   - Rely more on temporal accumulation (64 frames) than spatial
-    reblur.diffusePrepassBlurRadius = 8.0f;
-    reblur.specularPrepassBlurRadius = 12.0f;
-    reblur.usePrepassOnlyForSpecularMotionEstimation = true;
+    // Specular prepass slightly stronger than diffuse: water/glass reflections are sparse at SPP-1.
+    reblur.diffusePrepassBlurRadius = 10.0f;
+    reblur.specularPrepassBlurRadius = 16.0f;
+    reblur.usePrepassOnlyForSpecularMotionEstimation = false;
     reblur.minBlurRadius = 1.0f;
-    reblur.maxBlurRadius = 30.0f;
-    reblur.fastHistoryClampingSigmaScale = 2.0f;
-    reblur.lobeAngleFraction = 0.30f;
-    reblur.roughnessFraction = 0.30f;
-    reblur.planeDistanceSensitivity = 0.02f;
-    reblur.minHitDistanceWeight = 0.10f;
-    reblur.fireflySuppressorMinRelativeScale = 2.0f;
+    reblur.maxBlurRadius = 36.0f;
+    reblur.fastHistoryClampingSigmaScale = 2.2f;
+    // Slightly looser lobe/roughness so wave normals + thin glass don't thrash history.
+    reblur.lobeAngleFraction = 0.35f;
+    reblur.roughnessFraction = 0.35f;
+    reblur.planeDistanceSensitivity = 0.025f;
+    reblur.minHitDistanceWeight = 0.08f;
+    reblur.fireflySuppressorMinRelativeScale = 1.8f;
     reblur.enableAntiFirefly = true;
     reblur.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_5X5;
-    reblur.responsiveAccumulationSettings.roughnessThreshold = 0.15f;
-    reblur.responsiveAccumulationSettings.minAccumulatedFrameNum = 2;
-    // Antilag remains enabled; confidence/disocclusion inputs accelerate unstable history.
-    // Problem: "peripheral noise around a clear central area" - NRD works in center but fails at edges.
-    // Root cause: Antilag at 4.0/6.0 is TOO AGGRESSIVE at screen edges where:
-    //   - Motion vectors are less reliable (reprojection OOB)
-    //   - Spatial samples are asymmetric (fewer neighbors)
-    //   - History is frequently rejected → fallback to raw noisy input
-    reblur.antilagSettings.luminanceSigmaScale = 2.0f;
-    reblur.antilagSettings.luminanceSensitivity = 3.0f;
+    // Responsive accumulation kicks in earlier for smooth dielectrics (guide roughness ~0.06).
+    reblur.responsiveAccumulationSettings.roughnessThreshold = 0.12f;
+    reblur.responsiveAccumulationSettings.minAccumulatedFrameNum = 3;
+    // Milder antilag: confidence/disocclusion already drive rejection for water/glass.
+    reblur.antilagSettings.luminanceSigmaScale = 2.4f;
+    reblur.antilagSettings.luminanceSensitivity = 2.6f;
     reblur.convergenceSettings.s = 1.0f;
-    reblur.convergenceSettings.b = 0.20f;
-    reblur.convergenceSettings.p = 0.80f;
+    reblur.convergenceSettings.b = 0.18f;
+    reblur.convergenceSettings.p = 0.82f;
     nrd::SetDenoiserSettings(*c->instance, nrd::Identifier(nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR), &reblur);
 
     nrd::SigmaSettings sigma{};
@@ -773,15 +776,21 @@ extern "C" int caustica_nrd_dispatch_v2(
     cs.accumulationMode = (reset || frame_index == 0)
         ? nrd::AccumulationMode::CLEAR_AND_RESTART
         : nrd::AccumulationMode::CONTINUE;
-    // 2D screen-space MV only. (2.5D mv.z from clip.w was inconsistent with prepare viewZ
-    // and caused mass history rejection → undenoised firefly grain.)
-    cs.motionVectorScale[0] = 1.0f / float(c->width);
-    cs.motionVectorScale[1] = 1.0f / float(c->height);
+    // gMotion is shared with TAAU and already contains full screen-space camera motion.
+    // NRD also receives current/previous camera matrices, including the camera-relative origin
+    // shift in worldToViewPrev. Applying gMotion here would represent camera translation twice
+    // and make REBLUR reject otherwise valid history. Treat the scene as static for NRD until a
+    // separate object-only motion guide is available (moving entities may ghost temporarily).
+    // NRD rejects an exact zero XY scale for screen-space motion, so use a
+    // nonzero value small enough to suppress this guide in practice.
+    cs.motionVectorScale[0] = NRD_STATIC_SCENE_MOTION_SCALE;
+    cs.motionVectorScale[1] = NRD_STATIC_SCENE_MOTION_SCALE;
     cs.motionVectorScale[2] = 0.0f;
     cs.viewZScale = 1.0f;
     // Standard primary threshold plus an alternate selected by the application mix texture.
-    cs.disocclusionThreshold = 0.03f;
-    cs.disocclusionThresholdAlternate = 0.05f;
+    // Primary threshold for opaque geometry; alternate (via mix texture) for water/glass/particles.
+    cs.disocclusionThreshold = 0.025f;
+    cs.disocclusionThresholdAlternate = 0.08f;
     cs.isHistoryConfidenceAvailable = true;
     cs.isDisocclusionThresholdMixAvailable = true;
     cs.isMotionVectorInWorldSpace = false;
@@ -799,6 +808,275 @@ extern "C" int caustica_nrd_dispatch_v2(
         return -3;
     for (uint32_t i = 0; i < nDisp; ++i) {
         if (!dispatchOne(c, cmd, dispatches[i])) return -5;
+    }
+    return 0;
+}
+
+// ============================================================================
+// RELAX_DIFFUSE_SPECULAR variant — ABI v3.
+// Attention-based denoiser (NRD 4.x), better quality than REBLUR at slightly higher cost.
+// Same input layout as caustica_nrd_create_v2/dispatch_v2, separate context per kind.
+// ============================================================================
+
+extern "C" int caustica_nrd_create_relax_v2(
+    uint64_t vk_device, uint64_t vk_physical, uint64_t get_device_proc_addr,
+    uint32_t width, uint32_t height, uint32_t graphics_queue_family,
+    uint32_t compute_queue_family, void** out_ctx)
+{
+    if (!out_ctx || !vk_device || !vk_physical || !get_device_proc_addr || !width || !height) return -1;
+    auto* c = new (std::nothrow) CausticaNrd();
+    if (!c) return -2;
+    c->device = (VkDevice)vk_device;
+    c->physical = (VkPhysicalDevice)vk_physical;
+    c->getDeviceProcAddr = (PFN_vkGetDeviceProcAddr)get_device_proc_addr;
+    VkPhysicalDeviceProperties deviceProperties{};
+    vkGetPhysicalDeviceProperties(c->physical, &deviceProperties);
+    if (deviceProperties.vendorID != 0x1002) {
+        c->cmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)
+            c->getDeviceProcAddr(c->device, "vkCmdPushDescriptorSetKHR");
+    }
+    if (!queueFamilySupportsCompute(c->physical, graphics_queue_family) ||
+        (compute_queue_family != UINT32_MAX &&
+         !queueFamilySupportsCompute(c->physical, compute_queue_family))) {
+        delete c;
+        return -3;
+    }
+    c->queueFamilies[0] = graphics_queue_family;
+    c->queueFamilyCount = 1;
+    if (compute_queue_family != UINT32_MAX && compute_queue_family != graphics_queue_family) {
+        c->queueFamilies[1] = compute_queue_family;
+        c->queueFamilyCount = 2;
+    }
+
+    VkPhysicalDeviceFeatures features{};
+    vkGetPhysicalDeviceFeatures(c->physical, &features);
+    if (!features.shaderStorageImageExtendedFormats) {
+        delete c;
+        return -7;
+    }
+
+    nrd::DenoiserDesc denoisers[] = {
+        {nrd::Identifier(nrd::Denoiser::RELAX_DIFFUSE_SPECULAR), nrd::Denoiser::RELAX_DIFFUSE_SPECULAR},
+        {nrd::Identifier(nrd::Denoiser::SIGMA_SHADOW), nrd::Denoiser::SIGMA_SHADOW},
+    };
+    nrd::InstanceCreationDesc idesc{{}, denoisers, 2};
+    if (nrd::CreateInstance(idesc, c->instance) != nrd::Result::SUCCESS) {
+        delete c;
+        return -4;
+    }
+    if (!supportsNrdFormats(c)) {
+        destroyAll(c);
+        delete c;
+        return -8;
+    }
+
+    // RELAX settings — tuned for SPP-1 MC content. RELAX uses an attention-based
+    // disocclusion test; the SIGMA_SHADOW leg is reused unchanged.
+    nrd::RelaxSettings relax{};
+    relax.diffusePrepassBlurRadius = 12.0f;
+    relax.specularPrepassBlurRadius = 18.0f;
+    relax.diffuseMaxAccumulatedFrameNum = 32;
+    relax.specularMaxAccumulatedFrameNum = 32;
+    relax.diffuseMaxFastAccumulatedFrameNum = 6;
+    relax.specularMaxFastAccumulatedFrameNum = 6;
+    relax.historyFixFrameNum = 3;
+    relax.historyFixBasePixelStride = 6;
+    relax.historyFixAlternatePixelStride = 12;
+    relax.lobeAngleFraction = 0.35f;
+    relax.roughnessFraction = 0.35f;
+    relax.antilagSettings.accelerationAmount = 0.3f;
+    relax.antilagSettings.spatialSigmaScale = 4.5f;
+    relax.antilagSettings.temporalSigmaScale = 0.5f;
+    relax.antilagSettings.resetAmount = 0.5f;
+    relax.diffusePhiLuminance = 2.0f;
+    relax.specularPhiLuminance = 1.0f;
+    relax.specularVarianceBoost = 0.1f;
+    relax.specularLobeAngleSlack = 0.15f;
+    relax.atrousIterationNum = 5;
+    relax.diffuseMinLuminanceWeight = 0.0f;
+    relax.specularMinLuminanceWeight = 0.0f;
+    relax.depthThreshold = 0.003f;
+    relax.luminanceEdgeStoppingRelaxation = 0.5f;
+    relax.normalEdgeStoppingRelaxation = 0.3f;
+    relax.confidenceDrivenRelaxationMultiplier = 0.0f;
+    relax.spatialVarianceEstimationHistoryThreshold = 3;
+    relax.checkerboardMode = nrd::CheckerboardMode::OFF;
+    nrd::SetDenoiserSettings(*c->instance, nrd::Identifier(nrd::Denoiser::RELAX_DIFFUSE_SPECULAR), &relax);
+
+    nrd::SigmaSettings sigma{};
+    sigma.planeDistanceSensitivity = 0.02f;
+    sigma.maxStabilizedFrameNum = 5;
+    nrd::SetDenoiserSettings(*c->instance, nrd::Identifier(nrd::Denoiser::SIGMA_SHADOW), &sigma);
+
+    if (recreatePools(c, width, height) != 0) {
+        destroyAll(c);
+        delete c;
+        return -5;
+    }
+    if (createPipelines(c) != 0) {
+        destroyAll(c);
+        delete c;
+        return -6;
+    }
+    *out_ctx = c;
+    return 0;
+}
+
+extern "C" int caustica_nrd_dispatch_relax_v2(
+    void* ctx, uint64_t vk_command_buffer,
+    uint64_t in_diff_image, uint64_t in_diff_view,
+    uint64_t in_spec_image, uint64_t in_spec_view,
+    uint64_t in_mv_image, uint64_t in_mv_view,
+    uint64_t in_normal_image, uint64_t in_normal_view,
+    uint64_t in_viewz_image, uint64_t in_viewz_view,
+    uint64_t in_shadow_image, uint64_t in_shadow_view,
+    uint64_t in_diff_conf_image, uint64_t in_diff_conf_view,
+    uint64_t in_spec_conf_image, uint64_t in_spec_conf_view,
+    uint64_t in_disocclusion_image, uint64_t in_disocclusion_view,
+    uint64_t out_diff_image, uint64_t out_diff_view,
+    uint64_t out_spec_image, uint64_t out_spec_view,
+    uint64_t out_shadow_image, uint64_t out_shadow_view,
+    const float* view_to_clip, const float* view_to_clip_prev,
+    const float* world_to_view, const float* world_to_view_prev,
+    float jitter_x, float jitter_y, float jitter_x_prev, float jitter_y_prev,
+    float light_dir_x, float light_dir_y, float light_dir_z,
+    uint32_t frame_index, int reset)
+{
+    if (!ctx || !vk_command_buffer) return -1;
+    auto* c = static_cast<CausticaNrd*>(ctx);
+    VkCommandBuffer cmd = (VkCommandBuffer)vk_command_buffer;
+    recordPoolInitialization(c, cmd);
+
+    setUserTex(c, nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, (VkImage)in_diff_image, (VkImageView)in_diff_view);
+    setUserTex(c, nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST, (VkImage)in_spec_image, (VkImageView)in_spec_view);
+    setUserTex(c, nrd::ResourceType::IN_MV, (VkImage)in_mv_image, (VkImageView)in_mv_view);
+    setUserTex(c, nrd::ResourceType::IN_NORMAL_ROUGHNESS, (VkImage)in_normal_image, (VkImageView)in_normal_view);
+    setUserTex(c, nrd::ResourceType::IN_VIEWZ, (VkImage)in_viewz_image, (VkImageView)in_viewz_view);
+    setUserTex(c, nrd::ResourceType::IN_PENUMBRA, (VkImage)in_shadow_image, (VkImageView)in_shadow_view);
+    setUserTex(c, nrd::ResourceType::IN_DIFF_CONFIDENCE, (VkImage)in_diff_conf_image, (VkImageView)in_diff_conf_view);
+    setUserTex(c, nrd::ResourceType::IN_SPEC_CONFIDENCE, (VkImage)in_spec_conf_image, (VkImageView)in_spec_conf_view);
+    setUserTex(c, nrd::ResourceType::IN_DISOCCLUSION_THRESHOLD_MIX, (VkImage)in_disocclusion_image, (VkImageView)in_disocclusion_view);
+    setUserTex(c, nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, (VkImage)out_diff_image, (VkImageView)out_diff_view);
+    setUserTex(c, nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, (VkImage)out_spec_image, (VkImageView)out_spec_view);
+    setUserTex(c, nrd::ResourceType::OUT_SHADOW_TRANSLUCENCY, (VkImage)out_shadow_image, (VkImageView)out_shadow_view);
+
+    nrd::SigmaSettings sigma{};
+    sigma.lightDirection[0] = light_dir_x;
+    sigma.lightDirection[1] = light_dir_y;
+    sigma.lightDirection[2] = light_dir_z;
+    sigma.planeDistanceSensitivity = 0.02f;
+    sigma.maxStabilizedFrameNum = 5;
+    nrd::SetDenoiserSettings(*c->instance, nrd::Identifier(nrd::Denoiser::SIGMA_SHADOW), &sigma);
+
+    nrd::CommonSettings cs{};
+    std::memcpy(cs.viewToClipMatrix, view_to_clip, 16 * sizeof(float));
+    std::memcpy(cs.viewToClipMatrixPrev, view_to_clip_prev, 16 * sizeof(float));
+    std::memcpy(cs.worldToViewMatrix, world_to_view, 16 * sizeof(float));
+    std::memcpy(cs.worldToViewMatrixPrev, world_to_view_prev, 16 * sizeof(float));
+    for (int col = 0; col < 4; ++col) {
+        cs.viewToClipMatrix[col * 4 + 1] *= -1.0f;
+        cs.viewToClipMatrixPrev[col * 4 + 1] *= -1.0f;
+    }
+    cs.resourceSize[0] = (uint16_t)c->width;
+    cs.resourceSize[1] = (uint16_t)c->height;
+    cs.rectSize[0] = (uint16_t)c->width;
+    cs.rectSize[1] = (uint16_t)c->height;
+    cs.resourceSizePrev[0] = (uint16_t)c->width;
+    cs.resourceSizePrev[1] = (uint16_t)c->height;
+    cs.rectSizePrev[0] = (uint16_t)c->width;
+    cs.rectSizePrev[1] = (uint16_t)c->height;
+    cs.cameraJitter[0] = jitter_x;
+    cs.cameraJitter[1] = jitter_y;
+    cs.cameraJitterPrev[0] = jitter_x_prev;
+    cs.cameraJitterPrev[1] = jitter_y_prev;
+    cs.frameIndex = frame_index;
+    cs.accumulationMode = (reset || frame_index == 0)
+        ? nrd::AccumulationMode::CLEAR_AND_RESTART
+        : nrd::AccumulationMode::CONTINUE;
+    // Same static-scene convention as REBLUR above: camera motion comes from matrices,
+    // while the shared full-camera gMotion field is reserved for the TAAU path.
+    cs.motionVectorScale[0] = NRD_STATIC_SCENE_MOTION_SCALE;
+    cs.motionVectorScale[1] = NRD_STATIC_SCENE_MOTION_SCALE;
+    cs.motionVectorScale[2] = 0.0f;
+    cs.viewZScale = 1.0f;
+    cs.disocclusionThreshold = 0.025f;
+    cs.disocclusionThresholdAlternate = 0.08f;
+    cs.isHistoryConfidenceAvailable = true;
+    cs.isDisocclusionThresholdMixAvailable = true;
+    cs.isMotionVectorInWorldSpace = false;
+    cs.enableValidation = false;
+
+    if (nrd::SetCommonSettings(*c->instance, cs) != nrd::Result::SUCCESS) return -2;
+
+    nrd::Identifier ids[] = {
+        nrd::Identifier(nrd::Denoiser::RELAX_DIFFUSE_SPECULAR),
+        nrd::Identifier(nrd::Denoiser::SIGMA_SHADOW),
+    };
+    const nrd::DispatchDesc* dispatches = nullptr;
+    uint32_t nDisp = 0;
+    if (nrd::GetComputeDispatches(*c->instance, ids, 2, dispatches, nDisp) != nrd::Result::SUCCESS)
+        return -3;
+    for (uint32_t i = 0; i < nDisp; ++i) {
+        if (!dispatchOne(c, cmd, dispatches[i])) return -5;
+    }
+    return 0;
+}
+
+// Borrowed from Sundial-Lite's VB_MAX_BLEDED_FRAMES pattern (Sundial
+// shaders/programs/deferred/Deferred12.frag:413): let the user cap the temporal
+// accumulation depth at runtime without rebuilding the context. Reads the current
+// REBLUR settings, mutates maxAccumulatedFrameNum (and the matching
+// maxStabilizedFrameNum + responsiveAccumulation.minAccumulatedFrameNum so they stay
+// consistent), and re-applies. Safe to call between dispatch frames.
+//
+// @return 0 on success; -1 if ctx invalid; -2 if NRD refused the new settings.
+extern "C" CAUSTICA_NRD_API int caustica_nrd_set_max_accumulated_frame_num(
+    void* ctx, uint32_t frame_num)
+{
+    if (!ctx) return -1;
+    if (frame_num < 1 || frame_num > 63) return -2;
+    auto* c = static_cast<CausticaNrd*>(ctx);
+    if (!c->instance) return -1;
+
+    nrd::ReblurSettings reblur{};
+    // NRD 4.17+ removed GetDenoiserSettings; we just construct a fresh
+    // settings struct (NRD defaults are sensible: maxAccumulatedFrameNum=30,
+    // maxStabilizedFrameNum=30, responsiveAccumulationSettings.minAccumulatedFrameNum=3)
+    // and override the user's knob. The non-overridden fields keep their default
+    // values — fine because callers must re-create the context if they want
+    // different defaults, and this knob exists for runtime tuning only.
+    reblur.maxAccumulatedFrameNum = frame_num;
+    reblur.maxStabilizedFrameNum = frame_num;
+    reblur.responsiveAccumulationSettings.minAccumulatedFrameNum =
+        std::min(int32_t(3), int32_t(frame_num));
+    if (nrd::SetDenoiserSettings(*c->instance,
+            nrd::Identifier(nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR), &reblur)
+            != nrd::Result::SUCCESS) {
+        return -2;
+    }
+    return 0;
+}
+
+// RELAX equivalent — mutates both diffuse and specular MaxAccumulatedFrameNum in the
+// RelaxSettings struct (RELAX tracks them per-channel rather than as one knob).
+extern "C" CAUSTICA_NRD_API int caustica_nrd_set_relax_max_accumulated_frame_num(
+    void* ctx, uint32_t frame_num)
+{
+    if (!ctx) return -1;
+    if (frame_num < 1 || frame_num > 63) return -2;
+    auto* c = static_cast<CausticaNrd*>(ctx);
+    if (!c->instance) return -1;
+
+    nrd::RelaxSettings relax{};
+    // NRD 4.17+ removed GetDenoiserSettings — see comment above.
+    // RelaxSettings no longer has responsiveAccumulationSettings; only the
+    // per-channel max knobs are user-tunable here.
+    relax.diffuseMaxAccumulatedFrameNum = frame_num;
+    relax.specularMaxAccumulatedFrameNum = frame_num;
+    if (nrd::SetDenoiserSettings(*c->instance,
+            nrd::Identifier(nrd::Denoiser::RELAX_DIFFUSE_SPECULAR), &relax)
+            != nrd::Result::SUCCESS) {
+        return -2;
     }
     return 0;
 }

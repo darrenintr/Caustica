@@ -1,0 +1,57 @@
+// FidelityFX Shadow Denoiser — prepare pass (Caustica-hosted).
+// Packs per-pixel shadow visibility into 8x4 tile bitmasks (32 bits / tile),
+// matching the official hitMaskResults layout described in the FFX Denoiser docs.
+//
+// Output tiles:
+//   tileX = floor(pix.x / 8), tileY = floor(pix.y / 4)
+//   bit   = (localY * 8 + localX)   // 0..31
+//   value = 1 if shadow visibility >= 0.5 else 0
+//
+// Also emits a dense per-pixel shadow copy in rg16f for the reproject path
+// (r = shadow [0,1], g = 0 count seed) so later passes keep float precision.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 4, local_size_z = 1) in;
+
+layout(binding = 0, r8)    readonly  uniform image2D gShadowHit;   // per-pixel visibility
+layout(binding = 1, r32ui) writeonly uniform uimage2D gHitMask;    // packed 8x4 tiles
+layout(binding = 2, rgba16f) writeonly uniform image2D gShadowDense; // r=shadow, g=0, b=0, a=0
+
+layout(push_constant) uniform Push {
+    int width;
+    int height;
+    int tilesX;
+    int tilesY;
+} pc;
+
+shared uint sBits[1];
+
+void main() {
+    uvec2 lid = gl_LocalInvocationID.xy; // 0..7, 0..3
+    uvec2 wid = gl_WorkGroupID.xy;       // tile coords
+    ivec2 pix = ivec2(wid.x * 8u + lid.x, wid.y * 4u + lid.y);
+
+    if (gl_LocalInvocationIndex == 0u) {
+        sBits[0] = 0u;
+    }
+    barrier();
+
+    uint bit = 0u;
+    float shadow = 1.0;
+    if (pix.x < pc.width && pix.y < pc.height) {
+        shadow = clamp(imageLoad(gShadowHit, pix).r, 0.0, 1.0);
+        // Store dense float immediately (each lane owns unique pixel).
+        imageStore(gShadowDense, pix, vec4(shadow, 0.0, 0.0, 0.0));
+        if (shadow >= 0.5) {
+            bit = 1u << (lid.y * 8u + lid.x);
+        }
+    }
+    atomicOr(sBits[0], bit);
+    barrier();
+
+    if (gl_LocalInvocationIndex == 0u) {
+        if (int(wid.x) < pc.tilesX && int(wid.y) < pc.tilesY) {
+            imageStore(gHitMask, ivec2(wid), uvec4(sBits[0], 0u, 0u, 0u));
+        }
+    }
+}

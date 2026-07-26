@@ -1,3 +1,19 @@
+/*
+ * Caustica — Classic AMD FSR 2.2 Vulkan upscaler.
+ * Copyright (c) 2026. Caustica contributors.
+ *
+ * The native bridge declares its color and output resources as
+ * {@code R16G16B16A16_SFLOAT}, while Caustica's bandwidth-oriented beauty plates are
+ * {@code B10G11R11_UFLOAT}. These formats are not view-compatible, so a layer of compute
+ * passes is needed to convert to and from RGBA16F around the SDK dispatch.
+ *
+ * <p>Phase 1 of the format-adaptation refactor: all of that conversion logic
+ * (pack/unpack/reactive/guard) now lives in {@link dev.comfyfluffy.caustica.rt.plate.RtPlateBridge}.
+ * This class owns the native FSR2 lifecycle and dispatch, plus the
+ * blackout-quarantine policy. {@link dev.comfyfluffy.caustica.rt.RtComposite} injects
+ * its shared bridge plus the actual input VkFormat each frame, allowing Hybrid's
+ * RGBA16F compose output to pass by identity while raw B10G11R11 fallbacks are packed.
+ */
 package dev.comfyfluffy.caustica.fsr;
 
 import com.mojang.blaze3d.systems.RenderSystem;
@@ -5,14 +21,15 @@ import com.mojang.blaze3d.vulkan.VulkanDevice;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
+import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
+import dev.comfyfluffy.caustica.rt.plate.RtPlateBridge;
 import dev.comfyfluffy.caustica.upscale.Upscaler;
-import dev.comfyfluffy.caustica.upscale.UpscalerSelector.Mode;
-import dev.comfyfluffy.caustica.vendor.GpuVendor;
 import net.fabricmc.loader.api.FabricLoader;
 import org.joml.Matrix4fc;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.lwjgl.vulkan.VK10;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -21,25 +38,29 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 
 /**
  * Classic AMD FSR 2.2 Vulkan upscaler ({@code libffx_fsr2_caustica.so}).
- * Used when modular FSR 3/4 loader has no Vulkan provider (Linux open-source path).
+ *
+ * <p>Native dispatch lives in this class; format adaptation (HDR → RGBA16F pack,
+ * RGBA16F → HDR unpack, optional blackout guard, optional self-derived reactive
+ * mask) lives in {@link RtPlateBridge}.
  */
 public final class Fsr2ClassicUpscaler implements Upscaler {
     private static final Logger LOGGER = LoggerFactory.getLogger("Caustica");
     private static final String LIB = "libffx_fsr2_caustica.so";
 
-    // Match FfxFsr2QualityMode (no NATIVE in FSR2; 1=Quality … 4=UltraPerf)
     private static final int Q_QUALITY = 1;
     private static final int Q_BALANCED = 2;
     private static final int Q_PERF = 3;
     private static final int Q_ULTRA = 4;
 
-    // HDR | DEPTH_INVERTED | DEPTH_INFINITE | AUTO_EXPOSURE
-    // (render-res MVs: do NOT set DISPLAY_RESOLUTION_MOTION_VECTORS)
-    private static final int FLAGS_DEFAULT = (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5);
+    // Full classic FSR2 flags for path-traced HDR + reverse-Z infinite depth.
+    // bit0 HDR | bit3 DEPTH_INVERTED | bit4 DEPTH_INFINITE
+    // Do NOT enable AUTO_EXPOSURE (bit5): we never bind an exposure texture; on RADV
+    // that combination returns FFX_OK with a pure-black output plate.
+    // Do NOT enable DISPLAY_RESOLUTION_MOTION_VECTORS: gMotion is render-res pixels.
+    private static final int FLAGS_DEFAULT = (1 << 0) | (1 << 3) | (1 << 4);
 
     private final Fsr2ClassicLibrary lib;
     private final VulkanDevice device;
@@ -50,17 +71,35 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
     private boolean failed;
     private long frameIndex;
     private boolean hardReset = true;
+    /**
+     * After a pure-black FSR output (rc=0 but no energy), stay on blit fail-open until
+     * a hard reset / recreate proves the path healthy again. Prevents a permanent black screen.
+     */
+    private boolean blackoutFailOpen;
+    private int consecutiveBlackouts;
+    private boolean blackoutLogged;
 
-    // Frame timing for accurate temporal accumulation
     private long lastFrameNanos = -1;
     private float lastDeltaTimeMs = 16.6f;
+
+    /**
+     * Guides injected via {@link #setReactiveMaskGuides} — the bridge consumes them when
+     * calling computeReactiveMaskIfNeeded. null guide → reactive pass is skipped.
+     */
+    private RtImage guideViewZ;
+    private RtImage guideDisocclusionMix;
+
+    /** Composite-owned, non-owning format bridge injected before ensure/evaluate. */
+    private RtPlateBridge plate;
+    /** Actual VkFormat of the color image supplied to evaluate(). */
+    private int inputColorFormat = RtContext.HDR_RADIANCE_FORMAT;
 
     private Fsr2ClassicUpscaler(Fsr2ClassicLibrary lib, VulkanDevice device) {
         this.lib = lib;
         this.device = device;
     }
 
-    public static Fsr2ClassicUpscaler tryCreate(GpuVendor gpu) {
+    public static Fsr2ClassicUpscaler tryCreate() {
         if (!(((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device)) {
             return null;
         }
@@ -72,7 +111,7 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
             }
             Fsr2ClassicLibrary lib = Fsr2ClassicLibrary.load(so);
             int ver = lib.probe();
-            LOGGER.info("Classic FSR2 native loaded (probe={}) from {} on {}", ver, so, gpu.deviceName);
+            LOGGER.info("Classic FSR2 native loaded (probe={}) from {}", ver, so);
             return new Fsr2ClassicUpscaler(lib, device);
         } catch (Throwable t) {
             LOGGER.warn("Classic FSR2 init failed", t);
@@ -93,14 +132,21 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
         try (InputStream in = Fsr2ClassicUpscaler.class.getResourceAsStream("/caustica/natives/linux-x64/" + LIB)) {
             if (in != null) {
                 byte[] bytes = in.readAllBytes();
-                if (!Files.isRegularFile(target) || Files.size(target) != bytes.length) {
+                // Always overwrite: size-only checks leave stale SO with wrong MV/format
+                // claims that black the FSR path on RADV while still returning rc=0.
+                boolean rewrite = !Files.isRegularFile(target) || Files.size(target) != bytes.length;
+                if (!rewrite && Files.isRegularFile(target)) {
+                    byte[] existing = Files.readAllBytes(target);
+                    rewrite = existing.length != bytes.length || !java.util.Arrays.equals(existing, bytes);
+                }
+                if (rewrite) {
                     Files.write(target, bytes);
                     target.toFile().setExecutable(true);
+                    LOGGER.info("Extracted FSR2 native to {} ({} bytes)", target, bytes.length);
                 }
                 return target;
             }
         }
-        // Dev / pre-seeded
         if (Files.isRegularFile(target) && Files.size(target) > 50_000) {
             return target;
         }
@@ -109,8 +155,43 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
     }
 
     @Override
-    public Mode mode() {
-        return Mode.FSR_3; // report as fsr-3 quality path in UI (classic FSR2 temporal)
+    public String id() {
+        return "fsr2";
+    }
+
+    @Override
+    public String displayName() {
+        return "Classic FSR 2.2";
+    }
+
+    @Override
+    public boolean performsTemporalReconstruction() {
+        return true;
+    }
+
+    @Override
+    public int inputColorFormat(int rawBeautyFormat) {
+        return VK10.VK_FORMAT_R16G16B16A16_SFLOAT;
+    }
+
+    @Override
+    public int displayColorFormat(int rawBeautyFormat, boolean hdrEnabled) {
+        return hdrEnabled ? VK10.VK_FORMAT_R16G16B16A16_SFLOAT : rawBeautyFormat;
+    }
+
+    @Override
+    public boolean needsReactiveMask() {
+        return true;
+    }
+
+    @Override
+    public boolean needsBlackoutGuard() {
+        return true;
+    }
+
+    @Override
+    public boolean includesSharpening() {
+        return true;
     }
 
     @Override
@@ -121,7 +202,6 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
     @Override
     public int[] queryOptimalRenderSize(int displayWidth, int displayHeight) {
         int cfgQ = CausticaConfig.Rt.Upscaler.QUALITY.value();
-        // 0 = true 1:1 (no scale) — sharpest; FSR still runs temporal lock at display res.
         if (cfgQ <= 0) {
             return new int[]{displayWidth, displayHeight};
         }
@@ -136,9 +216,8 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
     }
 
     private static int mapQuality(int causticaQuality) {
-        // Caustica: 0=native 1:1, 1=quality(~1.5×), 2=balanced, 3=perf, 4=ultra
         return switch (causticaQuality) {
-            case 0 -> Q_QUALITY; // unused when query returns 1:1
+            case 0 -> Q_QUALITY;
             case 1 -> Q_QUALITY;
             case 2 -> Q_BALANCED;
             case 3 -> Q_PERF;
@@ -155,7 +234,11 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
         }
         if (ready && renderWidth == featureRenderW && renderHeight == featureRenderH
                 && displayWidth == featureDisplayW && displayHeight == featureDisplayH) {
-            return true;
+            return plate != null && plate.profile() != null;
+        }
+        if (plate == null || plate.profile() == null) {
+            LOGGER.warn("FSR2 classic feature requested before RtComposite injected its plate bridge");
+            return false;
         }
         try {
             if (!ctx.equals(MemorySegment.NULL)) {
@@ -182,17 +265,30 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
             featureDisplayH = displayHeight;
             ready = true;
             hardReset = true;
-            LOGGER.info("FSR2 classic context: {}x{} → {}x{}", renderWidth, renderHeight, displayWidth, displayHeight);
+            frameIndex = 0;
+            // New context: allow native FSR2 again (clear any prior session quarantine).
+            blackoutFailOpen = false;
+            blackoutLogged = false;
+            consecutiveBlackouts = 0;
+            if (plate.profile() == null) {
+                LOGGER.error("FSR2 feature created but injected plate bridge has no profile");
+                ready = false;
+                return false;
+            }
+            LOGGER.info(
+                    "FSR2 classic context: {}x{} → {}x{} (full native path, RGBA16F α=1 pack + blackout guard)",
+                    renderWidth, renderHeight, displayWidth, displayHeight);
             return true;
         } catch (Throwable t) {
             failed = true;
-            LOGGER.error("FSR2 classic create failed; disabling", t);
+            LOGGER.error("FSR2 classic ensureFeature failed; disabling", t);
             return false;
         }
     }
 
+
     @Override
-    public boolean evaluate(long cmd, RtImage color, RtImage depth, RtImage motion,
+    public boolean evaluate(long cmdAddr, RtImage color, RtImage depth, RtImage motion,
                             RtImage diffuseAlbedo, RtImage specularAlbedo, RtImage normals,
                             RtImage specularMotion, RtImage specularHitDistance, RtImage out,
                             int renderWidth, int renderHeight, int displayWidth, int displayHeight,
@@ -200,34 +296,39 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
         if (!isReady() || color == null || depth == null || motion == null || out == null) {
             return false;
         }
+        // Sticky quarantine: after repeated native blackouts, skip native and let composite blit.
+        if (blackoutFailOpen) {
+            if (!blackoutLogged) {
+                blackoutLogged = true;
+                LOGGER.error(
+                        "FSR2 native path quarantined this session after blackout(s). "
+                                + "Using 1:1 blit upscale; denoise still runs. "
+                                + "Restart game or toggle upscaler to retry native FSR2.");
+            }
+            return false;
+        }
+        if (plate == null) {
+            return false;
+        }
         try {
-            // === FIX 1: 动态帧时间计算 ===
             long currentNanos = System.nanoTime();
             if (lastFrameNanos > 0) {
                 float deltaMs = (currentNanos - lastFrameNanos) / 1_000_000.0f;
-                // 钳制到合理范围 (避免暂停后的巨大跳变)
                 deltaMs = Math.max(1.0f, Math.min(100.0f, deltaMs));
                 lastDeltaTimeMs = deltaMs;
             }
             lastFrameNanos = currentNanos;
 
-            // === FIX 2: Jitter 方向 - 不反转 (FSR2 期望正向) ===
-            // RtComposite 传入的是已应用的 jitter，FSR2 需要知道它以便反向重投影
-            float jx = jitterX;  // 不反转
+            // Camera-derived FOV + near plane (mirror pre-refactor derivation).
+            float jx = jitterX;
             float jy = jitterY;
-
-            // === FIX 3: 正确提取 FOV 和相机参数 ===
-            // Vertical FOV from the real projection (m11 = 1/tan(fovy/2) for JOML perspective).
             float fovY = (float) Math.toRadians(70.0);
             float cameraNear = 0.05f;
-
             if (viewToClip != null) {
                 float m11 = viewToClip.m11();
                 if (Math.abs(m11) > 1e-5f) {
                     fovY = 2.0f * (float) Math.atan(1.0f / Math.abs(m11));
                 }
-                // 尝试从投影矩阵提取 near plane (reverse-Z)
-                // 对于 reverse-Z infinite: m22 = 0, m32 = -near
                 float m22 = viewToClip.m22();
                 float m32 = viewToClip.m32();
                 if (Math.abs(m22) < 0.001f && m32 < 0) {
@@ -235,44 +336,153 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
                 }
             }
 
-            // Pack sharpness into preExposure channel: 2.0 + sharpness (export enables RCAS).
+            // Sharpness packed as (2 + sharpness) — FSR2 native ABI expects > 1.0 to enable RCAS at that strength.
             float sharp = CausticaConfig.Rt.Upscaler.SHARPEN.value()
                     ? Math.max(0f, Math.min(1f, CausticaConfig.Rt.Upscaler.SHARPNESS.value()))
-                    : -1f; // negative → export disables sharpening
-            float preExpPacked = sharp < 0f ? -1f : (2.0f + sharp);
+                    : -1f;
+            float preExpPacked = sharp < 0f ? 1.0f : (2.0f + sharp);
 
-            // === FIX 4: 使用实际帧时间而不是固定 16.6ms ===
-            int rc = lib.dispatch(ctx, cmd,
-                    color.image, color.view,
-                    depth.image, depth.view,
-                    motion.image, motion.view,
-                    out.image, out.view,
-                    renderWidth, renderHeight,
-                    jx, jy, lastDeltaTimeMs, preExpPacked,  // ← 动态帧时间
-                    // Reverse-Z infinite: near plane + far=0 with DEPTH_INFINITE flag.
-                    cameraNear, 0.0f, fovY,  // ← 动态 near plane
-                    hardReset ? 1 : 0);
+            org.lwjgl.vulkan.VkCommandBuffer cmd =
+                    new org.lwjgl.vulkan.VkCommandBuffer(cmdAddr, device.vkDevice());
 
+            // Bridge chooses identity for RGBA16F Hybrid output, or packs raw
+            // B10G11R11 fallback/other denoisers into RGBA16F staging.
+            RtImage fsrIn = plate.convertToUpscalerInput(cmd, color, inputColorFormat);
+
+            // Optional reactive mask (motion+depth+normals+viewZ+disocclMix -> R32F).
+            // On RADV/NAVI33 the reactive compute + FSR2 v2 path hard-recovers the device on the
+            // first real-geometry frame (fixed SQC GPUVM fault). Skip reactive and use v1 only.
+            boolean reactiveRan = false;
+            if (!dev.comfyfluffy.caustica.rt.RtDeviceBringup.isRadv()) {
+                reactiveRan = plate.computeReactiveMaskIfNeeded(
+                        cmd, motion, depth, normals, guideViewZ, guideDisocclusionMix);
+            }
+            RtImage fsrReactive = reactiveRan ? plate.reactiveMask() : null;
+
+            // Pre-clear upscaler-output staging so a partial native write cannot leave NaN/black.
+            plate.clearUpscalerOutput(cmd);
+            RtImage fsrOut = plate.upscalerOutputColor();
+
+            // RADV: full barrier so RT/plate writes are visible before the native FSR2 dispatch
+            // samples color/depth/motion (same graphics queue; no implicit RT→compute sync).
+            if (dev.comfyfluffy.caustica.rt.RtDeviceBringup.isRadv()) {
+                try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
+                    org.lwjgl.vulkan.VkMemoryBarrier.Buffer mem =
+                            org.lwjgl.vulkan.VkMemoryBarrier.calloc(1, stack).sType$Default()
+                                    .srcAccessMask(org.lwjgl.vulkan.VK10.VK_ACCESS_SHADER_WRITE_BIT
+                                            | org.lwjgl.vulkan.VK10.VK_ACCESS_TRANSFER_WRITE_BIT
+                                            | org.lwjgl.vulkan.VK10.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                                    .dstAccessMask(org.lwjgl.vulkan.VK10.VK_ACCESS_SHADER_READ_BIT
+                                            | org.lwjgl.vulkan.VK10.VK_ACCESS_TRANSFER_READ_BIT);
+                    org.lwjgl.vulkan.VK10.vkCmdPipelineBarrier(cmd,
+                            org.lwjgl.vulkan.VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            org.lwjgl.vulkan.VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            0, mem, null, null);
+                }
+            }
+
+            // ----- Native FSR2 dispatch (v1 without reactive, v2 with reactive) -----
+            // FSR2's reverse-infinite transform derives its scale from min/max(cameraNear, cameraFar);
+            // passing far=0 makes that scale 0 after the inverted-depth swap. A finite positive sentinel
+            // keeps the infinite-depth permutation well-defined (the flag, not this magnitude, selects
+            // the infinite projection formula).
+            int rc;
+            if (reactiveRan) {
+                if (!lib.hasV2Dispatch() || fsrReactive == null) {
+                    throw new IllegalStateException(
+                            "reactive v2 dispatch unavailable (v2 symbol missing or reactive image null)");
+                }
+                rc = lib.dispatchV2(ctx, cmdAddr,
+                        fsrIn.image, fsrIn.view,
+                        depth.image, depth.view,
+                        motion.image, motion.view,
+                        fsrOut.image, fsrOut.view,
+                        fsrReactive.image, fsrReactive.view,
+                        renderWidth, renderHeight,
+                        jx, jy, lastDeltaTimeMs, preExpPacked,
+                        cameraNear, 1_000_000.0f, fovY,
+                        hardReset ? 1 : 0);
+            } else {
+                rc = lib.dispatch(ctx, cmdAddr,
+                        fsrIn.image, fsrIn.view,
+                        depth.image, depth.view,
+                        motion.image, motion.view,
+                        fsrOut.image, fsrOut.view,
+                        renderWidth, renderHeight,
+                        jx, jy, lastDeltaTimeMs, preExpPacked,
+                        cameraNear, 1_000_000.0f, fovY,
+                        hardReset ? 1 : 0);
+            }
             if (frameIndex < 5 || frameIndex % 300 == 0) {
-                LOGGER.info("FSR2 dispatch #{} rc={} jitter=({:.3f}, {:.3f}) fovY={:.1f}° near={:.3f} dt={:.2f}ms sharp={:.2f} render={}x{} → {}x{} reset={}",
-                        frameIndex, rc, jx, jy, Math.toDegrees(fovY), cameraNear, lastDeltaTimeMs, sharp,
-                        renderWidth, renderHeight, displayWidth, displayHeight, hardReset);
+                LOGGER.info(
+                        "FSR2 dispatch #{} rc={} path={} jitter=({}, {}) fovY={}° near={} dt={}ms sharp={} "
+                                + "render={}x{} → {}x{} reset={}",
+                        frameIndex, rc, reactiveRan ? "v2+reactive" : "v1",
+                        String.format(java.util.Locale.ROOT, "%.3f", jx),
+                        String.format(java.util.Locale.ROOT, "%.3f", jy),
+                        String.format(java.util.Locale.ROOT, "%.1f", Math.toDegrees(fovY)),
+                        String.format(java.util.Locale.ROOT, "%.3f", cameraNear),
+                        String.format(java.util.Locale.ROOT, "%.2f", lastDeltaTimeMs),
+                        String.format(java.util.Locale.ROOT, "%.2f", sharp),
+                        renderWidth, renderHeight, displayWidth, displayHeight, hardReset ? 1 : 0);
             }
             hardReset = false;
             frameIndex++;
             if (rc != 0) {
-                throw new IllegalStateException("caustica_ffx_fsr2_dispatch failed: " + rc);
+                consecutiveBlackouts++;
+                if (consecutiveBlackouts >= 3) {
+                    blackoutFailOpen = true;
+                }
+                throw new IllegalStateException(
+                        reactiveRan ? "caustica_ffx_fsr2_dispatch_v2 failed: " + rc
+                                   : "caustica_ffx_fsr2_dispatch failed: " + rc);
             }
+
+            // ----- Bridge-driven output unpack (with optional blackout-guard fallback) -----
+            plate.convertFromUpscalerOutput(cmd, out);
+
+            consecutiveBlackouts = 0;
             return true;
         } catch (Throwable t) {
-            LOGGER.error("FSR2 classic evaluate failed", t);
+            LOGGER.error("FSR2 classic evaluate failed — composite will blit-fallback", t);
+            consecutiveBlackouts++;
+            if (consecutiveBlackouts >= 3) {
+                blackoutFailOpen = true;
+            }
             return false;
         }
+    }
+
+    /**
+     * Sticky latch: true while native FSR is quarantined so composite prefers blit.
+     */
+    @Override
+    public boolean consumeFailOpen() {
+        return blackoutFailOpen;
+    }
+
+    @Override
+    public void setReactiveMaskGuides(RtImage viewZ, RtImage disocclusionMix) {
+        this.guideViewZ = viewZ;
+        this.guideDisocclusionMix = disocclusionMix;
+    }
+
+
+    @Override
+    public void setPlateBridge(RtPlateBridge bridge) {
+        this.plate = bridge;
+    }
+
+    @Override
+    public void setInputColorFormat(int format) {
+        this.inputColorFormat = format;
     }
 
     @Override
     public void requestResetHistory() {
         hardReset = true;
+        blackoutFailOpen = false;
+        consecutiveBlackouts = 0;
     }
 
     @Override
@@ -284,6 +494,8 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
             }
             ctx = MemorySegment.NULL;
         }
+        // RtComposite owns and destroys the shared bridge.
+        plate = null;
         ready = false;
     }
 }

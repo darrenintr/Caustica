@@ -1,0 +1,26 @@
+// RGBA16F FSR2 output → B10G11R11 display plate (drop alpha).
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f)          readonly  uniform image2D gIn;
+layout(binding = 1, r11f_g11f_b10f) writeonly uniform image2D gOut;
+
+layout(push_constant) uniform Push {
+    int width;
+    int height;
+    int pad0;
+    int pad1;
+} pc;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= pc.width || pix.y >= pc.height) {
+        return;
+    }
+    vec3 rgb = max(imageLoad(gIn, pix).rgb, vec3(0.0));
+    if (any(isnan(rgb)) || any(isinf(rgb))) {
+        rgb = vec3(0.0);
+    }
+    imageStore(gOut, pix, vec4(rgb, 1.0));
+}

@@ -39,6 +39,10 @@ public final class RtVariableRateShading {
     private long descriptorSetLayout;
     private long descriptorPool;
     private long descriptorSet;
+    private long boundDepthView;
+    private long boundAlbedoView;
+    private long boundRateView;
+    private boolean rateImageInAttachmentLayout;
 
     // Push constants structure
     private static final int PUSH_CONST_SIZE = 24; // uvec2 + uvec2 + float + float
@@ -135,8 +139,13 @@ public final class RtVariableRateShading {
                     .sType$Default()
                     .pCode(spirv);
             LongBuffer pShader = stack.mallocLong(1);
-            check(vkCreateShaderModule(vk, smInfo, null, pShader), "vkCreateShaderModule VRS");
-            long shaderModule = pShader.get(0);
+            long shaderModule;
+            try {
+                check(vkCreateShaderModule(vk, smInfo, null, pShader), "vkCreateShaderModule VRS");
+                shaderModule = pShader.get(0);
+            } finally {
+                MemoryUtil.memFree(spirv);
+            }
 
             // 4. Create compute pipeline
             VkPipelineShaderStageCreateInfo stageInfo = VkPipelineShaderStageCreateInfo.calloc(stack)
@@ -215,21 +224,44 @@ public final class RtVariableRateShading {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDevice vk = ctx.vk();
 
-            // Update descriptor set
-            VkDescriptorImageInfo.Buffer imageInfos = VkDescriptorImageInfo.calloc(3, stack);
-            imageInfos.get(0).imageView(depth.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL);
-            imageInfos.get(1).imageView(albedo.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL);
-            imageInfos.get(2).imageView(shadingRateImage.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL);
+            if (boundDepthView != depth.view || boundAlbedoView != albedo.view
+                    || boundRateView != shadingRateImage.view) {
+                VkDescriptorImageInfo.Buffer imageInfos = VkDescriptorImageInfo.calloc(3, stack);
+                imageInfos.get(0).imageView(depth.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL);
+                imageInfos.get(1).imageView(albedo.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL);
+                imageInfos.get(2).imageView(shadingRateImage.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL);
 
-            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(3, stack);
-            writes.get(0).sType$Default().dstSet(descriptorSet).dstBinding(0).dstArrayElement(0)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE).descriptorCount(1).pImageInfo(imageInfos.slice(0, 1));
-            writes.get(1).sType$Default().dstSet(descriptorSet).dstBinding(1).dstArrayElement(0)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE).descriptorCount(1).pImageInfo(imageInfos.slice(1, 1));
-            writes.get(2).sType$Default().dstSet(descriptorSet).dstBinding(2).dstArrayElement(0)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1).pImageInfo(imageInfos.slice(2, 1));
+                VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(3, stack);
+                writes.get(0).sType$Default().dstSet(descriptorSet).dstBinding(0).dstArrayElement(0)
+                        .descriptorType(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE).descriptorCount(1).pImageInfo(imageInfos.slice(0, 1));
+                writes.get(1).sType$Default().dstSet(descriptorSet).dstBinding(1).dstArrayElement(0)
+                        .descriptorType(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE).descriptorCount(1).pImageInfo(imageInfos.slice(1, 1));
+                writes.get(2).sType$Default().dstSet(descriptorSet).dstBinding(2).dstArrayElement(0)
+                        .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1).pImageInfo(imageInfos.slice(2, 1));
 
-            vkUpdateDescriptorSets(vk, writes, null);
+                vkUpdateDescriptorSets(vk, writes, null);
+                boundDepthView = depth.view;
+                boundAlbedoView = albedo.view;
+                boundRateView = shadingRateImage.view;
+            }
+
+            if (rateImageInAttachmentLayout) {
+                VkImageMemoryBarrier2.Buffer toCompute = VkImageMemoryBarrier2.calloc(1, stack);
+                toCompute.get(0)
+                        .sType$Default()
+                        .srcStageMask(VK_PIPELINE_STAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
+                        .srcAccessMask(VK_ACCESS_2_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR)
+                        .dstStageMask(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+                        .dstAccessMask(VK_ACCESS_2_SHADER_WRITE_BIT)
+                        .oldLayout(VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR)
+                        .newLayout(VK_IMAGE_LAYOUT_GENERAL)
+                        .image(shadingRateImage.image)
+                        .subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                                .levelCount(1).layerCount(1));
+                KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd,
+                        VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toCompute));
+                rateImageInAttachmentLayout = false;
+            }
 
             // Bind pipeline
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, generateRatePipeline);
@@ -270,6 +302,7 @@ public final class RtVariableRateShading {
                     .pImageMemoryBarriers(barrier);
 
             KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, depInfo);
+            rateImageInAttachmentLayout = true;
         }
     }
 
@@ -301,6 +334,10 @@ public final class RtVariableRateShading {
             shadingRateImage.destroy();
             shadingRateImage = null;
         }
+        boundDepthView = 0L;
+        boundAlbedoView = 0L;
+        boundRateView = 0L;
+        rateImageInAttachmentLayout = false;
     }
 
     public void destroy() {
