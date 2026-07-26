@@ -114,16 +114,11 @@ abstract class CompileShaders extends DefaultTask {
 				// Vulkan 1.2 is Blaze3D's device baseline and already includes SPIR-V 1.4,
 				// buffer-device-address, descriptor indexing, and shader float controls. Keeping the
 				// shader environment at 1.2 avoids excluding otherwise capable KHR RT drivers.
-				// Use spirv1.4 target-env so the SPIR-V-side
-				// GL_EXT_shader_invocation_reorder extension is recognised — at vulkan1.2 it
-				// sometimes requires --enable-ext spirv1.4 plus a newer glslangValidator than
-				// LunarG SDK 1.4.309.0 ships; spirv1.4 alone is sufficient across all
-				// upstream versions and matches what the runtime expects.
-				commandLine([glslang.get(), "-V", "--target-env", "spirv1.4", "-g"] + defines
+				commandLine([glslang.get(), "-V", "--target-env", "vulkan1.2", "-g"] + defines
 						+ [src.absolutePath, "-o", spv.absolutePath])
 			}
 			execOps.exec {
-				commandLine spirvVal.get(), "--target-env", "spv1.4", spv.absolutePath
+				commandLine spirvVal.get(), "--target-env", "vulkan1.2", spv.absolutePath
 			}
 		}
 		def shaderFiles = srcDir.get().asFileTree.matching {

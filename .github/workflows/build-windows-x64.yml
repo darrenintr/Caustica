@@ -62,65 +62,87 @@ jobs:
         with:
           arch: x64
 
-      # Install a minimal Vulkan SDK on Windows so :compileShaders can call
-      # glslangValidator + spirv-val. The Linux side pulls a SDK tarball from LunarG.
-      # On Windows the same approach using `/S` to silently run the Inno-Setup-based
-      # installer hangs in the CI env, and the KhronosGroup/glslang + SPIRV-Tools repos
-      # don't ship Windows release zips. The 7-Zip installer on the Windows runner can
-      # usually crack Inno-Setup payloads because the MSI inside is a stream — point 7z
-      # at VulkanSDK-<ver>-Installer.exe and ask it to extract the contents directly.
-      - name: Install LunarG Vulkan SDK via 7-Zip extact-from-installer
+      # Install glslangValidator (from upstream KhronosGroup/glslang main, fresh
+      # enough to accept GL_EXT_shader_invocation_reorder in --target-env vulkan1.2)
+      # + spirv-val (built from SPIRV-Tools against the vcpkg protobuf port)
+      # for the windows-2022 runner. LunarG SDK 1.4.309.0 ships a glslang too old
+      # for the world.rgen extension even though the SDK itself installs cleanly
+      # under 7z. Building both binaries from the pinned tags of the upstream repos
+      # takes ~60s on the runner and parallels the Linux SDK-pipeline path.
+      - name: Build glslangValidator + spirv-val from upstream source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # 1.4.309.0 ships glslang 13.x with GL_EXT_shader_invocation_reorder support,
-          # which shaders/world/world.rgen requires. (1.3.290.0 doesn't recognise the
-          # extension; the older run failed at compileShaders with "extension not
-          # supported: GL_EXT_shader_invocation_reorder".)
-          $version = '1.4.309.0'
-          $work    = Join-Path $env:RUNNER_TEMP "caustica-vulkan-sdk-$version"
+          $work = Join-Path $env:RUNNER_TEMP 'caustica-shader-tools'
           if (Test-Path $work) { Remove-Item -Recurse -Force $work }
           New-Item -ItemType Directory -Path $work | Out-Null
-          $installer = Join-Path $work "VulkanSDK-$version-Installer.exe"
-          $unpacked  = Join-Path $work 'unpacked'
 
-          $szip = 'C:\Program Files\7-Zip\7z.exe'
-          if (-not (Test-Path $szip)) {
-              Write-Host "Installing 7-Zip via Chocolatey ..."
-              choco install 7zip -y --no-progress 2>&1 | Select-Object -Last 3
-              $szip = (Get-Command 7z.exe).Source
+          Write-Host "Cloning KhronosGroup/glslang @ main ..."
+          git clone --depth 1 https://github.com/KhronosGroup/glslang.git (Join-Path $work 'glslang') 2>&1 | Select-Object -Last 3
+          Write-Host "Cloning KhronosGroup/SPIRV-Tools @ main ..."
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Tools.git (Join-Path $work 'SPIRV-Tools') 2>&1 | Select-Object -Last 3
+          Write-Host "Cloning KhronosGroup/SPIRV-Headers (deopt dep) ..."
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git (Join-Path $work 'SPIRV-Headers') 2>&1 | Select-Object -Last 3
+
+          $vcpkg = (Get-Command vcpkg -ErrorAction SilentlyContinue).Source
+          if (-not $vcpkg) {
+              $vcpkg = "$env:VCPKG_ROOT\vcpkg.exe"
+              if (-not (Test-Path $vcpkg)) {
+                  $vcpkg = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\vcpkg\vcpkg.exe'
+              }
+          }
+          if (-not (Test-Path $vcpkg)) { throw "vcpkg not found at $vcpkg; install protobuf manually via vcpkg" }
+          Write-Host "vcpkg at $vcpkg"
+
+          Write-Host "Installing protobuf via vcpkg (--x-install + --no-print + static) ..."
+          & $vcpkg install protobuf:x64-windows 2>&1 | Select-Object -Last 8
+
+          $vcpkgInstalled = "$env:VCPKG_ROOT\installed\x64-windows"
+          if (-not (Test-Path $vcpkgInstalled)) {
+              $vcpkgInstalled = "$($vcpkg.Replace('\\vcpkg.exe',''))installed\x64-windows"
+          }
+          if (-not (Test-Path (Join-Path $vcpkgInstalled 'include\google\protobuf\message.h'))) {
+              throw "vcpkg protobuf install missing at $vcpkgInstalled"
           }
 
-          Write-Host "Downloading LunarG Vulkan SDK $version installer ..."
-          Invoke-WebRequest -UseBasicParsing -OutFile $installer `
-              "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
-          $size = (Get-Item $installer).Length
-          if ($size -lt 10MB) { throw "installer too small ($size bytes)" }
+          $spirvBuild = Join-Path $work 'SPIRV-Tools-build'
+          Write-Host "Configuring SPIRV-Tools ..."
+          cmake -S (Join-Path $work 'SPIRV-Tools') -B $spirvBuild -G Ninja `
+                -DCMAKE_BUILD_TYPE=Release `
+                -DSPIRV_WERROR=OFF -DSPIRV_SKIP_TESTS=ON `
+                "-DCMAKE_PREFIX_PATH=$vcpkgInstalled" 2>&1 | Select-Object -Last 8
 
-          Write-Host "Cracking Inno-Setup payload via 7z ..."
-          New-Item -ItemType Directory -Path $unpacked | Out-Null
-          & $szip x $installer "-o$unpacked" -y 2>&1 | Select-Object -Last 8
+          Write-Host "Building spirv-val ..."
+          cmake --build $spirvBuild --target spirv-val --config Release 2>&1 | Select-Object -Last 8
 
-          $hit = Get-ChildItem -Path $unpacked -Recurse -Filter 'glslangValidator.exe' -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-          if (-not $hit) {
-              Get-ChildItem -Path $unpacked -Recurse | Select-Object FullName,Length | Format-Table -AutoSize | Out-String | Write-Host
-              throw "glslangValidator.exe not found in 7z-extracted payload"
-          }
+          $glslangBuild = Join-Path $work 'glslang-build'
+          Write-Host "Configuring glslang ..."
+          cmake -S (Join-Path $work 'glslang') -B $glslangBuild -G Ninja `
+                -DCMAKE_BUILD_TYPE=Release `
+                -DGLSLANG_TESTS=OFF -DENABLE_OPT=OFF -DENABLE_HLSL=OFF `
+                -DENABLE_GLSLANG_BINARIES=ON 2>&1 | Select-Object -Last 8
 
-          $binDir = $hit.DirectoryName
-          Write-Host "Bin directory: $binDir"
-          $vulkanSdk = Split-Path $binDir -Parent
-          Write-Host "Promoting VULKAN_SDK to $vulkanSdk"
+          Write-Host "Building glslang standalone ..."
+          cmake --build $glslangBuild --target glslang --config Release 2>&1 | Select-Object -Last 8
+
+          $vulkanBin = Join-Path $env:VULKAN_SDK 'Bin'
+          if (-not (Test-Path $vulkanBin)) { New-Item -ItemType Directory -Path $vulkanBin | Out-Null }
+          $glslangExe = Get-ChildItem -Path $glslangBuild -Recurse -Filter 'glslang.exe' | Select-Object -First 1
+          if (-not $glslangExe) { throw "glslang.exe not found after build under $glslangBuild" }
+          $spirvExe = Get-ChildItem -Path $spirvBuild -Recurse -Filter 'spirv-val.exe' | Select-Object -First 1
+          if (-not $spirvExe) { throw "spirv-val.exe not found after build under $spirvBuild" }
+          Copy-Item $glslangExe.FullName  (Join-Path $vulkanBin 'glslang.exe')         -Force
+          Copy-Item $glslangExe.FullName  (Join-Path $vulkanBin 'glslangValidator.exe') -Force
+          Copy-Item $spirvExe.FullName     (Join-Path $vulkanBin 'spirv-val.exe')      -Force
 
           foreach ($exe in 'glslangValidator.exe','spirv-val.exe') {
-              $path = Join-Path $binDir $exe
+              $path = Join-Path $vulkanBin $exe
               if (-not (Test-Path $path)) { throw "$exe missing at $path" }
               & $path --version | Select-Object -First 1 | Write-Host
           }
 
-          "VULKAN_SDK=$vulkanSdk" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "$binDir" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "VULKAN_SDK=$vulkanBin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$vulkanBin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
