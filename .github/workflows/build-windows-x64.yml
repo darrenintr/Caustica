@@ -63,15 +63,13 @@ jobs:
           arch: x64
 
       # Install a minimal Vulkan SDK on Windows so :compileShaders can call
-      # glslangValidator + spirv-val. The Linux side pulls a SDK tarball from LunarG; on
-      # Windows the same approach using `/S` to silently run the Inno-Setup-based
-      # installer hangs in the CI env (Start-Process -Wait blocks on the inner
-      # elevation dialog). Workaround: drive the Inno Setup "extract to directory"
-      # command-line so we never actually launch the GUI installer. The installer
-      # exposes `/extract:<dir>` which lays the included MSI / cab / iss files on disk
-      # without writing to Program Files, and then we can pull Bin\glslangValidator.exe
-      # + Bin\spirv-val.exe out of the unpacked payload directly.
-      - name: Install LunarG Vulkan SDK via Inno-Setup /extract (no installer run)
+      # glslangValidator + spirv-val. The Linux side pulls a SDK tarball from LunarG.
+      # On Windows the same approach using `/S` to silently run the Inno-Setup-based
+      # installer hangs in the CI env, and the KhronosGroup/glslang + SPIRV-Tools repos
+      # don't ship Windows release zips. The 7-Zip installer on the Windows runner can
+      # usually crack Inno-Setup payloads because the MSI inside is a stream — point 7z
+      # at VulkanSDK-<ver>-Installer.exe and ask it to extract the contents directly.
+      - name: Install LunarG Vulkan SDK via 7-Zip extact-from-installer
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -82,64 +80,32 @@ jobs:
           $installer = Join-Path $work "VulkanSDK-$version-Installer.exe"
           $unpacked  = Join-Path $work 'unpacked'
 
+          $szip = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path $szip)) {
+              Write-Host "Installing 7-Zip via Chocolatey ..."
+              choco install 7zip -y --no-progress 2>&1 | Select-Object -Last 3
+              $szip = (Get-Command 7z.exe).Source
+          }
+
           Write-Host "Downloading LunarG Vulkan SDK $version installer ..."
           Invoke-WebRequest -UseBasicParsing -OutFile $installer `
               "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
           $size = (Get-Item $installer).Length
-          if ($size -lt 10MB) { throw "installer looks too small ($size bytes)" }
-          Write-Host "  ok ($size bytes)"
+          if ($size -lt 10MB) { throw "installer too small ($size bytes)" }
 
-          Write-Host "Running Inno Setup /extract into $unpacked ..."
-          $proc = Start-Process -FilePath $installer -ArgumentList "/extract:`"$unpacked`"" -PassThru -Wait -NoNewWindow
-          if ($proc.ExitCode -ne 0) { throw "inno /extract exited $($proc.ExitCode)" }
+          Write-Host "Cracking Inno-Setup payload via 7z ..."
+          New-Item -ItemType Directory -Path $unpacked | Out-Null
+          & $szip x $installer "-o$unpacked" -y 2>&1 | Select-Object -Last 8
 
-          $payload = Get-ChildItem -Path $unpacked -Recurse -Include '*.msi','*.exe','*.7z','*.zip' |
-              Where-Object { $_.Name -notmatch 'Installer\.exe$' }
-          Write-Host "Payload candidates: $($payload.Count)"
-
-          # Find a Bin/glslangValidator.exe inside the extracted payload. The installer
-          # extracts itself as an Inno-Setup folder of MSIs; we msiexec /a the top one
-          # to a temp dir (admin install — extracts without committing to Program Files
-          # or running its own services).
-          $binDir = $null
-          foreach ($c in $payload) {
-              $probe = Join-Path $work 'probe'
-              if (Test-Path $probe) { Remove-Item -Recurse -Force $probe }
-              New-Item -ItemType Directory -Path $probe | Out-Null
-              switch ($c.Extension.ToLower()) {
-                  '.msi' {
-                      $p = Start-Process -FilePath 'msiexec.exe' `
-                          -ArgumentList "/a `"$($c.FullName)`" /qn TARGETDIR=`"$probe`"" `
-                          -PassThru -Wait -NoNewWindow
-                      if ($p.ExitCode -ne 0) { continue }
-                  }
-                  '.7z' {
-                      $sz = 'C:\Program Files\7-Zip\7z.exe'
-                      if (Test-Path $sz) { & $sz x $c.FullName "-o$probe" -y | Out-Null }
-                  }
-                  '.zip' {
-                      Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
-                      try { [System.IO.Compression.ZipFile]::ExtractToDirectory($c.FullName, $probe) }
-                      catch { continue }
-                  }
-                  '.exe' {
-                      # try the same /extract trick on the inner exe
-                      $p = Start-Process -FilePath $c.FullName -ArgumentList "/extract:`"$probe`"" `
-                          -PassThru -Wait -NoNewWindow
-                      if ($p.ExitCode -ne 0) { continue }
-                  }
-              }
-              $hit = Get-ChildItem -Path $probe -Recurse -Filter 'glslangValidator.exe' -ErrorAction SilentlyContinue |
-                  Select-Object -First 1
-              if ($hit) { $binDir = $hit.DirectoryName; break }
-          }
-
-          if (-not $binDir) {
+          $hit = Get-ChildItem -Path $unpacked -Recurse -Filter 'glslangValidator.exe' -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+          if (-not $hit) {
               Get-ChildItem -Path $unpacked -Recurse | Select-Object FullName,Length | Format-Table -AutoSize | Out-String | Write-Host
-              throw "glslangValidator.exe not found in any extracted payload"
+              throw "glslangValidator.exe not found in 7z-extracted payload"
           }
 
-          Write-Host "Bin directory located: $binDir"
+          $binDir = $hit.DirectoryName
+          Write-Host "Bin directory: $binDir"
           $vulkanBin = Join-Path $env:VULKAN_SDK 'Bin'
           if (-not (Test-Path $vulkanBin)) { New-Item -ItemType Directory -Path $vulkanBin | Out-Null }
           foreach ($exe in 'glslangValidator.exe','glslang.exe','spirv-val.exe','spirv-opt.exe','spirv-dis.exe') {
