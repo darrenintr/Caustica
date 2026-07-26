@@ -1,0 +1,170 @@
+name: build-windows-x64
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-windows-x64.yml"
+      - ".github/workflows/build-linux-x64.yml"
+      - "build.gradle"
+      - "gradle.properties"
+      - "settings.gradle"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      - "src/**"
+      - "shaders/**"
+      - "native/**"
+      - "scripts/**"
+  pull_request:
+    paths:
+      - ".github/workflows/build-windows-x64.yml"
+      - ".github/workflows/build-linux-x64.yml"
+      - "build.gradle"
+      - "gradle.properties"
+      - "settings.gradle"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      - "src/**"
+      - "shaders/**"
+      - "native/**"
+      - "scripts/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-x64-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: "25"
+
+jobs:
+  build:
+    name: Build portable Windows x64 JAR
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Caustica
+        uses: actions/checkout@v4
+
+      # Visual Studio toolchain — required by the optional `buildNative` JNI scaffold task
+      # (which on Windows produces libcaustica_native.dll) and by anyone re-running
+      # build_nrd_windows.ps1 locally in the same workflow. We don't need cl.exe for the
+      # regular JAR build since the pre-committed Windows DLLs are picked up straight from
+      # src/main/resources/caustica/natives/windows-x64/, but having MSVC on the PATH means
+      # a developer can iterate against the same toolchain as their local box.
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: 1.4.350.0
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          vulkan-use-cache: true
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Mirror the user's local command:
+      #   ./gradlew.bat build
+      # `set -uo pipefail` (no -e) reads the exit code from ${PIPESTATUS[0]} so tee can't
+      # swallow a failing build.
+      - name: Build jar
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $cmd = if (Test-Path 'gradlew.bat') { '.\gradlew.bat' } else { 'gradle' }
+          & $cmd --no-daemon build 2>&1 | Tee-Object -FilePath build.log
+          $rc = $LASTEXITCODE
+          Write-Host "build rc=$rc"
+          if ($rc -ne 0) {
+              $summary = @(
+                  "## build failed (rc=$rc) on ${{ runner.os }}",
+                  "",
+                  "<details><summary>Gradle output (click to expand)</summary>",
+                  "",
+                  "``````",
+                  (Select-String -Path build.log -Pattern 'error: |FAILURE|\* What went wrong|\* Where:|\* Try:' -SimpleMatch:$false | Select-Object -First 200) -join "`n",
+                  "``````",
+                  "",
+                  "</details>",
+                  "",
+                  "Full log uploaded as `build-windows-build-log` artifact."
+              ) -join "`n"
+              Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+              exit $rc
+          }
+
+      - name: Upload build log (on failure only)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-windows-build-log
+          path: build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Inspect packaged native resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $jarFile = Get-ChildItem -Path build/libs -Filter 'caustica-*.jar' |
+              Where-Object { $_.Name -notmatch '-sources\.jar$' -and $_.Name -notmatch '-dev\.jar$' } |
+              Select-Object -First 1
+          if (-not $jarFile) { throw "no caustica-*.jar produced under build/libs" }
+          Write-Host "JAR: $($jarFile.FullName) ($($jarFile.Length) bytes)"
+
+          # Required Windows natives — see NrdRuntime / ffx_* shims. Missing any one of these
+          # on the launched JAR is the failure mode a player hits at first tryUse(): the
+          # loader falls back to "RT disabled" instead of the renderer.
+          $expected = @(
+              'caustica/natives/windows-x64/nrd_caustica.dll',
+              'caustica/natives/windows-x64/ffx_denoiser_caustica.dll',
+              'caustica/natives/windows-x64/ffx_fsr2_caustica.dll'
+          )
+
+          # List every entry in the JAR via .NET ZipFile (no external `7z`/`unzip` needed).
+          Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($jarFile.FullName)
+          try {
+              $entries = New-Object 'System.Collections.Generic.HashSet[string]'
+              foreach ($entry in $zip.Entries) { [void]$entries.Add($entry.FullName) }
+          } finally {
+              $zip.Dispose()
+          }
+
+          $missing = New-Object 'System.Collections.Generic.List[string]'
+          foreach ($e in $expected) {
+              if ($entries.Contains($e)) { Write-Host "OK  $e" }
+              else { [void]$missing.Add($e) }
+          }
+          if ($missing.Count -gt 0) {
+              Write-Error "JAR missing required Windows natives:`n  $($missing -join "`n  ")"
+              exit 1
+          }
+          Write-Host "All required Windows natives present in $($jarFile.Name)."
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: caustica-windows-x64-jar
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
+            !build/libs/*-dev.jar
+          if-no-files-found: error

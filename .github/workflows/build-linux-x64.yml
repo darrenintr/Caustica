@@ -70,11 +70,36 @@ jobs:
 
       - name: Inspect packaged native resources
         run: |
+          set -euo pipefail
           jar_file="$(find build/libs -maxdepth 1 -type f -name 'caustica-*.jar' \
             ! -name '*-sources.jar' ! -name '*-dev.jar' | head -1)"
           test -n "$jar_file"
           echo "JAR: $jar_file"
-          unzip -l "$jar_file" | grep 'caustica/natives/' || true
+          # Required Linux natives — see NrdRuntime / ffx_* shims. Missing any one of these
+          # on the launched JAR is the failure mode a player hits at first tryUse(): the
+          # loader falls back to "RT disabled" instead of the renderer.
+          expected=(
+            caustica/natives/linux-x64/libnrd_caustica.so
+            caustica/natives/linux-x64/libffx_denoiser_caustica.so
+            caustica/natives/linux-x64/libffx_fsr2_caustica.so
+            caustica/natives/linux-x64/libcaustica_native.so
+          )
+          missing=()
+          for entry in "${expected[@]}"; do
+            if ! unzip -l "$jar_file" "$entry" >/dev/null 2>&1; then
+              missing+=("$entry")
+            else
+              echo "OK  $entry"
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "JAR missing required Linux natives:" >&2
+            printf '  - %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+          echo "All required Linux natives present."
+          # Informational listing of all bundled natives.
+          unzip -l "$jar_file" | awk '/caustica\/natives\// {print "  " $NF}'
 
       - name: Upload Linux build
         uses: actions/upload-artifact@v4
