@@ -62,45 +62,58 @@ jobs:
         with:
           arch: x64
 
-      # Pull a full Vulkan SDK directly from LunarG (the same vendor as the Linux tarball
-      # downloaded by build-nrd.yml). KhronosGroup/glslang's GitHub releases only ship
-      # Linux / macOS zips, not Windows, and SPIRV-Tools has no Windows artefacts at all;
-      # the only reliable source of `glslangValidator.exe` + `spirv-val.exe` on Windows is
-      # the Vulkan SDK installer. 1.3.290.0 is the latest URL-pattern LunarG keeps
-      # downloadable (1.4.x redirect 404 today). It ships glslang 13.x which already
-      # supports `--target-env vulkan1.2` plus the `GL_EXT_shader_invocation_reorder`
-      # extension Caustica uses in shaders/world/world.rgen.
-      #
-      # Silent install lands at the default C:\VulkanSDK\<version>\ which exports
-      # VULKAN_SDK + adds Bin\ to the env. That's the only SDK we need — no point running
-      # humbletim's partial install on top, so we just unset whatever it would have set
-      # and re-export the path LunarG produces.
-      - name: Install LunarG Vulkan SDK (silent) for glslangValidator + spirv-val
+      # Install a minimal Vulkan SDK on Windows so :compileShaders can call
+      # glslangValidator + spirv-val. The Linux side pulls a SDK tarball from LunarG; on
+      # Windows the only reliable source of those binaries is the SDK installer — but
+      # pulling the 162MB installer and running /S silently has proven to be flaky and
+      # slow in the CI env. Faster path: clone the upstream repos and cmake-build just
+      # the executables we need (`glslangValidator`, `spirv-val`). Both are small and
+      # build in well under a minute on the windows-2022 runner.
+      - name: Install minimal Vulkan SDK (glslangValidator + spirv-val from source)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = '1.3.290.0'
-          $installRoot = Join-Path $env:ProgramFiles 'VulkanSDK'
-          $sdkRoot = Join-Path $installRoot $version
-          $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version-Installer.exe"
-          Write-Host "Downloading LunarG Vulkan SDK $version installer..."
-          Invoke-WebRequest -UseBasicParsing -OutFile $installer `
-              "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
-          if ((Get-Item $installer).Length -lt 10MB) { throw "installer looks too small ($((Get-Item $installer).Length) bytes)" }
+          $buildRoot = Join-Path $env:RUNNER_TEMP 'caustica-shader-tools'
+          if (Test-Path $buildRoot) { Remove-Item -Recurse -Force $buildRoot }
+          New-Item -ItemType Directory -Path $buildRoot | Out-Null
 
-          Write-Host "Installing silently to $installRoot ..."
-          $proc = Start-Process -FilePath $installer -ArgumentList '/S' -PassThru -Wait -NoNewWindow
-          if ($proc.ExitCode -ne 0) { throw "Vulkan SDK installer exited with code $($proc.ExitCode)" }
-          if (-not (Test-Path (Join-Path $sdkRoot 'Bin\glslangValidator.exe'))) {
-              throw "glslangValidator.exe missing at $sdkRoot\Bin after install"
+          Write-Host "Cloning glslang @ vulkan-sdk-1.3.290.0 (pinned)..."
+          git clone --depth 1 --branch vulkan-sdk-1.3.290.0 https://github.com/KhronosGroup/glslang.git (Join-Path $buildRoot 'glslang') 2>&1 | Select-Object -Last 3
+          Write-Host "Cloning SPIRV-Tools @ v2025.5 ..."
+          git clone --depth 1 --branch v2025.5 https://github.com/KhronosGroup/SPIRV-Tools.git (Join-Path $buildRoot 'SPIRV-Tools') 2>&1 | Select-Object -Last 3
+          Write-Host "Cloning SPIRV-Headers (dep)..."
+          git clone --depth 1 --branch vulkan-sdk-1.3.290.0 https://github.com/KhronosGroup/SPIRV-Headers.git (Join-Path $buildRoot 'glslang\External\spirv-tools') 2>&1 | Select-Object -Last 3
+
+          Write-Host "Configuring SPIRV-Tools ..."
+          $spirvBuild = Join-Path $buildRoot 'SPIRV-Tools-build'
+          cmake -S (Join-Path $buildRoot 'SPIRV-Tools') -B $spirvBuild -G Ninja `
+                -DCMAKE_BUILD_TYPE=Release -DSPIRV_WERROR=OFF -DSPIRV_SKIP_TESTS=ON 2>&1 | Select-Object -Last 5
+          Write-Host "Building SPIRV-Tools (spirv-val only) ..."
+          cmake --build $spirvBuild --target spirv-val --config Release 2>&1 | Select-Object -Last 5
+
+          Write-Host "Configuring glslang (with external spirv-tools) ..."
+          $glslangBuild = Join-Path $buildRoot 'glslang-build'
+          cmake -S (Join-Path $buildRoot 'glslang') -B $glslangBuild -G Ninja `
+                -DCMAKE_BUILD_TYPE=Release -DGLSLANG_TESTS=OFF -DENABLE_OPT=OFF -DENABLE_HLSL=OFF `
+                -DENABLE_GLSLANG_BINARIES=ON `
+                -DSPIRV_TOOLS_LIBRARY=$spirvBuild -DSPIRV_INCLUDE_PATH=(Join-Path $buildRoot 'glslang\External\spirv-tools\include') 2>&1 | Select-Object -Last 5
+          Write-Host "Building glslangValidator ..."
+          cmake --build $glslangBuild --target glslangValidator --config Release 2>&1 | Select-Object -Last 5
+
+          $vulkanBin = Join-Path $env:VULKAN_SDK 'Bin'
+          if (-not (Test-Path $vulkanBin)) { New-Item -ItemType Directory -Path $vulkanBin | Out-Null }
+          Copy-Item (Join-Path $spirvBuild 'tools\spirv-val.exe')         (Join-Path $vulkanBin 'spirv-val.exe')         -Force
+          Copy-Item (Join-Path $glslangBuild 'StandAlone\glslangValidator.exe') (Join-Path $vulkanBin 'glslangValidator.exe') -Force
+          Copy-Item (Join-Path $glslangBuild 'StandAlone\glslang.exe')          (Join-Path $vulkanBin 'glslang.exe')          -Force
+
+          foreach ($exe in 'glslangValidator.exe','spirv-val.exe') {
+              $path = Join-Path $vulkanBin $exe
+              if (-not (Test-Path $path)) { throw "$exe missing at $path after build" }
+              & $path --version | Select-Object -First 1 | Write-Host
           }
 
-          Write-Host "Pointing VULKAN_SDK at $sdkRoot for subsequent steps ..."
-          "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "$sdkRoot\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-
-          & (Join-Path $sdkRoot 'Bin\glslangValidator.exe') --version | Select-Object -First 1
-          & (Join-Path $sdkRoot 'Bin\spirv-val.exe')         --version | Select-Object -First 1
+          "VULKAN_SDK=$vulkanBin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$vulkanBin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
