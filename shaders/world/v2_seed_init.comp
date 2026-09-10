@@ -1,0 +1,41 @@
+#version 460
+// ReSTIR PT Enhanced §5 V2-seed initialiser (Lin, Kettunen, Wyman, I3D 2026).
+//
+// Fills the per-pixel V2-identifier seed image (R32 UI, render-res) used by the
+// duplication_map.comp compute pass on the next frame. Each pixel is a PCG-hash of
+// (pixel.coord, frameSeed), so the seed reshuffles every frame but stays deterministic
+// during the frame for the duplication-map pass.
+//
+// Bindings:
+//   0  gV2SeedCurr  (r32ui) writeonly
+//
+// Push:  ivec2 renderSize, uint frameSeed, uint pad → 16 bytes.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, set = 0, r32ui) uniform writeonly uimage2D v2SeedCurr;
+
+layout(push_constant) uniform Push {
+    ivec2 renderSize;
+    uint  frameSeed;
+    uint  pad0;
+} pc;
+
+// 32-bit PCG (xorshift-multiply). Used both for the V2-seed payload and as the per-pixel "tag"
+// the duplication map compares against, so identical seeds hash identically. The frameSeed
+// multiplier rotates the output across frames so duplicate density reshuffles per frame.
+uint pcg32(uint x) {
+    x ^= x >> 16u; x *= 0x85EBCA6Bu;
+    x ^= x >> 13u; x *= 0xC2B2AE35u;
+    x ^= x >> 16u;
+    return x;
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= pc.renderSize.x || px.y >= pc.renderSize.y) {
+        return;
+    }
+    uint seed = pcg32(uint(px.y) * 1973u + uint(px.x) * 9277u + pc.frameSeed * 0x9E3779B9u);
+    imageStore(v2SeedCurr, px, uvec4(seed, 0u, 0u, 0u));
+}

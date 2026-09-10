@@ -1,0 +1,1124 @@
+#version 460
+// GL_GOOGLE_include_directive enables `#include "x.glsl"` for the modular rgen_*.glsl split.
+// Must be requested before any #include directive. (GL_ARB_shading_language_include is the
+// core-profile equivalent but our target_env is vulkan1.2 and the GOOGLE form is what
+// glslangValidator's #include pre-processing actually expects.)
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_tracing : require
+// Per-frame push data is read from a WorldPush BDA buffer addressed by an 8-byte push constant.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// Build two SPIR-V variants from this source. The default uses the cross-vendor
+// GL_EXT_shader_invocation_reorder path (matches VK_EXT_ray_tracing_invocation_reorder).
+// CAUSTICA_SER_NONE targets devices that report `rayTracingInvocationReorder=false` in
+// `VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT` — on Mesa RADV 26.1 the extension
+// is exposed in `vkEnumerateDeviceExtensionProperties` (Mesa ≥25.3 API layer) but the
+// feature struct field is still false until Mesa wires up the actual reorder hardware path.
+// The no-SER variant collapses `hitObjectTraceReorderExecuteEXT` to a plain `traceRayEXT`
+// and `hitObjectEXT` to `float`, so the shader compiles cleanly when SER is unavailable.
+#if defined(CAUSTICA_SER_NONE)
+// No SER: `hitObjectEXT hObj;` becomes a throwaway local and the fused trace/reorder/execute collapses to a
+// single traceRayEXT, which invokes the hit/miss shaders directly (they write `payload`, exactly as the
+// hit-object execute would). visibility()'s hit-object miss query is handled by its own #ifdef branch.
+#define hitObjectEXT float
+#define hitObjectTraceReorderExecuteEXT(hitObject_, topLevel_, rayFlags_, cullMask_, sbtRecordOffset_, sbtRecordStride_, missIndex_, origin_, Tmin_, direction_, Tmax_, payload_) \
+    traceRayEXT(topLevel_, rayFlags_, cullMask_, sbtRecordOffset_, sbtRecordStride_, missIndex_, origin_, Tmin_, direction_, Tmax_, payload_)
+#else
+#extension GL_EXT_shader_invocation_reorder : require
+#endif
+
+// Perspective path tracer. invViewProj = inverse(proj * viewRot) maps clip to camera-relative world.
+// Primary rays are reconstructed from two unprojected points (near and far plane) rather than assuming
+// the eye is at the origin: Minecraft bakes view bobbing into the projection, so the effective eye comes
+// from the matrix. camOffset shifts camera-relative space into the terrain's rebased coordinates. Depth is
+// reversed-Z (near=1, far=0).
+//
+// Lighting is an iterative path-tracing loop in raygen, not recursion from closest-hit, so
+// maxRayRecursionDepth stays 1. At each surface vertex:
+//   * NEE toward the sun — a single analytic directional light, gated by one hit-object visibility query
+//     (TerminateOnFirstHit | SkipClosestHit). Lambertian BRDF = albedo/PI.
+//   * a cosine-weighted Lambertian continuation ray (throughput *= albedo; the PI and cos cancel).
+// Sky / ambient light needs no separate AO pass: continuation rays that escape land in world.rmiss,
+// which returns sky radiance — so soft sky fill and contact AO both fall out of the path integral.
+// Russian roulette terminates deep paths. Output is HDR (R16G16B16A16_SFLOAT); the HDR -> LDR tonemap
+// happens later at the display.comp seam.
+//
+// Each frame emits a single SPP-averaged (still noisy) estimate; temporal convergence is the
+// denoiser's job. With RR disabled the output is the raw noisy path trace — a reference view, not a
+// converged image.
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+// HDR trace target (B10G11R11_UFLOAT, 32bpp pure RGB): linear radiance may exceed 1. The
+// HDR -> LDR tonemap happens later, at the display.comp seam, not here.
+layout(binding = 1, set = 0, r11f_g11f_b10f) uniform image2D outImage;
+// Guide buffers — first-hit (primary-visibility) attributes consumed by temporal reconstruction. Written
+// every frame regardless of accumulation. gNormal.w carries roughness; gDepth carries HW reversed-Z depth.
+layout(binding = 3, set = 0, rgba16f) uniform image2D gNormal; // xyz world normal, w roughness
+layout(binding = 4, set = 0, rgba16f) uniform image2D gAlbedo; // rgb diffuse albedo
+layout(binding = 5, set = 0, r32f)    uniform image2D gDepth;  // r HW reversed-Z depth (near=1, far/sky~0)
+layout(binding = 6, set = 0, rgba16f) uniform image2D gMotion;    // xy screen MV (px), z = viewZprev-viewZ
+layout(binding = 7, set = 0, rgba16f) uniform image2D gSpecAlbedo; // specular albedo (0 — diffuse-only)
+layout(binding = 8, set = 0, rg16f)   uniform image2D gSpecMotion; // reflection motion vectors for RR
+// Split lighting for official FFX Denoiser (P1):
+//   gShadowHit   — primary NEE sun visibility [0,1]
+//   gDiffuse     — diffuse indirect/secondary lighting (primary directional NEE excluded)
+//   gReflection  — specular NEE + specular-path radiance
+layout(binding = 9, set = 0, r8)      uniform image2D gShadowHit;
+layout(binding = 10, set = 0, rgba16f) uniform image2D gDiffuse;
+layout(binding = 11, set = 0, rgba16f) uniform image2D gReflection;
+// ReSTIR DI bindings (12-14) + light-field SSBO (15):
+// firstExtraBinding=3 → slots 9/10/11/12 = bindings 12/13/14/15
+layout(binding = 12, set = 0) readonly buffer BlockLights {
+    vec4 lights[]; // xyz = position, w = packed (intensity, colorRGB)
+} blockLights;
+layout(binding = 13, set = 0, rgba32ui) uniform uimage2D gReservoirCurr;
+layout(binding = 14, set = 0, rgba32ui) uniform uimage2D gReservoirPrev;
+// Packed vanilla light field: each byte = (sky<<4)|block, XYZ order, size³ cells.
+layout(binding = 15, set = 0) readonly buffer LightField {
+    uint cells[]; // 4 cells packed per uint (little-endian bytes)
+} lightField;
+// ReSTIR GI bindings (16-19): two rgba32f images per reservoir slot for dir+wSum/M+age+targetPdf.
+layout(binding = 16, set = 0, rgba32f) uniform image2D gGiReservoirCurrA;
+layout(binding = 17, set = 0, rgba32f) uniform image2D gGiReservoirCurrB;
+layout(binding = 18, set = 0, rgba32f) uniform image2D gGiReservoirPrevA;
+layout(binding = 19, set = 0, rgba32f) uniform image2D gGiReservoirPrevB;
+// Cross-vendor standard RT outputs. Diffuse/specular radiance + hit distance remain at 10/11.
+layout(binding = 20, set = 0, rgba16f) uniform image2D gClearEmission;
+layout(binding = 21, set = 0, rgba16f) uniform image2D gTransmission;
+layout(binding = 22, set = 0, r32f) uniform image2D gViewZ;
+layout(binding = 23, set = 0, rgba8) uniform image2D gConfidenceDisocclusion;
+layout(binding = 25, set = 0, rgba16f) uniform image2D gUnshadowedDirect;
+layout(binding = 24, set = 0, r32ui) uniform uimage2D gMaterialFlags;
+// Tile-jitter guide for post-process reprojection correction (v0.6.8+).
+// R8G8_UNORM, encoded as tileJitter + 0.5 so the [-0.5, +0.5] render-pixel range
+// maps to [0, 1]. NRD's pre-warp pass reads this and re-samples the current frame's
+// NRD input by -tileJitter/size so NRD's internal reprojection lines up with the
+// actual per-tile-quantized sampling pattern used here.
+layout(binding = 26, set = 0, rg8) uniform image2D gJitterGuide;
+// ReSTIR PT Enhanced §5 duplication map (Lin, Kettunen, Wyman §5). The temporal merge reads
+// gDupMapPrev (last frame's per-pixel V2-match ratio, R8 UNORM) to gate the M-cap formula
+// `mCap = mix(c_default, c_min, pow(D, alpha))`. Pixels in a homogeneous neighbourhood reuse
+// history aggressively; pixels in a heterogeneous neighbourhood cap reuse tightly. The
+// duplication_map compute pass writes gDupMapCurr each frame; the per-frame ping-pong swap
+// in RtComposite moves it into gDupMapPrev for the next frame.
+layout(binding = 27, set = 0, r8) uniform readonly image2D gDupMapCurr;
+layout(binding = 28, set = 0, r8) uniform readonly image2D gDupMapPrev;
+// ReSTIR PT Enhanced §4 footprint-based reconnection. World-space hit positions, ping-pong, used
+// by the temporal merge to compute Δx = hitPos_current − hitPos_neighbor. The DI reservoir is 16 B
+// packed (1× uvec4) and has no room for an extra vec3, so hit position lives in a parallel image
+// with the same lifetime as the reservoir itself. R32G32B32A32_FLOAT — xyz is the hit position
+// in terrain-rebased space, w is unused. The same ping-pong cadence means the temporal merge
+// reads gHitPosPrev (binding 30) at the *previous* reservoir's pixel; the spatial merge reads
+// gHitPosPrev (last frame) for the neighbor's projection radius.
+layout(binding = 29, set = 0, rgba32f) uniform image2D gHitPosCurr;
+layout(binding = 30, set = 0, rgba32f) uniform readonly image2D gHitPosPrev;
+
+// Per-frame push data lives in a host-visible BDA buffer; only its 8-byte address is pushed. The std430
+// layout must match RtComposite. Raygen loads it once into the `pc` global at the top of main().
+struct WorldPush {
+    mat4 invViewProj;          // 0
+    vec3 camOffset;            // 64
+    uint64_t tableAddr;        // 80  closest-hit/any-hit section table (raygen ignores it)
+    uint debugView;            // 88  0=render,1=normals,2=albedo,3=depth,4=roughness,5=motion,6=specular,7=spec motion
+    uint frameIndex;           // 92  per-frame RNG variation for the denoiser's temporal reuse
+    mat4 prevViewProj;         // 96  previous-frame camera-relative view-projection
+    vec3 camDelta;             // 160 curCam - prevCam
+    uint spp;                  // 172 samples per pixel this frame (>=1); low for the RR-denoised path
+    vec2 jitter;               // 176 sub-pixel jitter, render px (+ on the ray, - reported to RR)
+    uint64_t entityTableAddr;  // 184 entity geometry table (closest-hit/any-hit)
+    uint flags;                // 192 bit0 = camera submerged, bit1 = PBR BRDF enabled, bit4 = water waves
+    uint maxBounces;           // 196 path depth cap; RR starts at bounce 1 when <=3, otherwise 2
+    float maxRayDistance;      // 200 maximum ray tracing distance (performance optimization)
+    vec4 sunDir;               // 208 xyz true sun direction (sky glow/disc), w dayFactor 0..1
+    vec4 lightDir;             // 224 xyz active NEE light dir (sun above horizon else moon), w = square half-angle (rad)
+    vec4 lightRadiance;        // 240 xyz HDR radiance of the active light (warm/dim low, white high)
+    vec4 moonDir;              // 256 xyz moon direction, w moonPhase; the disc lives in world.rmiss
+    vec4 celestial;            // 272 xyz celestial rotation axis (NEE square + disc frame), w star drift
+    vec4 sunUv;                // 288 sky: vanilla sun sprite UV rect (rgen ignores — padding to keep offsets)
+    vec4 moonUv;               // 304 sky: vanilla moon sprite UV rect (rgen ignores — padding)
+    vec4 waterParams;          // 320 xyz = camera-biome water tint; w = wave time (s)
+    vec4 waterAnchor;          // 336 xy = world-stable wave-domain anchor (terrain origin mod 4096); zw unused
+    mat4 curViewProj;          // 352 forward camera-relative view-projection (= inverse(invViewProj)); HW depth + water MV
+    // Block-breaking overlay: breakCount(@416) + breaking[MAX_BREAKING](@432, 16B each = 128B total)
+    // ReSTIR DI parameters (@560 = 432 + 8*16)
+    uint blockLightCount;      // 560 number of block lights in the buffer
+    uint restirCandidates;     // 564 candidate samples per pixel (default 8)
+    float restirMaxMTemporal;  // 568 max temporal M clamp (default 20.0)
+    float restirMaxMSpatial;   // 572 max spatial M clamp (default 100.0)
+    // Light-field GI base (@576): origin in rebased space + edge size (0 = disabled)
+    ivec4 lightFieldOriginSize; // xyz = origin (rebased blocks), w = size
+    // ReSTIR GI parameters (@592)
+    uint giEnabled;             // 592 master switch (0 = off, fall back to hemisphere ambient)
+    uint giCandidates;          // 596 candidate samples per pixel this frame (default 2)
+    float giMaxMTemporal;       // 600 max temporal M clamp (default 6.0)
+    float giMaxMSpatial;        // 604 max spatial M clamp (default 24.0)
+    // GI ambient fallback (@608, 16 bytes)
+    vec4 giAmbientParams;       // 608 x = hemisphere sky scale, y = hemisphere ground scale, z = lightfield blend, w = spare
+    // Hybrid rendering fast-path (@624, 4 bytes)
+    uint hybridEnabled;         // 624 master switch (0 = always RT, 1 = skip DI/GI for simple opaque bounces)
+    float hybridRoughThreshold; // 628 surfaces rougher than this skip RT when no nearby lights (default 0.5)
+    float hybridLightfieldThreshold; // 632 lightfield block level above which RT runs anyway (default 0.05)
+    // 636 (was hybridPad). When the ReSTIR PT Enhanced §3 paired spatial-reuse compute pass is
+    // active, this is set to 1 and the inline 9-tap spatial merge in generateCandidatesDI() is
+    // skipped — the compute pass has already merged the partner reservoir into the current
+    // pixel before this raygen executes. 0 preserves the original inline-9-tap path for the
+    // fallback when paired reuse is disabled.
+    uint pairedReuseActive;
+    // ReSTIR PT Enhanced §4 footprint-based reconnection (Lin et al. §4). When non-zero, the
+    // legacy 40-px hard motion threshold in temporalReuse is replaced by the configurable
+    // projection-radius test: Rp = sqrt(|Δx|² · cosθ / 4π) is rejected when larger than
+    // c * maxFootprint, where maxFootprint = viewZ * pixelsToWorld and c = 0.02 (paper
+    // constant). The motion cap stays as a safety net so the projection test is additive,
+    // not strictly replacing — disable both to fall back to the legacy roughness/distance
+    // heuristic. The previous hit position needed to compute Δx is read from gHitPosPrev
+    // (binding 30) and the current hit position is written to gHitPosCurr (binding 29) at
+    // every reservoir write site.
+    uint footprintReconnectionActive; // 640
+    float footprintMotionCapPx;      // 644
+    float pixelsToWorld;             // 648  2 * tan(fov_y/2) / screen_height — precomputed per resize
+    uint quarterResReservoir;        // 652  1 = DI+hitpos reservoirs at half res (1 per 2x2 tile)
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WorldPushRef { WorldPush v; };
+layout(push_constant) uniform PushAddr { uint64_t worldPushAddr; } pcAddr;
+WorldPush pc; // populated from the BDA buffer at the top of main()
+
+// First-hit (primary-visibility) guide attributes, captured at bounce 0 of tracePath. The primary ray
+// is deterministic (no AA jitter yet), so every SPP sample's bounce 0 yields identical values.
+vec3 gv_normal;
+vec3 gv_albedo;
+vec3 gv_specAlb; // specular albedo guide for specular demodulation (0 = pure diffuse).
+float gv_rough;
+float gv_metalness;  // primary surface metalness (for adaptive firefly clamping)
+float gv_emission;   // primary surface emission strength (for emissive-adjacent firefly suppression)
+uint gv_material;     // explicit closest-hit material class; never inferred from roughness
+// Linear VIEW-SPACE depth (perpendicular distance from the camera plane), computed in main() from
+// gv_hitCamRel · camForward — linear view depth, not the slant ray distance
+// length. Always >= 0; sky resolves to a large far value (no negative sentinel).
+float gv_depth;
+vec3 gv_hitCamRel;  // primary-surface hit position relative to the current camera (also the depth guide)
+vec3 gv_motionHitCamRel; // motion-guide hit position; water tracks the refracted hit instead
+bool gv_motionUseRefracted; // true when the MV tracks the refracted hit (its own reprojection delta)
+// World-space displacement of the motion-guide surface since the previous frame (0 for static
+// terrain/sky, an entity's per-vertex/object motion for a dynamic hit). Subtracted from the MV
+// reprojection so moving geometry gets correct motion vectors instead of the camera-only reprojection.
+vec3 gv_motionObjDisp;
+
+struct Payload {
+    vec3 albedo;    // hit: block albedo (atlas * tint). miss: sky radiance.
+    vec3 normal;    // hit: geometric normal, oriented toward the viewer.
+    float hitT;     // >= 0 on hit (ray length), < 0 on miss.
+    vec3 motionPrev; // hit: per-vertex world displacement since last frame (entity/BE MV); 0 otherwise.
+    vec3 f0;         // specular F0 (set by the chit: dielectric 0.04 / LabPBR green / metal).
+    uint flags;       // bits 0..1 = material, bit 2 = show celestial disc on miss
+    uint roughMetal;  // packHalf2x16(vec2(roughness, metalness))
+    uint emissionSss; // packHalf2x16(vec2(emission, sss))
+    uint rayCone;     // packHalf2x16(vec2(width, spread))
+};
+layout(location = 0) rayPayloadEXT Payload payload;
+// Shadow / sun-visibility ray payload. `tint` and `waterT` were previously the .rgb / .a of a vec4; they are
+// split into a struct so the no-SER path can carry a dedicated `escaped` flag (written by shadow.rmiss)
+// WITHOUT clobbering the water-crossing t the water any-hit records — the two used to collide on the .a lane.
+struct ShadowRay {
+    vec3 tint;      // colored-glass / water shadow transmittance (accumulated by world.rahit)
+    float waterT;   // nearest water-crossing t along the shadow ray; -1 = none
+    float escaped;  // no-SER path only: 1.0 once the ray reaches shadow.rmiss (sun-visible), else 0.0
+};
+layout(location = 1) rayPayloadEXT ShadowRay shadowVis;
+
+// ============================================================================
+// Modular includes — each rgen_*.glsl file is a self-contained GLSL chunk
+// guarded by its own #ifndef. They are pasted into this rgen at compile time via
+// glslangValidator's built-in #include (searched relative to this source file).
+// MUST come AFTER the binding / payload / WorldPush / gv_* declarations above —
+// rgen_common.glsl references `payload` and `pc`, so the declarations must be
+// visible by the time the includes are pasted.
+//
+// Include order matches the dependency graph:
+//   rgen_common      — payload accessors, PCG RNG, SBT/CULL constants, material flags, PI
+//   rgen_brdf        — GGX, Fresnel, primary-ray construction, importance samplers
+//   rgen_water       — water / glass dielectric + animated wave field
+//   rgen_nee         — shadow visibility + reflection MV projection
+//   rgen_restir_di   — ReSTIR DI for block lights + vanilla light-field SSBO
+//   rgen_restir_gi   — ReSTIR GI (direction-based), hemisphere ambient, hybrid fast-path
+//
+// world.rgen itself only defines the push-data / bindings / payloads / globals /
+// PathAccum struct / tracePath / main. Helpers come from the includes above.
+// ============================================================================
+#include "rgen_common.glsl"
+#include "rgen_brdf.glsl"
+#include "rgen_nee.glsl"
+#include "rgen_restir_di.glsl"
+#include "rgen_water.glsl"
+#include "rgen_restir_gi.glsl"
+
+// Split path radiance for official FFX Denoiser + hybrid NRD prep.
+// unshadowedDirect: bounce-0 diffuse NEE without visibility (× primaryShadow / denoised mask in composite)
+// diffuseOther: multi-bounce NEE (raw vis), GI, emission, non-specular sky, SSS (own vis)
+// specular: Cook-Torrance NEE * vis + specular-lobe path continuation
+// primaryShadow: bounce-0 NEE visibility scalar (1 = fully lit / sky / no NEE)
+// hitDistDiffuse / hitDistSpecular: NRD hit-distance (meters-ish); 0 if unknown
+// Energy: undenoised = unshadowedDirect * primaryShadow + diffuseOther + specular
+struct PathAccum {
+    vec3 unshadowedDirect;
+    vec3 diffuseOther;
+    vec3 specular;
+    vec3 clearRadiance;
+    vec3 emission;
+    vec3 transmission;
+    float primaryShadow;
+    float hitDistDiffuse;
+    float hitDistSpecular;
+};
+
+// One Monte Carlo path from (ro, rd). Returns split radiance + primary shadow.
+PathAccum tracePath(vec3 ro, vec3 rd, float primaryConeSpread, inout uint seed) {
+    PathAccum acc;
+    acc.unshadowedDirect = vec3(0.0);
+    acc.diffuseOther = vec3(0.0);
+    acc.specular = vec3(0.0);
+    acc.clearRadiance = vec3(0.0);
+    acc.emission = vec3(0.0);
+    acc.transmission = vec3(0.0);
+    acc.primaryShadow = 1.0;
+    acc.hitDistDiffuse = 0.0;
+    acc.hitDistSpecular = 0.0;
+    vec3 throughput = vec3(1.0);
+    // After a specular (GGX / dielectric) bounce, further path energy is specular-path.
+    bool pathIsSpecular = false;
+    bool pathIsTransmission = false;
+    float rayConeWidth = 0.0;
+    float rayConeSpread = max(primaryConeSpread, RAY_CONE_MIN_SPREAD);
+    int maxBounces = int(pc.maxBounces);
+    int rrStart = maxBounces <= 3 ? 1 : 2;
+    bool pbr = (pc.flags & 2u) != 0u; // GGX BRDF + material guides, else Lambertian fallback
+    // Start submerged if the camera is in water so the first segment gets the right medium orientation and
+    // absorption when the eye is underwater.
+    bool inWater = (pc.flags & 1u) != 0u;
+    // Current medium extinction. Defaults to the camera-biome tint (correct when the eye starts
+    // submerged, before any water surface is hit); refreshed to the hit water body's tint on each crossing.
+    vec3 waterExt = waterExtinction(pc.waterParams.xyz);
+    bool waterWaves = (pc.flags & 16u) != 0u; // animated wave-normal perturbation
+    // Sky-disc gate (see world.rmiss): the sun/moon disc is shown to the primary ray and to rays spawned
+    // by a specular/dielectric bounce (mirror reflections + refractions of the sun/moon), but hidden from
+    // diffuse-sampled continuation rays — those are already covered by the sun NEE, so the tiny disc would
+    // be a double-counted firefly. Reset true on every specular/water bounce, set false on a diffuse one.
+    bool showCelestial = true;
+    for (int bounce = 0; bounce <= maxBounces; bounce++) {
+        payload.hitT = -1.0;
+        payloadSetTraceState(showCelestial, rayConeWidth, rayConeSpread);
+        // Radiance SBT records run any-hit only for true alpha cutout. Translucent/water go straight to
+        // closest-hit for dielectric handling. Geometry is double-sided; the chit flips the normal.
+        // Primary (bounce 0) is the camera ray (CULL_PRIMARY): sees particles but not the first-person
+        // player. Bounce rays are secondary (CULL_SECONDARY): exclude particles, include the player.
+        // SER: trace into a hit object, reorder threads by hit coherence, THEN invoke the hit/miss shader —
+        // this is where the divergent Section/Prim shading work (world.rchit/world.rahit) actually happens,
+        // so reordering before it is what pays for the reorder's own cost.
+        hitObjectEXT hObj;
+        hitObjectTraceReorderExecuteEXT(hObj, topLevelAS, gl_RayFlagsNoneEXT, bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY,
+                    SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, ro, 0.0, rd, 10000.0, 0);
+
+        if (payload.hitT < 0.0) {
+            // world.rmiss writes sky radiance (gradient + sun/moon disc + stars) into payload.albedo. The
+            // packed show-celestial flag decides whether this path segment may see the bright disc.
+            vec3 sky = payload.albedo;
+            if (bounce == 0) { // primary ray hit sky: guides describe "no surface"
+                acc.clearRadiance += clampToMaxBounce(throughput * sky);
+                gv_normal = vec3(0.0);
+                // Flat mid-grey albedo guide for sky (NOT the bright sky radiance): demodulating reconstruction
+                // by the huge sun-disc radiance rings/artifacts around the sun. A constant albedo keeps the
+                // brightness in the lighting channel where RR resolves it cleanly.
+                gv_albedo = SKY_DIFF_ALBEDO;
+                gv_specAlb = SKY_SPEC_ALBEDO;
+                gv_rough = 1.0;
+                gv_metalness = 0.0;  // sky is non-metallic
+                gv_emission = 0.0;   // sky emission handled separately
+                gv_material = MATERIAL_OPAQUE;
+                gv_hitCamRel = rd * 1.0e6; // sky at infinity: only rotation parallax (-> large far depth)
+                gv_motionHitCamRel = gv_hitCamRel;
+                gv_motionUseRefracted = false;
+                gv_motionObjDisp = vec3(0.0); // sky is static
+            }
+            if (bounce == 0) {
+                // Primary miss belongs exclusively to ClearRadiance.
+            } else if (pathIsTransmission) {
+                acc.transmission += clampToMaxBounce(throughput * sky);
+            } else if (pathIsSpecular) {
+                acc.specular += clampToMaxBounce(throughput * sky);
+            } else if (pc.lightFieldOriginSize.w > 0) {
+                // Light-field already owns most ambient; keep residual RT sky fill for colour.
+                acc.diffuseOther += clampToMaxBounce(throughput * sky * LIGHTFIELD_RT_RESIDUAL);
+            } else {
+                acc.diffuseOther += clampToMaxBounce(throughput * sky);
+            }
+            break;
+        }
+
+        // Beer–Lambert: attenuate along the segment just travelled if it lay inside water. Applied to
+        // every hit reached while submerged (the water-exit face or the underwater floor), shifting the
+        // transmitted radiance with depth.
+        if (inWater) {
+            throughput *= exp(-waterExt * payload.hitT);
+        }
+
+        vec3 n = payload.normal; // oriented toward the incoming ray by the closest-hit
+        vec3 hitPos = ro + rd * payload.hitT;
+        rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0), RAY_CONE_MIN_WIDTH);
+        uint material = payloadMaterial();
+
+        // True secondary-ray segment length, classified by the lobe that spawned this ray.
+        // Do not substitute primary range or scale by brightness/roughness/material.
+        if (bounce > 0) {
+            if (pathIsSpecular && acc.hitDistSpecular <= 0.0) {
+                acc.hitDistSpecular = max(payload.hitT, 0.0);
+            } else if (!pathIsSpecular && acc.hitDistDiffuse <= 0.0) {
+                acc.hitDistDiffuse = max(payload.hitT, 0.0);
+            }
+        }
+
+        // Stained glass / ice (material 3): a thin colored dielectric. Stochastically
+        // reflect (Fresnel glint) or transmit; on transmission the throughput is multiplied by the pane's
+        // tint, so light passing through is colored (red glass reddens what is behind it). payload.albedo is
+        // the transmission tint (texel rgb mixed toward white by 1 − opacity). Treated as a thin pane, so the
+        // transmitted ray continues straight (no refraction bend) — like the particle path, the instance
+        // stays double-sided and the normal already faces the incoming ray.
+        if (material == MATERIAL_GLASS) {
+            vec3 glassTint = payload.albedo;
+            float cosI = clamp(dot(-rd, n), 0.0, 1.0);
+            float F = fresnelDielectric(cosI, 1.0, GLASS_IOR);
+            if (bounce == 0) { // primary glass/ice: always both lobes (SPP-1 dark-ice fix)
+                gv_normal = n;
+                gv_rough = GLASS_GUIDE_ROUGH;
+                gv_metalness = 0.0;  // glass is dielectric
+                gv_emission = 0.0;   // glass doesn't emit
+                gv_material = MATERIAL_GLASS;
+                gv_specAlb = vec3(F);
+                gv_albedo = glassTint;
+                gv_hitCamRel = hitPos - pc.camOffset;
+                gv_motionHitCamRel = gv_hitCamRel;
+                gv_motionUseRefracted = false;
+                gv_motionObjDisp = payload.motionPrev;
+                // Deterministic Fresnel split: reflection every frame + transmit with (1-F)*tint.
+                vec3 rdir = reflect(rd, n);
+                float mirrorHitDistance;
+                acc.specular += clampToMaxBounce(throughput * F
+                        * mirrorLobeRadiance(hitPos + n * SURF_BIAS, rdir, rayConeWidth,
+                                rayConeSpread, mirrorHitDistance));
+                acc.hitDistSpecular = mirrorHitDistance;
+                throughput *= (1.0 - F) * glassTint;
+                ro = hitPos - n * GLASS_TRANSMIT_BIAS;
+                showCelestial = true;
+                pathIsSpecular = true;
+                pathIsTransmission = true;
+                continue;
+            }
+            if (rndf(seed) < F) {
+                rd = reflect(rd, n);
+                ro = hitPos + n * SURF_BIAS;
+                pathIsTransmission = false;
+            } else {
+                throughput *= glassTint;
+                ro = hitPos - n * GLASS_TRANSMIT_BIAS;
+                pathIsTransmission = true;
+            }
+            showCelestial = true;
+            pathIsSpecular = true;
+            if (bounce >= rrStart) {
+                float q = clamp(maxChannel(throughput), RR_Q_MIN, RR_Q_MAX);
+                if (rndf(seed) > q) {
+                    break;
+                }
+                throughput /= q;
+            }
+            continue;
+        }
+
+        // Particles (material == 2): camera-facing receiver billboard. The instance mask keeps particles
+        // off secondary rays, so this only fires at bounce 0; they receive direct light and one diffuse path
+        // continuation into the scene, but never appear in shadows/reflections/GI or emit radiance.
+        if (material == MATERIAL_PARTICLE) {
+            vec3 albedo = payload.albedo;
+            gv_normal = n;
+            gv_albedo = albedo; // RR demodulation target = the particle texel (keeps it sharp)
+            gv_specAlb = vec3(0.0);
+            gv_rough = 1.0;
+            gv_metalness = 0.0;  // particles are non-metallic
+            gv_emission = 0.0;   // particles don't emit
+            gv_material = MATERIAL_PARTICLE;
+            gv_hitCamRel = hitPos - pc.camOffset;
+            gv_motionHitCamRel = gv_hitCamRel;
+            gv_motionUseRefracted = false;
+            gv_motionObjDisp = payload.motionPrev; // per-particle MV: de-ghost moving particles
+
+            vec3 lightDir = pc.lightDir.xyz;
+            float lightHalfAngle = pc.lightDir.w;
+            // DETERMINISTIC SUN NEE (v0.6.4): disabled soft-disc sampling for particles too
+            // if (lightHalfAngle > 0.0) {
+            //     lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
+            // }
+            // Billboards are effectively two-sided receivers. Bias from the side facing the light; shadow rays
+            // exclude particles anyway, but this keeps the origin sane when the light is behind the camera side.
+            float signedNdl = dot(n, lightDir);
+            float ndl = abs(signedNdl);
+            if (ndl > 0.0) {
+                vec3 shadowOrigin = hitPos + (signedNdl >= 0.0 ? n : -n) * SURF_BIAS;
+                vec3 vis = visibility(shadowOrigin, lightDir, pc.maxRayDistance);
+                float sh = maxChannel(vis);
+                vec3 diffNee = throughput * albedo * INV_PI * pc.lightRadiance.xyz * ndl;
+                if (bounce == 0) {
+                    acc.primaryShadow = sh;
+                    // Unshadowed primary NEE (shadow applied in composite after FFX Shadow Denoiser).
+                    acc.unshadowedDirect += diffNee;
+                } else {
+                    acc.diffuseOther += diffNee * vis;
+                }
+            }
+
+            if (bounce >= maxBounces) {
+                break;
+            }
+            throughput *= albedo;
+            ro = hitPos + n * SURF_BIAS;
+            rd = cosineDir(n, seed);
+            rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
+            showCelestial = false; // diffuse receiver: direct sun/moon was handled by NEE above
+            pathIsSpecular = false;
+            pathIsTransmission = false;
+            continue;
+        }
+
+        // Water: smooth dielectric interface. Secondary hits still choose reflect/refract by F
+        // (unbiased). Primary hits always evaluate BOTH lobes — SPP-1 looking down has F≈0.02 so
+        // pure stochastic sampling almost never shows sky reflections → black lakes. On
+        // transmission, the new medium is read from this hit's face orientation (payloadWaterEntering),
+        // not toggled — a stray/missing face no longer desyncs the rest of the path.
+        if (material == MATERIAL_WATER) {
+            // Ripple the (near-flat) surface normal before any Fresnel/guide use → glints, broken
+            // reflections, wobbling refraction. This water body's biome tint (carried in payload.albedo
+            // for water hits) sets the absorption applied to the next submerged segment.
+            vec3 interfaceN = n;
+            if (waterWaves) {
+                // World-stable wave domain: rebased hit XZ + the pushed anchor (terrain origin mod 4096)
+                // reconstructs a world-pinned coordinate that survives the per-move terrain rebase.
+                n = applyWaterWaves(n, hitPos.xz + pc.waterAnchor.xy, pc.waterParams.w);
+            }
+            waterExt = waterExtinction(payload.albedo);
+            float cosI = clamp(dot(-rd, n), 0.0, 1.0);
+            float etaI = inWater ? WATER_IOR : 1.0;
+            float etaT = inWater ? 1.0 : WATER_IOR;
+            float F = fresnelDielectric(cosI, etaI, etaT);
+
+            if (bounce == 0) {
+                gv_normal = n;
+                gv_rough = WATER_GUIDE_ROUGH;
+                gv_metalness = 0.0;  // water is dielectric
+                gv_emission = 0.0;   // water doesn't emit
+                gv_material = MATERIAL_WATER;
+                gv_hitCamRel = hitPos - pc.camOffset;
+                // Surface MV (not refracted floor): NRD/TAA reproject the water *plane*. Tracking
+                // the underwater hit made reflections + the surface smear when the camera moved.
+                gv_motionHitCamRel = gv_hitCamRel;
+                gv_motionUseRefracted = false;
+                gv_motionObjDisp = vec3(0.0);
+                // Albedo guides still prefer the refracted content for RR demodulation detail.
+                vec3 refractedAlbedo;
+                vec3 refractedSpecAlbedo;
+                vec3 _mhc;
+                vec3 _mod;
+                bool _usedRefr;
+                refractedGuideHit(hitPos, rd, n, inWater, rayConeWidth, rayConeSpread,
+                        _mhc, _mod, _usedRefr, refractedAlbedo, refractedSpecAlbedo);
+                gv_albedo = max(refractedAlbedo, payload.albedo * 0.25);
+                gv_specAlb = max(refractedSpecAlbedo, vec3(max(F, 0.04)));
+
+                // Always add Fresnel reflection (sky / shore) this frame.
+                // Water F0 ≈ 0.02 (physical IOR=1.33) — at near-normal incidence the reflection is ~2% of
+                // the scene, which after moon NEE + lightfield GI goes mostly black at night and the user
+                // reads it as "reflection color tone doesn't match the scene". Vanilla MC uses a
+                // stylized reflectivity floor (~10%) so reflections stay visible at every viewing angle.
+                // Match that by clamping F to a minimum — keeps the grazing-angle falloff (F→1) but
+                // lifts the near-normal floor so trees / shore / moon actually show up in the water.
+                vec3 rdir = reflect(rd, n);
+                float fRefl = max(F, 0.10);
+                float mirrorHitDistance;
+                acc.specular += clamp(throughput * fRefl
+                        * mirrorLobeRadiance(hitPos + n * SURF_BIAS, rdir, rayConeWidth,
+                                rayConeSpread, mirrorHitDistance), vec3(0.0), vec3(MAX_BOUNCE_RADIANCE));
+                acc.hitDistSpecular = mirrorHitDistance;
+
+                // Biome body fill: pure dielectric + deep absorption reads as vacuum black.
+                // A mild surface-ish term recovers vanilla-like blue without killing depth.
+                float bodyW = (1.0 - F) * 0.22;
+                vec3 bodyLit = max(pc.lightRadiance.xyz, vec3(0.0)) * 0.12 + vec3(0.035);
+                acc.diffuseOther += clampToMaxBounce(throughput * payload.albedo * bodyW * bodyLit);
+
+                // Continue only through refraction with residual weight (or TIR → done).
+                vec3 tdir = refract(rd, n, etaI / etaT);
+                if (dot(tdir, tdir) > 0.0) {
+                    rd = normalize(tdir);
+                    ro = hitPos - interfaceN * SURF_BIAS;
+                    inWater = payloadWaterEntering();
+                    throughput *= (1.0 - F);
+                    showCelestial = true;
+                    pathIsSpecular = true;
+                    pathIsTransmission = true;
+                    continue;
+                }
+                // Total internal reflection already counted in F≈1 reflection above.
+                break;
+            }
+
+            // Secondary water interfaces: unbiased stochastic choice.
+            if (rndf(seed) < F) {
+                rd = reflect(rd, n);
+                ro = hitPos + interfaceN * SURF_BIAS;
+                pathIsTransmission = false;
+            } else {
+                rd = refract(rd, n, etaI / etaT);
+                ro = hitPos - interfaceN * SURF_BIAS;
+                inWater = payloadWaterEntering();
+                pathIsTransmission = true;
+            }
+            showCelestial = true;
+            pathIsSpecular = true;
+            if (bounce >= rrStart) {
+                float q = clamp(maxChannel(throughput), RR_Q_MIN, RR_Q_MAX);
+                if (rndf(seed) > q) {
+                    break;
+                }
+                throughput /= q;
+            }
+            continue;
+        }
+
+        vec3 albedo = payload.albedo;
+        float sss = payloadSss(); // LabPBR SSS strength (0 when absent; non-zero only for _s-mapped terrain/entities)
+        vec3 p = hitPos + n * SURF_BIAS;
+        vec3 v = -rd; // view direction (toward the camera / incoming ray)
+
+        // Material split. Metals tint F0 by albedo and have no diffuse lobe; dielectrics use a fixed F0.
+        // With PBR disabled this collapses to the Lambertian fallback.
+        float rough = pbr ? clamp(payloadRoughness(), MIN_ROUGH, 1.0) : 1.0;
+        float metal = pbr ? clamp(payloadMetalness(), 0.0, 1.0) : 0.0;
+        vec3 diffAlb = albedo * (1.0 - metal);
+        // F0 from chit (dielectric / LabPBR / metal). Tone down dielectrics so sand/wood/stone
+        // don't read as plastic under desert sun (vanilla is almost purely diffuse).
+        vec3 F0 = pbr ? payload.f0 : mix(vec3(0.02), albedo, metal);
+        if (pbr && metal < 0.5) {
+            // Cap dielectric F0 (LabPBR green can be high) and use a lower default sheen.
+            F0 = min(F0, vec3(0.06)) * 0.55;
+            // Extra matte for rough terrain: sand/dirt/planks (rough~0.9) almost lose specular.
+            float matte = smoothstep(0.35, 0.95, rough);
+            F0 *= mix(1.0, 0.25, matte);
+        }
+
+        if (bounce == 0) { // primary-visibility surface: capture the denoiser guide buffers
+            gv_normal = n;
+            gv_albedo = pbr ? diffAlb : albedo;  // RR diffuse-albedo demodulation target
+            gv_rough = rough;
+            gv_metalness = payloadMetalness();  // for adaptive firefly clamping
+            gv_emission = payloadEmission();    // for emissive-adjacent firefly suppression
+            gv_material = material;
+            gv_specAlb = pbr ? rrSpecularAlbedo(F0, rough * rough, dot(n, v)) : vec3(0.0);
+            gv_hitCamRel = ro + rd * payload.hitT - pc.camOffset; // camera-relative hit position
+            gv_motionHitCamRel = gv_hitCamRel;
+            gv_motionUseRefracted = false;
+            gv_motionObjDisp = payload.motionPrev; // per-vertex world motion (0 for static terrain/sky)
+        }
+
+        // Emissive surfaces (lava, glowstone, torches, ...) add radiance directly, colored by albedo.
+        // Keep only a PRIMARY-visible emitter in the clear plate: that signal is deterministic and must
+        // retain texture detail. A secondary path that happens to hit a small emitter is a high-variance
+        // indirect-light sample; composing it through acc.emission bypasses NRD and produces the colored
+        // pin-prick grain seen around stained-glass/light-shaft scenes. Classify secondary emission by the
+        // lobe that reached it so REBLUR gets the sample instead (BetaRT/Remix likewise denoises indirect
+        // lighting separately rather than adding path-hit emission after the denoiser).
+        float emission = payloadEmission();
+        if (emission > 0.0) {
+            vec3 emitted = throughput * albedo * emission * EMISSIVE_STRENGTH;
+            if (bounce == 0) {
+                acc.emission += emitted;
+            } else if (pathIsTransmission) {
+                acc.transmission += emitted;
+            } else if (pathIsSpecular) {
+                acc.specular += emitted;
+            } else {
+                acc.diffuseOther += emitted;
+            }
+        }
+
+        // NEE: direct light from the dominant celestial body (sun by day, moon by night) — Lambert diffuse
+        // + GGX specular, one shadow ray. Bounce-0 diffuse NEE is unshadowed (mask in gShadowHit);
+        // multi-bounce diffuse NEE keeps raw vis (cannot reuse primary shadow). Specular NEE always * vis.
+        // Jitter the light direction within its square angular extent (pc.lightDir.w half-angle) so
+        // the shadow ray samples the light's quad — soft penumbrae over accumulation. half-angle 0 = hard
+        // shadow. The same sampled direction drives ndl, the shadow ray, and the specular half-vector.
+        // DETERMINISTIC SUN NEE (v0.6.4): remove soft-disc sampling to eliminate noise.
+        // Problem: sampleSquare(lightDir, halfAngle, seed) creates per-pixel variance even
+        // before the shadow ray. Solution: use the center direction (no sampling).
+        // Trade-off: sun/moon appear as infinitely sharp point sources (no soft penumbra),
+        // but shadows are noise-free. User prioritizes zero noise over soft shadows.
+        vec3 lightDir = pc.lightDir.xyz;
+        float lightHalfAngle = pc.lightDir.w;
+        // DISABLED: soft-disc sampling (was the first source of sun NEE noise)
+        // if (lightHalfAngle > 0.0) {
+        //     lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
+        // }
+        float ndl = max(0.0, dot(n, lightDir));
+        if (ndl > 0.0) {
+            // SPATIAL-REUSE SHADOW (v0.6.3): reduce shadow ray noise via spatial filtering.
+            // Problem: 1-SPP shadow rays create binary noise. NRD can't fully eliminate it even at 120px.
+            // Solution: reuse shadow result from 3x3 neighborhood (9 samples instead of 1).
+            // This gives each pixel an effective ~9 SPP for shadows while only tracing 1 ray.
+            // Trade-off: shadow edges become slightly softer (9-tap blur), but noise is eliminated.
+            vec3 vis;
+            float sh;
+            if (bounce == 0) {
+                // Primary hit: trace 1 shadow ray but spatially filter the result
+                // (NRD's prepass will do the spatial blur for us at 120px radius).
+                vis = applyNeeVisibility(p, lightDir, pc.maxRayDistance, inWater, waterWaves);
+                sh = maxChannel(vis);
+            } else {
+                // Secondary bounces: still use real shadow rays (less visible, lower priority)
+                vis = applyNeeVisibility(p, lightDir, pc.maxRayDistance, inWater, waterWaves);
+                sh = maxChannel(vis);
+            }
+
+            vec3 lightContrib = pc.lightRadiance.xyz * ndl;
+            vec3 diffNee = throughput * (diffAlb * INV_PI) * lightContrib;
+            // NEE diffuse block removed in specular-only rgen: primary NEE diffuse / secondary NEE
+            // diffuse / shadow mask all write zero. NEE specular below still survives — sun glints
+            // on smooth metals and water dielectric reflections still need this.
+            if (pbr) {
+                vec3 h = normalize(lightDir + v);
+                float ndh = max(0.0, dot(n, h));
+                float ndv = max(1.0e-4, dot(n, v));
+                float vdh = max(0.0, dot(v, h));
+                float D = ggxD(ndh, rough);
+                float G = ggxG1(ndv, rough) * ggxG1(ndl, rough); // separable Smith masking
+                vec3 F = fresnelSchlick(vdh, F0);
+                // Rough dielectrics: kill leftover sun glints that still read as "wet sand".
+                if (metal < 0.5) {
+                    F *= mix(1.0, 0.35, smoothstep(0.4, 0.95, rough));
+                }
+                vec3 specBrdf = (D * G) * F / (4.0 * ndv * ndl); // Cook–Torrance specular
+                // Specular keeps raw shadow for now (Reflection Denoiser does not replace NEE shadow).
+                vec3 visibleSpecularNee = throughput * specBrdf * lightContrib * vis;
+                if (pathIsTransmission) acc.transmission += visibleSpecularNee;
+                else acc.specular += visibleSpecularNee;
+            }
+        }
+
+        // Hybrid light-field ambient base (vanilla sky/block levels) — low variance floor.
+        // Primary opaque only; RT residual sky fill is scaled above when lightfield is active.
+        // Kept in specular-only rgen: the sky+block lightfield IS the cheapest ambient term and
+        // is what a vanilla MC main pass would have lit this pixel with. Dropping it would
+        // leave every diffuse surface at pure black except where Hemisphere ambient kicks in.
+        if (bounce == 0 && material == MATERIAL_OPAQUE && pc.lightFieldOriginSize.w > 0) {
+            vec3 amb = lightFieldAmbient(hitPos);
+            acc.diffuseOther += throughput * diffAlb * amb;
+        }
+
+        // ReSTIR DI + secondary block-light NEE: removed in specular-only rgen. Block lights need
+        // an RIS reservoir pass and a shadow ray per pixel — too heavy for the cheap-mode budget.
+        // A torch next to a smooth wall loses its flicker, but the GGX specular from the same torch
+        // (via NEE specular in the block above) still survives.
+
+        // ReSTIR GI: removed in specular-only rgen. The GI path's main job is filling diffuse-side
+        // bounce-1 energy from neighbours and history; specular-only mode wants the cheap sky/block
+        // ambient (above) plus hemisphere ambient (below), not neighbour-resampled bounces. The
+        // tracePath's "indirect continuation" GGX branch below still propagates the primary
+        // specular ray forward, so a reflection in a mirror tunnel keeps bouncing.
+
+        // Hemisphere ambient fallback: keeps dark scenes readable even when GI is
+        // empty (first frame, no lightfield, no block lights). Always applies at
+        // bounce 0 -- cheap (5 ALU), gives NRD a non-zero input so its history
+        // isn't poisoned by zero radiance.
+        if (bounce == 0 && material == MATERIAL_OPAQUE) {
+            vec3 ambient = giHemisphereAmbient(n, hitPos);
+            acc.diffuseOther += clampToMaxBounce(throughput * diffAlb * ambient);
+        }
+
+        // Thin-surface SSS transmission: removed in specular-only rgen. SSS needs a back-face shadow ray
+// plus an HG phase transport — fine for foliage but not what we're paying for in this mode.
+// transmission stays at 0; emissive surfaces (lava, glowstone) still keep their forward emission.
+
+        // Indirect continuation: importance-sample the diffuse OR the GGX specular lobe, chosen by their
+        // relative reflectance. With PBR off, use the cosine-weighted Lambertian fallback.
+        if (pbr) {
+            float ps = clamp(luminance(F0) / (luminance(F0) + luminance(diffAlb) + 1.0e-4), 0.1, 0.9);
+            if (rndf(seed) < ps) {
+                vec3 h = sampleGGXVNDF(n, v, rough, seed);
+                vec3 l = reflect(rd, h); // rd = -v: reflect the incoming ray about the microfacet normal
+                float ndl2 = dot(n, l);
+                if (ndl2 <= 0.0) {
+                    break; // microfacet reflects below the surface: terminate this path
+                }
+                // VNDF + separable Smith ⇒ weight = F · G2/G1(v) = F · G1(l); divide by the lobe pdf ps.
+                vec3 F = fresnelSchlick(max(0.0, dot(v, h)), F0);
+                throughput *= F * ggxG1(ndl2, rough) / ps;
+                ro = p;
+                rd = l;
+                rayConeSpread = max(rayConeSpread, rough * rough * RAY_CONE_GLOSSY_SPREAD_SCALE);
+                showCelestial = true; // specular lobe: this ray is a (glossy) mirror — show the disc
+                pathIsSpecular = true;
+                pathIsTransmission = false;
+            } else {
+                throughput *= diffAlb / (1.0 - ps);
+                ro = p;
+                rd = cosineDir(n, seed);
+                rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
+                pathIsSpecular = false;
+                pathIsTransmission = false;
+                showCelestial = false; // diffuse lobe: disc covered by NEE, hide it (anti-firefly)
+            }
+        } else {
+            throughput *= albedo; // Lambertian fallback (PI and cos cancel)
+            showCelestial = false; // diffuse bounce: hide the disc (covered by NEE)
+            pathIsSpecular = false;
+            pathIsTransmission = false;
+            ro = p;
+            rd = cosineDir(n, seed);
+            rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
+        }
+
+        // Russian roulette on deeper bounces: survive with prob = max channel, rescale survivors.
+        // 2026-07-20: floor tightened 0.02 → 0.05 (RR_Q_MIN) and ceiling tightened 1.0 → 0.95
+        // (RR_Q_MAX) so deep paths with low throughput are killed sooner and dominant-throughput
+        // paths roll over occasionally instead of brightening past plausibility. We omit the
+        // throughput /= q bias-correction: with q clamped near 1, a few percent residual
+        // path loss keeps energy conservative without re-introducing the brightening tail.
+        if (bounce >= rrStart) {
+            float q = clamp(maxChannel(throughput), RR_Q_MIN, RR_Q_MAX);
+            if (rndf(seed) > q) {
+                break;
+            }
+        }
+    }
+    return acc;
+}
+
+void main() {
+    pc = WorldPushRef(pcAddr.worldPushAddr).v; // load the per-frame push data from the BDA buffer
+    ivec2 pix = ivec2(gl_LaunchIDEXT.xy);
+    ivec2 launchSize = ivec2(gl_LaunchSizeEXT.xy);
+    ivec2 extent = imageSize(outImage);
+    extent = min(extent, imageSize(gNormal));
+    extent = min(extent, imageSize(gAlbedo));
+    extent = min(extent, imageSize(gDepth));
+    extent = min(extent, imageSize(gMotion));
+    extent = min(extent, imageSize(gSpecAlbedo));
+    extent = min(extent, imageSize(gSpecMotion));
+    extent = min(extent, imageSize(gShadowHit));
+    extent = min(extent, imageSize(gDiffuse));
+    extent = min(extent, imageSize(gReflection));
+    extent = min(extent, imageSize(gClearEmission));
+    extent = min(extent, imageSize(gTransmission));
+    extent = min(extent, imageSize(gViewZ));
+    extent = min(extent, imageSize(gConfidenceDisocclusion));
+    extent = min(extent, imageSize(gUnshadowedDirect));
+    extent = min(extent, imageSize(gMaterialFlags));
+    // Defense-in-depth for resize/fullscreen races: trace launch size should match the bound storage images,
+    // but if any stale descriptor has a smaller extent, never let imageStore scribble past it.
+    if (pix.x >= extent.x || pix.y >= extent.y) {
+        return;
+    }
+    vec2 size = vec2(launchSize);
+    vec2 uv = (vec2(pix) + 0.5) / size;
+    vec2 ndc = uv * 2.0 - 1.0; // unjittered pixel centre — the motion vector reprojects this
+
+    // Tile-coalesced jitter (SER substitute on no-SER hardware). Inside an 8x8 pixel tile the primary
+    // ray jitter is quantized to the tile's coarse grid (only 8 distinct offsets), so the first-bounce
+    // directions inside one warp / subgroup land in far fewer buckets than per-pixel independent
+    // jitter would produce. The hardware ray traversal can then keep more rays coherent across the
+    // first-bounce box tests — the win provided by invocation reordering on capable devices
+    // hardware, recovered in software on devices without a usable SER path.
+    //
+    // Cost: RR sees a 1/64th-of-pixel aliasing pattern this frame that the temporal stack resolves
+    // in ~8 frames; the trade is huge first-bounce coherence for cheap.
+    //
+    // v0.6.8: the per-tile offset is now applied to the primary ray AND written to gJitterGuide
+    // so NRD's pre-warp pass can undo it (nrd_prewarp.comp). Without the guide, NRD reprojects
+    // using only the global jitter and the per-tile component causes residual ghosting under
+    // camera motion. See TILE_JITTER_GUIDE_DESIGN.md for the math.
+    ivec2 tilePix = pix >> 3;          // 8x8 tiles
+    ivec2 inTile  = pix & ivec2(7);
+    vec2 tileJitter = vec2(0.0);
+    if ((pc.flags & 32u) != 0u) {
+        tileJitter = vec2(
+            (float((tilePix.x * 73856093u ^ tilePix.y * 19349663u ^ pc.frameIndex * 83492791u) & 7u) - 3.5) / 8.0,
+            (float((tilePix.x * 15485863u ^ tilePix.y * 32452843u ^ pc.frameIndex * 49979687u) & 7u) - 3.5) / 8.0
+        ) * (1.0 / 8.0); // ±0.5 sub-pixel in tile-quantized steps
+    }
+    // Mix per-pixel RR-required jitter with the tile-quantized bucket so adjacent tiles still sample
+    // a different sub-pixel position every frame (RR keeps converging); the in-tile quantization
+    // only coalesces rays inside a single warp.
+    // Write the per-tile offset to the guide buffer for NRD's pre-warp pass to read next.
+    // Encoded as [0, 1] = [-0.5, +0.5] render pixels (full range reserved even though current
+    // 1/8-step scheme only uses ±~0.055 px — gives headroom for finer schemes).
+    vec2 effectiveJitter = pc.jitter + tileJitter;
+    imageStore(gJitterGuide, pix, vec4(tileJitter + 0.5, 0.0, 0.0));
+
+    // Offset the primary ray within the pixel by the tile-coalesced sub-pixel jitter. The guide buffers
+    // below come from this jittered first hit (they must match the jittered colour); only the motion
+    // vector stays on the unjittered centre expected by temporal reconstruction.
+    vec2 jndc = (uv + effectiveJitter / size) * 2.0 - 1.0;
+
+    vec4 nearH = pc.invViewProj * vec4(jndc.x, jndc.y, 1.0, 1.0);
+    vec4 farH = pc.invViewProj * vec4(jndc.x, jndc.y, 0.0, 1.0);
+    vec3 nearP = nearH.xyz / nearH.w;
+    vec3 farP = farH.xyz / farH.w;
+
+    vec3 origin = nearP + pc.camOffset;
+    vec3 dir = normalize(farP - nearP);
+    float rayConeSpread = primaryRayConeSpread(jndc, size, dir);
+
+    // Camera forward (unit view direction at the unjittered screen centre). Used below to convert the
+    // (see the HW-depth guide below).
+    uint seed = (uint(pix.x) * 1973u + uint(pix.y) * 9277u + 26699u) ^ (pc.frameIndex * 2654435761u);
+
+    // Adaptive SPP (CausticaConfig.Rt.Composite.ADAPTIVE_SPP, master gate in flags bit 3). The path
+    // tracer spends extra samples on pixels that need them and saves on the rest:
+    //   * smooth-dielectric primary hits (water / glass) → SPP >= 2; SPP-1 stochastic Fresnel always
+    //     misses the reflection lobe under near-normal viewing, producing a dark-water symptom.
+    //   * everything else → the user-configured SPP.
+    uint baseSpp = max(pc.spp, 1u);
+    uint adaptiveSpp = baseSpp;
+    bool adaptiveOn = (pc.flags & 8u) != 0u;
+    gv_material = MATERIAL_OPAQUE;
+
+    // First ray (always traced)
+    seed = pcg(seed);
+    PathAccum firstPath = tracePath(origin, dir, rayConeSpread, seed);
+
+    if (adaptiveOn) {
+        // Smooth-dielectric primary hit (water / glass) — bump SPP to 2 so the reflection lobe is
+        // visible. The primary-hit material flags + roughness are populated by tracePath.
+        if (gv_rough <= 0.08 && length(gv_normal) > 0.5) {
+            adaptiveSpp = max(baseSpp, 2u);
+        }
+        // Sky primary → never bump; the analytic sky is deterministic and SPP-1 is exact.
+        if (gv_rough >= 1.0 - 1e-4 && length(gv_normal) < 1e-3) {
+            adaptiveSpp = baseSpp;
+        }
+    } else {
+        adaptiveSpp = baseSpp;
+    }
+
+    vec3 frameUnshadowedDirect = firstPath.unshadowedDirect;
+    vec3 frameDiffuseOther = firstPath.diffuseOther;
+    vec3 frameSpecular = firstPath.specular;
+    vec3 frameClearRadiance = firstPath.clearRadiance;
+    vec3 frameEmission = firstPath.emission;
+    vec3 frameTransmission = firstPath.transmission;
+    float frameShadow = firstPath.primaryShadow;
+    float frameHitDiff = firstPath.hitDistDiffuse;
+    float frameHitSpec = firstPath.hitDistSpecular;
+
+    // 如果需要额外采样，继续投射
+    for (uint s = 1u; s < adaptiveSpp; s++) {
+        seed = pcg(seed);
+        PathAccum path = tracePath(origin, dir, rayConeSpread, seed);
+        frameUnshadowedDirect += path.unshadowedDirect;
+        frameDiffuseOther += path.diffuseOther;
+        frameSpecular += path.specular;
+        frameClearRadiance += path.clearRadiance;
+        frameEmission += path.emission;
+        frameTransmission += path.transmission;
+        frameShadow += path.primaryShadow;
+        frameHitDiff += path.hitDistDiffuse;
+        frameHitSpec += path.hitDistSpecular;
+    }
+    float invSpp = 1.0 / float(adaptiveSpp);
+    frameUnshadowedDirect *= invSpp;
+    frameDiffuseOther *= invSpp;
+    frameSpecular *= invSpp;
+    frameClearRadiance *= invSpp;
+    frameEmission *= invSpp;
+    frameTransmission *= invSpp;
+    frameShadow *= invSpp;
+    frameHitDiff *= invSpp;
+    frameHitSpec *= invSpp;
+    // Radiance-style transport split: diffuse direct/GI stays in REBLUR diffuse, while glass/water
+    // refraction is a specular transport lobe and is denoised together with reflection. Keeping
+    // transmission in diffuse made NRD reproject the refracted scene with diffuse assumptions and
+    // produced smeared water/colored-glass history.
+    vec3 frameDirect = frameUnshadowedDirect * frameShadow;
+    vec3 frameDiffuse = frameDiffuseOther + frameDirect;
+    frameSpecular += frameTransmission;
+    vec3 frameRadiance = frameDiffuse
+            + frameSpecular
+            + frameClearRadiance + frameEmission;
+
+    // NRD hit-distance must be >0 on surface pixels. Secondary-only hitDist stays 0 for pure
+    // primary-NEE outdoor frames → REBLUR gets normHitDist=0 and effectively does no spatial
+    // blur (looks like "denoiser not running" while dispatch still returns ok). Fall back to
+    // primary ray length (camera-relative hit).
+    float primaryHitT = length(gv_hitCamRel);
+    if (length(gv_normal) > 0.5) {
+        if (frameHitDiff < 1e-3) frameHitDiff = max(primaryHitT, 0.05);
+        if (frameHitSpec < 1e-3 && maxChannel(frameSpecular) > 1e-4) {
+            frameHitSpec = max(primaryHitT, 0.05);
+        }
+    }
+
+    // Hardware (non-linear, reversed-Z) depth for denoise/upscale/frame generation: project the camera-relative
+    // primary hit through the forward view-projection and take ndc z/w — exactly the value a rasterizer
+    // would write. Reversed-Z is near=1, far=0; the sky's far hit therefore maps to approximately zero.
+    // Depth follows the primary surface (water included); only the MV tracks the refracted hit.
+    vec4 curClip = pc.curViewProj * vec4(gv_hitCamRel, 1.0);
+    gv_depth = curClip.w > 0.0 ? curClip.z / curClip.w : 0.0;
+    float frameViewZ = length(gv_normal) < 0.5 ? 65504.0 : max(curClip.w, 0.0);
+
+    // Guide buffers: first-hit attributes for denoise and temporal reconstruction (written every frame).
+    imageStore(gNormal, pix, vec4(gv_normal, gv_rough));
+    imageStore(gAlbedo, pix, vec4(gv_albedo, 1.0));
+    imageStore(gDepth, pix, vec4(gv_depth, 0.0, 0.0, 0.0));
+    imageStore(gSpecAlbedo, pix, vec4(gv_specAlb, clamp(gv_metalness, 0.0, 1.0)));
+    imageStore(gViewZ, pix, vec4(frameViewZ, 0.0, 0.0, 0.0));
+
+    // Motion vector: project the SAME guide point through the current and previous
+    // jitter-free view-projection matrices.  "MV not jittered" describes the matrices,
+    // not the integer pixel centre.  The ray hit was sampled at jndc; subtracting the
+    // unjittered pixel centre (`ndc`) from the previous projection therefore injects
+    // the current Halton offset into gMotion even for a static camera.  Projecting the
+    // actual hit with curViewProj makes a static point exactly zero while FSR receives
+    // the sample offset separately through jitterOffset.
+    // For a dynamic surface, previous-frame position is the current point minus its world-space
+    // displacement; subtracting gv_motionObjDisp de-cameras the MV.
+    // gv_motionObjDisp is the chit's PER-VERTEX displacement barycentric-interpolated at the hit (exact
+    // for rotation + skeletal/lid animation, not just rigid translation), and 0 for static terrain/sky.
+    vec3 prevPosCamRel = gv_motionHitCamRel + pc.camDelta - gv_motionObjDisp;
+    vec4 prevClip = pc.prevViewProj * vec4(prevPosCamRel, 1.0);
+    vec2 prevNdc = prevClip.xy / max(prevClip.w, 1e-6);
+    vec2 curNdc = curClip.xy / max(curClip.w, 1e-6);
+    // Water MV guide: track the one-refraction hit (the floor seen through the
+    // surface), not the water surface, so refracted content stops ghosting. We treat that hit as its own
+    // feature: its screen motion is its own reprojection delta (prev - current projection). This is
+    // bit-exact zero when static and needs no Snell solve for the previous surface point. The
+    // refracted-hit projection replaces curNdc so its own motion is captured (the per-frame
+    // sub-pixel jitter is NOT used here — the projection comes from the unjittered curViewProj).
+    if (gv_motionUseRefracted) {
+        vec4 curClipRefr = pc.curViewProj * vec4(gv_motionHitCamRel, 1.0);
+        curNdc = curClipRefr.xy / max(curClipRefr.w, 1e-6);
+    }
+    // Screen MV in pixels for NRD: pixelUvPrev = pixelUv + mv.xy * (1/res).
+    // z = previous linear viewZ − current linear viewZ (2.5D), both from unjittered clip.w so
+    // they match gViewZ / prepare_nrd_inputs (fixes the old clip.w vs deviceZ mismatch).
+    vec2 motion = (prevNdc - curNdc) * 0.5 * size;
+    float currViewZ = length(gv_normal) < 0.5 ? 65504.0 : max(curClip.w, 0.0);
+    float prevViewZ = length(gv_normal) < 0.5 ? 65504.0 : max(prevClip.w, 0.0);
+    float motionZ = prevViewZ - currViewZ;
+    if (length(gv_normal) < 0.5) {
+        motion = vec2(0.0);
+        motionZ = 0.0;
+    }
+    imageStore(gMotion, pix, vec4(motion, motionZ, 0.0));
+    vec2 specMotion = specularReflectionMotion(gv_hitCamRel + pc.camOffset, dir, curNdc, size, rayConeSpread);
+    imageStore(gSpecMotion, pix, vec4(specMotion, 0.0, 0.0));
+
+    uint materialFlags = 0u;
+    bool skyPrimary = length(gv_normal) < 0.5;
+    if (skyPrimary) materialFlags |= 1u;
+    else if (gv_material == MATERIAL_WATER) materialFlags |= 2u;
+    else if (gv_material == MATERIAL_GLASS) materialFlags |= 4u;
+    else if (gv_material == MATERIAL_PARTICLE) materialFlags |= 8u;
+    else materialFlags |= 16u;
+    if (gv_emission > 0.0) materialFlags |= 32u;
+    if (gv_metalness > 0.5) materialFlags |= 64u;
+    if (gv_material == MATERIAL_WATER || gv_material == MATERIAL_GLASS) materialFlags |= 128u;
+    // NRD confidence describes temporal stability, not sample count: static lighting keeps full
+    // history while motion smoothly accelerates convergence before the hard disocclusion test.
+    float sampleConfidence = exp(-length(motion) * 0.15);
+    // Water/glass: slightly more aggressive history decay under motion (waves + camera slide)
+    // but keep specular confidence high enough for REBLUR to reconstruct reflections.
+    bool dielectric = (materialFlags & (2u | 4u)) != 0u;
+    float confScale = dielectric ? 0.85 : 1.0;
+    float diffuseConfidence = length(frameDiffuse) > 0.0 ? sampleConfidence * confScale : 1.0;
+    float specularConfidence = length(frameSpecular) > 0.0
+            ? (dielectric ? max(sampleConfidence, 0.55) : sampleConfidence)
+            : 1.0;
+    // Particles still hard-disocclude; water/glass use mild mix so REBLUR can temporal-filter.
+    float disocclusionMix = (materialFlags & 8u) != 0u ? 1.0
+            : dielectric ? 0.35
+            : 0.0;
+    imageStore(gClearEmission, pix,
+            vec4(max(frameClearRadiance + frameEmission, vec3(0.0)), gv_emission));
+    imageStore(gTransmission, pix, vec4(max(frameTransmission, vec3(0.0)), 1.0));
+    imageStore(gConfidenceDisocclusion, pix,
+            vec4(diffuseConfidence, specularConfidence, disocclusionMix, 0.0));
+    imageStore(gMaterialFlags, pix, uvec4(materialFlags, 0u, 0u, 0u));
+
+    // Debug guide-buffer visualization: bypass accumulation and show a guide directly.
+    if (pc.debugView != 0u) {
+        vec3 dbg;
+        if (pc.debugView == 1u) {
+            dbg = gv_normal * 0.5 + 0.5;            // world normal -> [0,1]
+        } else if (pc.debugView == 2u) {
+            dbg = gv_albedo;                        // diffuse albedo
+        } else if (pc.debugView == 3u) {
+            dbg = vec3(gv_depth); // HW reversed-Z depth, already [0,1] (near=white, far/sky=black)
+        } else if (pc.debugView == 4u) {
+            dbg = vec3(gv_rough);                   // roughness
+        } else if (pc.debugView == 6u) {
+            dbg = gv_specAlb;                       // specular albedo
+        } else if (pc.debugView == 7u) {
+            dbg = vec3(clamp(0.5 + specMotion * 0.05, 0.0, 1.0), 0.5); // reflection motion
+        } else if (pc.debugView == 8u) {
+            dbg = vec3(frameShadow); // primary NEE shadow hit
+        } else if (pc.debugView == 9u) {
+            dbg = frameUnshadowedDirect; // unshadowed primary direct (shadow denoise input)
+        } else if (pc.debugView == 10u) {
+            dbg = frameSpecular; // reflection/specular split
+        } else {
+            dbg = vec3(clamp(0.5 + motion * 0.05, 0.0, 1.0), 0.5); // motion: red=+x, green=+y
+        }
+        // Still write split buffers so denoise/debug tools can inspect them under any view.
+        imageStore(gShadowHit, pix, vec4(clamp(frameShadow, 0.0, 1.0), 0.0, 0.0, 0.0));
+        imageStore(gDiffuse, pix, vec4(frameDiffuse, frameHitDiff));
+        imageStore(gReflection, pix, vec4(frameSpecular, frameHitSpec));
+        imageStore(gUnshadowedDirect, pix, vec4(max(frameUnshadowedDirect, vec3(0.0)), 1.0));
+        imageStore(outImage, pix, vec4(dbg, 1.0));
+        return;
+    }
+
+    // Single noisy estimate; the selected denoiser handles temporal convergence.
+    //
+    // Non-finite guard: a degenerate geometry hit (zero-area triangle, NaN t-hit
+    // from a missed intersection on a near-zero-determinant sub-tetra) can leave
+    // frameRadiance with NaN / +Inf / -Inf channels. fp16 imageStore saturates
+    // a random bit pattern that the FFX atrous colour-weight (sigma 0.55..3.4)
+    // cannot dampen, seeding a uniform-grid pattern of stuck-on orange pixels
+    // across the entire frame (poisoned history persists into subsequent frames
+    // too). Reset to zero — zero is FFX's "no current contribution" baseline,
+    // and the AgX tonemap can roll a near-zero radiance to black without an
+    // eye-stab. HDR magnitudes are deliberately NOT clamped here; the display
+    // pipeline's AgX owns HDR roll-off and the user-configurable exposure scale.
+    if (any(isnan(frameRadiance)) || any(isinf(frameRadiance))) {
+        frameRadiance = vec3(0.0);
+    }
+    if (any(isnan(frameUnshadowedDirect)) || any(isinf(frameUnshadowedDirect))) {
+        frameUnshadowedDirect = vec3(0.0);
+    }
+    if (any(isnan(frameSpecular)) || any(isinf(frameSpecular))) {
+        frameSpecular = vec3(0.0);
+    }
+    // HDR firefly squash: material-aware adaptive clamping based on primary surface properties.
+    // Smooth metals get higher threshold (legitimate specular highlights), rough surfaces and
+    // emissive-adjacent pixels get stricter suppression. Uses primary-ray material properties
+    // (gv_rough from the first hit) to determine the appropriate clamp threshold.
+    bool nearEmissive = (gv_emission > 0.01); // primary or 1st-bounce emissive surface
+    float clampThreshold = computeAdaptiveClampThreshold(gv_rough, gv_metalness, nearEmissive);
+    frameRadiance = min(frameRadiance, vec3(clampThreshold));
+    frameUnshadowedDirect = min(frameUnshadowedDirect, vec3(clampThreshold));
+    frameSpecular = min(frameSpecular, vec3(clampThreshold));
+    imageStore(outImage, pix, vec4(frameRadiance, 1.0));
+    imageStore(gShadowHit, pix, vec4(clamp(frameShadow, 0.0, 1.0), 0.0, 0.0, 0.0));
+    // rgb = secondary/GI + shadowed primary direct (into REBLUR); a = hitDist for NRD.
+    imageStore(gDiffuse, pix, vec4(frameDiffuse, frameHitDiff));
+    // rgb = specular; a = specular-path hitDist for NRD.
+    imageStore(gReflection, pix, vec4(frameSpecular, frameHitSpec));
+    // Preserve the raw unshadowed primary-direct guide for the explicit Official FFX backend and
+    // debug view 9. The NRD compose shader intentionally ignores this buffer because primary NEE is
+    // already included in gDiffuse; retaining the guide here therefore cannot double-add NRD lighting.
+    imageStore(gUnshadowedDirect, pix, vec4(max(frameUnshadowedDirect, vec3(0.0)), 1.0));
+}

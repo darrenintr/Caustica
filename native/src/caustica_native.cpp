@@ -197,10 +197,12 @@ Java_dev_comfyfluffy_caustica_nativebridge_NativeBridge_amdFfxLoaderCheck(
 static const char* kFfxQueryStr = "ffxQuery";
 static const char* kFfxGetLastErrorStr = "ffxGetLastError";
 
-// Effect ID we want to query: FFX_API_EFFECT_ID_DENOISER (0x00050000u) —
-// see ffx_api.h line 175. The 2.x modular API exposes Denoiser as one of
-// the shipped effect types. We don't include sub-version bytes — ffxQuery
-// with the bare ID is enough to learn "is this effect present?".
+// Effect ID we want to query: there is NO FFX_API_EFFECT_ID_DENOISER in the 2.x modular
+// loader — GetVersions enumerates providers by their create-desc type, and the loader only
+// ships upscale (0x10000), framegeneration (0x20000) and swapchain providers. The 1.x
+// denoiser (ffx_denoiser.h) predates the 2.x provider model entirely. Querying a bare
+// 0x50000 therefore returns FFX_API_RETURN_NO_PROVIDER (rc=4): the loader is healthy,
+// it just has no denoiser provider to enumerate.
 static const uint64_t kDenoiserEffectId = 0x00050000u;
 
 // Forward-declared struct layouts that MUST match ffx_api.h. Verified by hand
@@ -299,9 +301,14 @@ Java_dev_comfyfluffy_caustica_nativebridge_NativeBridge_amdFfxDenoiserQuery(
 
     uint32_t rc = queryFn(nullptr, &queryDesc.header);
     if (rc != 0) {
+        // rc=4 (FFX_API_RETURN_NO_PROVIDER) is the EXPECTED answer for the denoiser effect id:
+        // the 2.x loader ships no denoiser provider (see kDenoiserEffectId). The bundled
+        // libffx_denoiser_caustica.so is the 1.x SDK path and is probed separately by
+        // NativeFfxDenoiseBackend — do not touch this query to "fix" it.
         const char* err = (getErrFn != nullptr) ? getErrFn() : "(no ffxGetLastError)";
-        std::snprintf(outBuf, sizeof(outBuf), "denoiser: rc=%u (%s)",
-                      static_cast<unsigned>(rc), err ? err : "(null err)");
+        std::snprintf(outBuf, sizeof(outBuf), "denoiser: rc=%u (%s)%s",
+                      static_cast<unsigned>(rc), err ? err : "(null err)",
+                      rc == 4 ? " [expected: loader ships no denoiser provider]" : "");
     } else {
         std::snprintf(outBuf, sizeof(outBuf), "denoiser: ok (%llu versions)",
                       static_cast<unsigned long long>(count));

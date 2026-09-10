@@ -137,7 +137,7 @@ public final class RtPlateProfile {
         b.needsReactiveMask = upscale != null && upscale.needsReactiveMask();
         b.needsBlackoutGuard = upscale != null && upscale.needsBlackoutGuard();
         RtPlateProfile p = b.build();
-        LOGGER.info("RtPlateProfile.resolve: denoise={}, up={}, rawFmt=0x{}, denoiseInFmt=0x{}, "
+        LOGGER.debug("RtPlateProfile.resolve: denoise={}, up={}, rawFmt=0x{}, denoiseInFmt=0x{}, "
                         + "denoiseOutFmt=0x{}, upscaleInFmt=0x{}, idDenoisePack={}, idDenoiseUnpack={}, "
                         + "displayFmt=0x{}, idPack={}, idUnpack={}, reactive={}, guard={}",
                 (denoise != null ? denoise.name() : "null"),

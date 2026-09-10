@@ -43,6 +43,70 @@ public final class UpscalerSelector {
                 return setActive(NoopUpscaler.INSTANCE);
             }
             case TAAU -> candidate = TaaUpscaler.tryCreate();
+            case FSR3 -> {
+                // FSR 3 uses the same AMD FFX SDK Vulkan backend as classic FSR 2 and triggers
+                // the same SQC GPUVM fault on RADV/NAVI33 (first real-geometry dispatch). The
+                // Fsr3Upscaler.tryCreate() guard already short-circuits to null on RADV, but
+                // we re-check here for defense-in-depth and a clearer log line.
+                if (dev.comfyfluffy.caustica.rt.RtDeviceBringup.isRadv()) {
+                    LOGGER.warn("FSR 3 path known-unstable on RADV/NAVI33 (SQC GPUVM on first dispatch); routing to TAAU");
+                    candidate = TaaUpscaler.tryCreate();
+                    if (candidate != null) {
+                        requestedReason = requested.key() + " → TAAU (RADV FSR 3 workaround)";
+                    }
+                } else {
+                    candidate = dev.comfyfluffy.caustica.fsr.Fsr3Upscaler.tryCreate();
+                    if (candidate != null) {
+                        requestedReason = requested.key() + " → FSR 3.4 (FFX 3.x upscaler)";
+                    } else {
+                        // FSR 3 bridge failed to load (e.g. .so missing on this platform /
+                        // AMD FFX Vulkan backend not shipped). Fall back to classic FSR 2, then TAAU.
+                        LOGGER.warn("FSR 3 native unavailable; falling back to classic FSR 2");
+                        candidate = dev.comfyfluffy.caustica.fsr.Fsr2ClassicUpscaler.tryCreate();
+                        if (candidate != null) {
+                            requestedReason = requested.key() + " → classic FSR 2 (FSR 3 unavailable)";
+                        } else {
+                            LOGGER.warn("Classic FSR 2 also unavailable; falling back to TAAU");
+                            candidate = TaaUpscaler.tryCreate();
+                            if (candidate != null) {
+                                requestedReason = requested.key() + " → TAAU (no FSR 3 or FSR 2 native)";
+                            }
+                        }
+                    }
+                }
+            }
+            case FSR41 -> {
+                // FSR 4.1 / FFX 4.x modular. Tries the FSR 4.1 path first
+                // (wins when the FSR 4.1 Linux port's Vulkan backend is
+                // shipped), then classic FSR2, then TAAU. FSR 4.1 has
+                // the same RADV/NAVI33 first-dispatch crash class as
+                // classic FSR2 — punt to TAAU on RADV until the FSR 4.1
+                // port's transient-image workaround lands.
+                if (dev.comfyfluffy.caustica.rt.RtDeviceBringup.isRadv()) {
+                    LOGGER.warn("FSR 4.1 path known-unstable on RADV/NAVI33; routing to TAAU");
+                    candidate = TaaUpscaler.tryCreate();
+                    if (candidate != null) {
+                        requestedReason = requested.key() + " → TAAU (RADV FSR 4.1 workaround)";
+                    }
+                } else {
+                    candidate = dev.comfyfluffy.caustica.fsr.Fsr41Upscaler.tryCreate();
+                    if (candidate != null) {
+                        requestedReason = requested.key() + " → FSR 4.1 (FFX 4.x modular)";
+                    } else {
+                        LOGGER.warn("FSR 4.1 shim unavailable; falling back to classic FSR2");
+                        candidate = dev.comfyfluffy.caustica.fsr.Fsr2ClassicUpscaler.tryCreate();
+                        if (candidate != null) {
+                            requestedReason = requested.key() + " → classic FSR2 (FSR 4.1 unavailable)";
+                        } else {
+                            LOGGER.warn("Classic FSR2 also unavailable; falling back to TAAU");
+                            candidate = TaaUpscaler.tryCreate();
+                            if (candidate != null) {
+                                requestedReason = requested.key() + " → TAAU (no FSR 4.1 or FSR2 native)";
+                            }
+                        }
+                    }
+                }
+            }
             case FSR2 -> {
                 // Mesa RADV + NAVI33: classic FSR2 native dispatch hard-recovers the device on the
                 // first real-geometry frame (fixed SQC GPUVM fault) even with pure device-local RT

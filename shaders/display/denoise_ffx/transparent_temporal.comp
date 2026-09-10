@@ -37,10 +37,12 @@ void main() {
 
     float currentDepth = imageLoad(gDepth, pix).r;
 
-    // Read motion vector and reproject to history
+    // Read motion vector and reproject to history. gMotion is prev-cur in
+    // render pixels (see world.rgen), so history lives at current + motion
+    // (same convention as temporal_accumulate / taau / ffx_reproject).
     vec2 motion = imageLoad(gMotion, pix).rg;
     vec2 uv = (vec2(pix) + 0.5) / vec2(size);
-    vec2 historyUV = uv - vec2(motion.x * pc.mvScaleX, motion.y * pc.mvScaleY);
+    vec2 historyUV = uv + vec2(motion.x * pc.mvScaleX, motion.y * pc.mvScaleY);
     ivec2 historyPix = ivec2(historyUV * vec2(size));
 
     // Out of bounds or first frame: no history

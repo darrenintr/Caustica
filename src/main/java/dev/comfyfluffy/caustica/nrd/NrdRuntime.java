@@ -11,6 +11,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import dev.comfyfluffy.caustica.nativebridge.NativePlatform;
 import java.util.Arrays;
 import java.util.OptionalInt;
 
@@ -49,7 +50,7 @@ public final class NrdRuntime {
             return OptionalInt.of(version);
         }
         try {
-            NativePlatform platform = NativePlatform.current();
+            NativePlatform platform = NativePlatform.forLibrary("libnrd_caustica.so");
             if (platform == null) {
                 CausticaMod.LOGGER.info("NRD native unavailable on {} / {}", System.getProperty("os.name"),
                         System.getProperty("os.arch"));
@@ -364,6 +365,7 @@ public final class NrdRuntime {
     }
 
     private static Path resolve(NativePlatform platform) throws Exception {
+        // platform is now dev.comfyfluffy.caustica.nativebridge.NativePlatform (see import above)
         String override = System.getProperty("caustica.nrd.path");
         if (override != null && !override.isBlank()) {
             Path p = Path.of(override);
@@ -381,7 +383,7 @@ public final class NrdRuntime {
                 // fix did not. Compare the actual content before loading the extracted library.
                 if (!Files.isRegularFile(target) || !Arrays.equals(Files.readAllBytes(target), bytes)) {
                     Files.write(target, bytes);
-                    if (!platform.windows()) target.toFile().setExecutable(true);
+                    if (!platform.isWindows()) target.toFile().setExecutable(true);
                 }
                 return target;
             }
@@ -391,18 +393,8 @@ public final class NrdRuntime {
         return Files.isRegularFile(dev) ? dev.toAbsolutePath() : null;
     }
 
-    private record NativePlatform(String resourceDirectory, String libraryName, boolean windows) {
-        String resourcePath() {
-            return "/caustica/natives/" + resourceDirectory + "/" + libraryName;
-        }
-
-        static NativePlatform current() {
-            String arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT);
-            if (!(arch.equals("amd64") || arch.equals("x86_64") || arch.equals("x64"))) return null;
-            String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
-            if (os.contains("win")) return new NativePlatform("windows-x64", "nrd_caustica.dll", true);
-            if (os.contains("linux")) return new NativePlatform("linux-x64", "libnrd_caustica.so", false);
-            return null;
-        }
-    }
+    // 2026-08-06: NRD's private NativePlatform record moved to
+    // dev.comfyfluffy.caustica.nativebridge.NativePlatform (shared with FSR2/FSR3/FSR4.1/FFX
+    // denoiser loaders). Same behaviour: detects os.name + os.arch, returns a platform-specific
+    // platform object, or null if unsupported.
 }

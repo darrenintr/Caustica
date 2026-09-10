@@ -31,6 +31,8 @@ import java.nio.LongBuffer;
 import java.util.Arrays;
 import java.util.BitSet;
 
+import dev.comfyfluffy.caustica.CausticaMod;
+import dev.comfyfluffy.caustica.nativebridge.NativeRenderer;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
@@ -63,6 +65,8 @@ import static org.lwjgl.vulkan.KHRRayTracingPipeline.vkGetRayTracingShaderGroupH
  * supported by passing an array; {@code traceRayEXT}'s {@code missIndex} selects among them.
  */
 public final class RtPipeline {
+    /** Native-backed pipeline handle. 0 means this instance delegates to the Java LWJGL backend. */
+    private final long nativePipelineId;
     private static final String SHADER_DIR = "/caustica/rt/";
     /** Keep descriptor upload scratch allocations bounded even if a user requests a very large array. */
     private static final int DESCRIPTOR_WRITE_CHUNK = 256;
@@ -107,9 +111,41 @@ public final class RtPipeline {
     private final int skyAtlasBinding;
     private boolean destroyed;
 
+    /** Native-backed constructor: only the pipeline id is kept; the per-frame state is fetched on demand. */
+    private RtPipeline(RtContext ctx, long pipelineId) {
+        this.nativePipelineId = pipelineId;
+        this.ctx = ctx;
+        this.descriptorSetLayout = 0L;
+        this.descriptorPool = 0L;
+        this.descriptorSets = new long[0];
+        this.currentSet = 0;
+        this.pipelineLayout = 0L;
+        this.pipeline = 0L;
+        this.sbt = null;
+        this.sbtStride = 0L;
+        this.missCount = 0;
+        this.hitGroupCount = 0;
+        this.pushConstantSize = 0;
+        this.pushConstantStages = 0;
+        this.firstExtraBinding = 0;
+        this.bindlessLayout = 0L;
+        this.bindlessPool = 0L;
+        this.bindlessSets = new long[0];
+        this.bindlessCapacity = 0;
+        this.bindlessViews = null;
+        this.bindlessSamplers = null;
+        this.bindlessDirty = null;
+        this.specAtlasBinding = 0;
+        this.normalAtlasBinding = 0;
+        this.skyAtlasBinding = 0;
+        this.bindlessInitialized = false;
+        this.destroyed = false;
+    }
+
     private RtPipeline(RtContext ctx, long dsl, long pool, long[] sets, long layout, long pipeline, RtBuffer sbt, long stride, int missCount, int hitGroupCount, int pushConstantSize, int pushConstantStages, int firstExtraBinding,
                        long bindlessLayout, long bindlessPool, long[] bindlessSets, int bindlessCapacity,
                        int specAtlasBinding, int normalAtlasBinding, int skyAtlasBinding) {
+        this.nativePipelineId = 0L;
         this.ctx = ctx;
         this.descriptorSetLayout = dsl;
         this.descriptorPool = pool;
@@ -165,6 +201,25 @@ public final class RtPipeline {
     }
 
     public static RtPipeline create(RtContext ctx, String rgen, String[] rmiss, String rchit, String rahit, int pushConstantSize, boolean withAtlasSampler, int extraStorageImages, int bindlessTextures, boolean blockMaterialAtlases, boolean skyAtlas) {
+        if (NativeRenderer.INSTANCE.isAttached() || NativeRenderer.tryAttach(ctx)) {
+            long id = NativeRenderer.INSTANCE.createWorldPipeline(ctx, rgen, rmiss, rchit, rahit,
+                    pushConstantSize, withAtlasSampler, extraStorageImages, bindlessTextures,
+                    blockMaterialAtlases, skyAtlas,
+                    RtDeviceBringup.positionFetchEnabled(), RtDeviceBringup.ommEnabled(),
+                    NativeRenderer.INSTANCE.generation());
+            if (id != 0L) {
+                return new RtPipeline(ctx, id);
+            }
+            // Native RT pipelines are intentionally skipped on RADV (see
+            // world_pipeline.cpp: Mesa SIGSEGVs in vkCreateRayTracingPipelinesKHR) — not a
+            // failure, the Java LWJGL path is the supported path there. Stay quiet on
+            // RADV so the log does not cry wolf every boot; warn only elsewhere.
+            if (RtDeviceBringup.isRadv()) {
+                CausticaMod.LOGGER.debug("Native RT pipeline skipped on RADV (known driver crash), using Java LWJGL");
+            } else {
+                CausticaMod.LOGGER.warn("Native RT pipeline create returned 0, falling back to Java LWJGL");
+            }
+        }
         VkDevice vk = ctx.vk();
         boolean hasAhit = rahit != null;
         String label = "world RT pipeline";

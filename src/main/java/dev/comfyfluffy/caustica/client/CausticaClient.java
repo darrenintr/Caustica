@@ -24,6 +24,10 @@ public final class CausticaClient implements ClientModInitializer {
 	@Override
 	public void onInitializeClient() {
 		CausticaMod.LOGGER.info("Caustica client initialized");
+		// Register the Caustica config entry with Sodium if it's loaded. The actual page is built
+		// later, inside the ConfigEntryPoint's registerConfigLate callback that Sodium invokes at
+		// the end of the first resource reload (after our client-init has run).
+		SodiumOptionsCompat.tryRegisterEntry();
 
 		// The GpuDevice exists well before the first tick, so a one-shot at tick start
 		// runs on the render thread with the device idle between frames.

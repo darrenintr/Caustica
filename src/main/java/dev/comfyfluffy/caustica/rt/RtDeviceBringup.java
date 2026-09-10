@@ -166,6 +166,20 @@ public final class RtDeviceBringup {
     }
 
     public static String worldRaygenShader() {
+        // RtMode.SPECULAR_ONLY selects the standalone `world_specular.rgen` variant.
+        // Stage interface (bindings + payload + push constant + globals) is intentionally
+        // identical to world.rgen so Vulkan's pipeline-create sees the same descriptor
+        // layout — the previous `#ifdef CAUSTICA_SPECULAR_ONLY` variant of world.rgen
+        // triggered a `vkCreateRayTracingPipelinesKHR` failure on RADV (stage interface
+        // mismatch, see log line "Native RT pipeline create returned 0"). The standalone
+        // rgen shares the rgen_*.glsl include files with world.rgen so they cannot drift.
+        // MIRROR the SER / no-SER split: dispatch the default (SER-enabled) variant when the
+        // device exposes `rayTracingInvocationReorder=true`, otherwise the no-SER variant.
+        if (CausticaConfig.Rt.MODE.value() == dev.comfyfluffy.caustica.CausticaConfig.RtMode.SPECULAR_ONLY) {
+            return serBackend == SerBackend.EXT
+                    ? "world_specular.rgen.spv"
+                    : "world_specular_noser.rgen.spv";
+        }
         return serBackend.worldRaygenShader;
     }
 
@@ -391,7 +405,8 @@ public final class RtDeviceBringup {
     }
 
     private static SerBackend selectSerBackend(VulkanPhysicalDevice physicalDevice) {
-        if (physicalDevice.hasDeviceExtension(VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME)
+        if (CausticaConfig.Rt.Ser.ENABLED.value()
+                && physicalDevice.hasDeviceExtension(VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME)
                 && supportsFeature(physicalDevice, serFeature())) {
             return SerBackend.EXT;
         }

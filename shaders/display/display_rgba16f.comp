@@ -47,32 +47,49 @@ vec3 agxDefaultContrast(vec3 x) {
 }
 
 vec3 applyLook(vec3 color) {
-    // Mild post-AgX grade tuned for BetterRTX-style indoor richness.
-    // Wood rooms, brick, and saturated block dyes (terracotta, concrete) read muddy without a
-    // touch of contrast/sat bump; vanilla AgX-default is a touch too neutral for our biased light
-    // palette (warmer torches, deeper lava, brighter glowstone). Contrast lifts midtones gently;
-    // saturation leans colour without crushing luminance.
-    const float contrast = 1.08;
-    const float saturation = 1.14;
+    // Post-AgX grade tuned for BetterRTX-style indoor richness. Wood rooms, brick, and
+    // saturated block dyes (terracotta, concrete) read muddy without a touch of contrast/sat
+    // bump; vanilla AgX-default is a touch too neutral for our biased light palette (warmer
+    // torches, deeper lava, brighter glowstone). Contrast lifts midtones gently; saturation
+    // leans colour without crushing luminance; the warmth bias on bright pixels gives torch
+    // / lava / glowstone a "this is hot" feel without over-saturating midtones.
+    const float contrast = 1.12;
+    const float saturation = 1.18;
+    const float warmth = 0.04;
 
     color = clamp((color - 0.5) * contrast + 0.5, 0.0, 1.0);
 
     float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
     color = mix(vec3(luma), color, saturation);
 
+    // Warmth bias: highlights (luma > 0.6) shift slightly toward orange-yellow.
+    float warmthMask = smoothstep(0.6, 1.0, luma);
+    color.r += warmth * warmthMask;
+    color.b -= warmth * warmthMask * 0.5;
+
     return color;
 }
 
-// Soft shoulder for HDR peaks (outdoor through a window, emissives) so auto-exposure can
-// lift dim interiors without nuking bright outdoor to pure white. Midtones barely move.
-vec3 softHighlightShoulder(vec3 hdr) {
+// Filmic tone curve: ambient toe + soft shoulder. The toe adds a small ambient floor to
+// deep shadows so they don't crush to pure black (subtle "this is a real place" feel; the
+// lift is small enough that midtones are unaffected). The shoulder protects HDR peaks
+// (emissives, outdoor-through-window) from being clobbered by auto-exposure lifting dim
+// interiors -- this is the firefly-friendly behaviour inherited from the previous
+// softHighlightShoulder and intentionally kept. SDR AgX path uses (hdr * exposure) as
+// input; HDR PQ path also calls this before the paperReferred headroom rolloff.
+vec3 filmicCurve(vec3 hdr) {
     hdr = max(hdr, vec3(0.0));
     float L = max(dot(hdr, vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
-    // Below ~0.9: identity. Above: asymptotically compress excess toward a soft white.
+    // Toe: smooth ambient lift below toeRange. Above toeRange, identity join.
+    const float toeRange = 0.05;
+    const float toeFloor = 0.008;
+    float toeWeight = 1.0 - smoothstep(0.0, toeRange, L);
+    float L_toe = L + toeFloor * toeWeight;
+    // Shoulder: existing soft highlight compression (preserved).
     const float start = 0.9;
     const float softness = 0.55; // higher = gentler roll-off
-    float excess = max(L - start, 0.0);
-    float L2 = L - excess + excess / (1.0 + excess * softness);
+    float excess = max(L_toe - start, 0.0);
+    float L2 = L_toe - excess + excess / (1.0 + excess * softness);
     return hdr * (L2 / L);
 }
 
@@ -113,7 +130,7 @@ vec3 cheapBloom(ivec2 pix, ivec2 size, float threshold, float strength) {
 }
 
 vec3 tonemap(vec3 hdr, float exposure) {
-    return agx(softHighlightShoulder(hdr * exposure));
+    return agx(filmicCurve(hdr * exposure));
 }
 
 const float PQ_M1 = 0.1593017578125;
@@ -143,7 +160,7 @@ const mat3 BT709_TO_BT2020 = mat3(
 // paper white lands exactly at paperWhiteNits. Highlights above 1.0 roll off smoothly and asymptote to
 // `headroom`, i.e. the brightest pixels approach peakNits. No SDR clamp here — that is the point.
 vec3 tonemapHdr(vec3 hdr, float exposure) {
-    vec3 c = softHighlightShoulder(max(hdr * exposure, vec3(0.0)));
+    vec3 c = filmicCurve(max(hdr * exposure, vec3(0.0)));
     vec3 lo = min(c, vec3(1.0));
     vec3 hi = max(c - vec3(1.0), vec3(0.0));
     float k = max(pc.headroom - 1.0, 0.0);

@@ -55,6 +55,11 @@ layout(set = 0, binding = 5) uniform sampler2D historySampler;
 // that averages over ~8 frames (less visible than the NRD error since TAA is plain
 // temporal averaging, not NRD's complex reprojection weights) — fix here for parity
 // with NRD pre-warp. See docs/TILE_JITTER_GUIDE_DESIGN.md.
+//
+// SAMPLING NOTE: sampled with texelFetch (nearest), NOT the linear history
+// sampler. The guide is tile-quantized (8x8 constant tiles); linear filtering
+// bleeds across tile borders and injects up to ~0.25px systematic reproject
+// error at every tile edge.
 layout(set = 0, binding = 8) uniform sampler2D jitterGuide;
 
 layout(set = 0, binding = 6, r11f_g11f_b10f) writeonly uniform image2D outColor;
@@ -259,13 +264,26 @@ void main() {
     //
     // Read at the dst pixel's render position (currentUV is in render UV space, which is
     // the same as the guide buffer's UV space since both are [0, 1]).
-    vec2 tileOffsetGuide = texture(jitterGuide, currentUV).rg - 0.5; // [-0.5, +0.5] render px
+    // Nearest fetch: the guide is 8x8-tile-quantized, so linear filtering would
+    // bleed across tile borders; the global-jitter part of currentUV is sub-pixel
+    // and stays inside the tile for all interior texels.
+    // Stale-shader-set guard: if the bound guide has a different extent than the
+    // render plate (placeholder view), the tile offset is undefined → treat as 0.
+    ivec2 guideSize = textureSize(jitterGuide, 0);
+    ivec2 srcSizeI = ivec2(srcSize);
+    vec2 tileOffsetGuide = vec2(0.0);
+    if (guideSize.x == srcSizeI.x && guideSize.y == srcSizeI.y) {
+        ivec2 guidePix = ivec2(currentUV * vec2(guideSize));
+        guidePix = clamp(guidePix, ivec2(0), guideSize - 1);
+        tileOffsetGuide = texelFetch(jitterGuide, guidePix, 0).rg - 0.5; // [-0.5, +0.5] render px
+    }
 
     // ---- 1. Current frame upsample ----
     // Composite already runs firefly_kill + NRD before TAAU. An always-on 3x3 median
     // here re-blurs every denoised texel (the "blur as fuck" symptom on grass/snow).
-    // Use bilinear for spatial upsample; optional light edge sharpen only.
-    // Outlier fireflies that slip past NRD are still rejected in the history path below.
+    // Use bilinear for spatial upsample; the in-shader unsharp below is SKIPPED when
+    // the RCAS post-pass will run (host passes sharpness=0 in that case — see
+    // TaaUpscaler.evaluate). Single sharpen stage only, never stacked.
     vec3 currColor = bilinearColor(currentUV, srcSize);
     if (pc.sharpness > 1e-4) {
         // Cheap unsharp from 4-neighbour ring — far less destructive than full 3x3 median.
@@ -387,9 +405,11 @@ void main() {
                 fireflyReject = true;
             }
         }
-        // Roughness-adaptive gamma: glossy surfaces get tighter clip (less
-        // ghost), matte surfaces get looser (more blur, less noise).
-        float gamma = pc.varianceClipGamma * mix(1.5, 0.7, clamp(currRough, 0.0, 1.0));
+        // Roughness-adaptive gamma: glossy surfaces get TIGHTER clip (less
+        // ghost — sharp reflections must not drag history), matte surfaces get
+        // LOOSER clip (more blur, less noise — rough walls hide the smear).
+        // NOTE: mix(a, b, rough) with rough=0 glossy → a. Tighter = smaller gamma.
+        float gamma = pc.varianceClipGamma * mix(0.7, 1.5, clamp(currRough, 0.0, 1.0));
         historyColor = clamp(historyColor, currColor - gamma * sigma, currColor + gamma * sigma);
 
         // Normal-based history reject: 4-corner sample, cheap ghost catch.

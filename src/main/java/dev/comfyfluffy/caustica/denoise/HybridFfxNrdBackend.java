@@ -101,6 +101,21 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
         return disocclusionMix;
     }
 
+    /** NRD REBLUR diffuse output (demodulated radiance). Null until first dispatch. */
+    public RtImage getNrdOutDiff() {
+        return nrdOutDiff;
+    }
+
+    /** NRD REBLUR specular output (demodulated radiance). Null until first dispatch. */
+    public RtImage getNrdOutSpec() {
+        return nrdOutSpec;
+    }
+
+    /** NRD REBLUR shadow output. Null until first dispatch (or dummy in NRD-only). */
+    public RtImage getNrdOutShadow() {
+        return nrdOutShadow;
+    }
+
     private RtImage shadowHit;
     private RtImage diffuse;
     private RtImage reflection;
@@ -158,7 +173,11 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
     private boolean nrdHardReset = true;
     private boolean haveCamera;
 
-    // Temporal warmup: gradually blend in history over first N frames to eliminate startup flicker
+    // Temporal warmup: gradually blend in history over first N frames to eliminate startup flicker.
+    // Implemented WITHOUT touching frameIndex: NRD treats frameIndex==0 as
+    // CLEAR_AND_RESTART, so compressing frameIndex toward 0 during warmup would
+    // wipe history every frame (the opposite of a warmup). Instead we ramp the
+    // confidence guides from 0→1, letting REBLUR trust history progressively.
     private int warmupFramesRemaining = 8;
     private static final int WARMUP_DURATION = 8;
 
@@ -376,7 +395,21 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                                Matrix4fc worldToViewPrevMat, Matrix4fc viewToClipPrevMat,
                                float jitterPixelsX, float jitterPixelsY) {
         setCameraFrame(worldToViewMat, viewToClipMat, worldToViewPrevMat, viewToClipPrevMat,
-                0f, 0f, 0f, jitterPixelsX, jitterPixelsY, 1, 1);
+                0f, 0f, 0f, jitterPixelsX, jitterY, 1, 1);
+    }
+
+    /**
+     * Warmup history trust 0→1 over {@link #WARMUP_DURATION} frames. Fed into
+     * prepare_nrd_inputs as a confidence multiplier so REBLUR leans on the
+     * current frame while its permanent pool is still filling. Reaches exactly
+     * 1.0 when warmup ends (no permanent dimming of history).
+     */
+    private float warmupConfidence() {
+        if (warmupFramesRemaining <= 0) {
+            return 1.0f;
+        }
+        float t = 1.0f - (float) warmupFramesRemaining / (float) WARMUP_DURATION;
+        return Math.max(0.0f, Math.min(1.0f, t));
     }
 
     public void requestNrdReset() {
@@ -447,6 +480,10 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
             return;
         }
         destroyImages();
+        // Runtime backend/size swaps may race an in-flight async-compute submit that still reads the
+        // images being torn down below. vkDeviceWaitIdle drains every queue (graphics + dedicated
+        // compute), so nothing referencing the old images survives into the recreation.
+        ctx.waitIdle();
         // Beauty plates match the RT output format (B10G11R11). NRD intermediate packs stay RGBA16F
         // (YCoCg + normHitDist / signed normal).
         beautyRawCopy = ctx.createStorageImage(width, height, RtContext.HDR_RADIANCE_FORMAT, "hybrid beauty raw");
@@ -504,7 +541,12 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
             // the context exists. If the bundled .so predates the v3 setter symbols this
             // returns false and we keep NRD's hardcoded default (32).
             int userMaxFrames = CausticaConfig.Rt.Denoise.NRD_MAX_ACCUMULATED_FRAMES.value();
-            if (!NrdRuntime.INSTANCE.setReblurMaxAccumulatedFrames(userMaxFrames)) {
+            // 0 = "no cap" (native accumulates forever); only call the setter for a
+            // real cap value. Calling it with the create-time default (32) would be
+            // harmless now (shim re-applies cached tuning), but skipping keeps old
+            // probe-only shims on their hardcoded path.
+            if (userMaxFrames != 0 && userMaxFrames != 32
+                    && !NrdRuntime.INSTANCE.setReblurMaxAccumulatedFrames(userMaxFrames)) {
                 if (!NrdRuntime.INSTANCE.supportsReblurMaxAccumulatedFramesSetter()) {
                     nrdMaxFramesSetterUnsupportedLogged = true;
                     CausticaMod.LOGGER.info("nrd.maxAccumulatedFrameNum setter unavailable in bundled "
@@ -599,7 +641,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                     VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, prepPipe);
                     VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, prepLayout, 0,
                             stack.longs(prepSet), null);
-                    // 32-byte push: near, hitA/B/C, useRawLayers, pad
+                    // 32-byte push: near, hitA/B/C, useRawLayers, warmupConfidence, pad, pad
                     ByteBuffer push = stack.malloc(32);
                     // Hit-distance norm (A,B,C): slightly tighter B for MC block-scale interiors
                     // so REBLUR kernels adapt better to short indoor rays.
@@ -608,7 +650,7 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                     push.putFloat(8, 0.12f);
                     push.putFloat(12, 16.0f);
                     push.putFloat(16, nrdOnly ? 1.0f : 0.0f);
-                    push.putFloat(20, 0.0f);
+                    push.putFloat(20, warmupConfidence());
                     push.putFloat(24, 0.0f);
                     push.putFloat(28, 0.0f);
                     VK10.vkCmdPushConstants(cmd, prepLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
@@ -739,13 +781,14 @@ public final class HybridFfxNrdBackend implements CausticaDenoiseBackend {
                 }
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd,
                         useRelax ? "hybrid NRD RELAX" : "hybrid NRD REBLUR")) {
-                    // Temporal warmup: gradually blend history over first WARMUP_DURATION frames
-                    // to eliminate startup/teleport flicker. We manipulate frameIndex to reduce
-                    // NRD's temporal weight during warmup (lower frameIndex = less history trust).
-                    int effectiveFrameIndex = nrdFrameIndex;
+                    // frameIndex MUST stay monotonic: NRD maps frameIndex==0 to
+                    // CLEAR_AND_RESTART, so the old warmup trick of compressing it
+                    // toward 0 wiped history every warmup frame. Warmup now ramps
+                    // confidence (see warmupConfidence() below); the index just
+                    // advances, with a floor of 1 so a post-reset frame never
+                    // re-triggers CLEAR.
+                    int effectiveFrameIndex = Math.max(1, nrdFrameIndex);
                     if (warmupFramesRemaining > 0) {
-                        // Remap frameIndex: warmup frame 0→0, frame 4→2, frame 8→8 (linear blend)
-                        effectiveFrameIndex = (WARMUP_DURATION - warmupFramesRemaining) * nrdFrameIndex / WARMUP_DURATION;
                         warmupFramesRemaining--;
                     }
 

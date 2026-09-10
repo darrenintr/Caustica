@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import dev.comfyfluffy.caustica.nativebridge.NativePlatform;
 import java.nio.file.StandardCopyOption;
 import java.util.OptionalInt;
 
@@ -19,7 +20,11 @@ import java.util.OptionalInt;
 public final class FfxDenoiserRuntime {
     public static final FfxDenoiserRuntime INSTANCE = new FfxDenoiserRuntime();
 
-    private static final String RESOURCE = "/caustica/natives/linux-x64/libffx_denoiser_caustica.so";
+    // 2026-08-06 fix: use NativePlatform.forLibrary() instead of hardcoded linux-x64/.so. The
+    // Windows JAR ships windows-x64/ffx_denoiser_caustica.dll, but the old constants pointed at
+    // the Linux .so and the FFX denoiser path was unreachable on Windows even though NRD's
+    // loader was platform-aware. LIB_NAME is now the canonical Linux name consumed by the
+    // platform helper; resolved paths (cache dir, dev fallback) come from NativePlatform below.
     private static final String LIB_NAME = "libffx_denoiser_caustica.so";
 
     private FfxDenoiserLibrary lib;
@@ -86,17 +91,23 @@ public final class FfxDenoiserRuntime {
         if (override != null && !override.isBlank()) {
             return Path.of(override);
         }
+        // 2026-08-06: platform-aware via NativePlatform.
+        NativePlatform platform = NativePlatform.forLibrary(LIB_NAME);
+        if (platform == null) {
+            return null;
+        }
         // Extract from classpath jar to game dir natives cache (same idea as FSR).
         Path cache = FabricLoader.getInstance().getGameDir()
                 .resolve(".caustica")
                 .resolve("natives")
-                .resolve("linux-x64");
+                .resolve(platform.resourceDirectory());
         Files.createDirectories(cache);
-        Path target = cache.resolve(LIB_NAME);
-        try (InputStream in = FfxDenoiserRuntime.class.getResourceAsStream(RESOURCE)) {
+        Path target = cache.resolve(platform.libraryName());
+        try (InputStream in = FfxDenoiserRuntime.class.getResourceAsStream(platform.resourcePath())) {
             if (in == null) {
                 // Dev: also try repo build output / resources tree
-                Path dev = Path.of("src/main/resources/caustica/natives/linux-x64").resolve(LIB_NAME);
+                Path dev = Path.of("src/main/resources/caustica/natives")
+                        .resolve(platform.resourceDirectory()).resolve(platform.libraryName());
                 if (Files.isRegularFile(dev)) {
                     return dev.toAbsolutePath();
                 }
@@ -107,7 +118,7 @@ public final class FfxDenoiserRuntime {
                 return null;
             }
             Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
-            target.toFile().setExecutable(true);
+            if (!platform.isWindows()) target.toFile().setExecutable(true);
             return target;
         }
     }

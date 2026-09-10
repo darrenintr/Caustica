@@ -95,6 +95,14 @@ struct CausticaNrd {
     nrd::Instance* instance = nullptr;
     uint32_t width = 0, height = 0;
 
+    // Cached create-time REBLUR tuning (see caustica_nrd_create_v2). NRD 4.17+
+    // removed GetDenoiserSettings, so the max-frames setter below re-applies
+    // THIS struct with only the accumulation knobs changed — otherwise every
+    // runtime setter call would silently reset our tuned prepass/blur/antilag
+    // values back to NRD defaults.
+    nrd::ReblurSettings tunedReblur{};
+    bool tunedReblurValid = false;
+
     std::vector<GpuTex> permanent;
     std::vector<GpuTex> transient;
     // User pool: sparse by ResourceType
@@ -331,6 +339,8 @@ enum class NrdDenoiserKind : uint8_t { REBLUR = 0, RELAX = 1 };
 
 struct CausticaNrdRelax : public CausticaNrd {
     NrdDenoiserKind kind = NrdDenoiserKind::REBLUR;
+    nrd::RelaxSettings tunedRelax{};
+    bool tunedRelaxValid = false;
 };
 
 static int recreatePools(CausticaNrd* c, uint32_t w, uint32_t h) {
@@ -669,6 +679,8 @@ extern "C" int caustica_nrd_create_v2(
     reblur.convergenceSettings.b = 0.18f;
     reblur.convergenceSettings.p = 0.82f;
     nrd::SetDenoiserSettings(*c->instance, nrd::Identifier(nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR), &reblur);
+    c->tunedReblur = reblur;
+    c->tunedReblurValid = true;
 
     nrd::SigmaSettings sigma{};
     sigma.planeDistanceSensitivity = 0.02f;
@@ -824,8 +836,9 @@ extern "C" int caustica_nrd_create_relax_v2(
     uint32_t compute_queue_family, void** out_ctx)
 {
     if (!out_ctx || !vk_device || !vk_physical || !get_device_proc_addr || !width || !height) return -1;
-    auto* c = new (std::nothrow) CausticaNrd();
+    auto* c = new (std::nothrow) CausticaNrdRelax();
     if (!c) return -2;
+    c->kind = NrdDenoiserKind::RELAX;
     c->device = (VkDevice)vk_device;
     c->physical = (VkPhysicalDevice)vk_physical;
     c->getDeviceProcAddr = (PFN_vkGetDeviceProcAddr)get_device_proc_addr;
@@ -902,6 +915,9 @@ extern "C" int caustica_nrd_create_relax_v2(
     relax.spatialVarianceEstimationHistoryThreshold = 3;
     relax.checkerboardMode = nrd::CheckerboardMode::OFF;
     nrd::SetDenoiserSettings(*c->instance, nrd::Identifier(nrd::Denoiser::RELAX_DIFFUSE_SPECULAR), &relax);
+    // c is CausticaNrdRelax here (allocated above) — cache the tuning for the setter.
+    static_cast<CausticaNrdRelax*>(c)->tunedRelax = relax;
+    static_cast<CausticaNrdRelax*>(c)->tunedRelaxValid = true;
 
     nrd::SigmaSettings sigma{};
     sigma.planeDistanceSensitivity = 0.02f;
@@ -1038,13 +1054,11 @@ extern "C" CAUSTICA_NRD_API int caustica_nrd_set_max_accumulated_frame_num(
     auto* c = static_cast<CausticaNrd*>(ctx);
     if (!c->instance) return -1;
 
-    nrd::ReblurSettings reblur{};
-    // NRD 4.17+ removed GetDenoiserSettings; we just construct a fresh
-    // settings struct (NRD defaults are sensible: maxAccumulatedFrameNum=30,
-    // maxStabilizedFrameNum=30, responsiveAccumulationSettings.minAccumulatedFrameNum=3)
-    // and override the user's knob. The non-overridden fields keep their default
-    // values — fine because callers must re-create the context if they want
-    // different defaults, and this knob exists for runtime tuning only.
+    // Re-apply the create-time tuning with only the accumulation knobs changed.
+    // A fresh ReblurSettings{} would reset our tuned prepass/blur/firefly/
+    // antilag values to NRD defaults (NRD 4.17+ has no GetDenoiserSettings to
+    // read-modify-write, so we kept our own copy at create time).
+    nrd::ReblurSettings reblur = c->tunedReblurValid ? c->tunedReblur : nrd::ReblurSettings{};
     reblur.maxAccumulatedFrameNum = frame_num;
     reblur.maxStabilizedFrameNum = frame_num;
     reblur.responsiveAccumulationSettings.minAccumulatedFrameNum =
@@ -1053,6 +1067,9 @@ extern "C" CAUSTICA_NRD_API int caustica_nrd_set_max_accumulated_frame_num(
             nrd::Identifier(nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR), &reblur)
             != nrd::Result::SUCCESS) {
         return -2;
+    }
+    if (c->tunedReblurValid) {
+        c->tunedReblur = reblur;
     }
     return 0;
 }
@@ -1067,16 +1084,30 @@ extern "C" CAUSTICA_NRD_API int caustica_nrd_set_relax_max_accumulated_frame_num
     auto* c = static_cast<CausticaNrd*>(ctx);
     if (!c->instance) return -1;
 
+    // Same read-modify-write problem as the REBLUR setter: re-apply the
+    // create-time RELAX tuning, changing only the per-channel max knobs.
+    // Guard the downcast: a REBLUR context must never be reinterpreted as
+    // RELAX (UB). Only CausticaNrdRelax instances (kind==RELAX) carry tunedRelax.
     nrd::RelaxSettings relax{};
-    // NRD 4.17+ removed GetDenoiserSettings — see comment above.
-    // RelaxSettings no longer has responsiveAccumulationSettings; only the
-    // per-channel max knobs are user-tunable here.
+    bool haveTuned = false;
+    if (auto* maybeRelax = dynamic_cast<CausticaNrdRelax*>(c)) {
+        if (maybeRelax->kind == NrdDenoiserKind::RELAX && maybeRelax->tunedRelaxValid) {
+            relax = maybeRelax->tunedRelax;
+            haveTuned = true;
+        }
+    }
     relax.diffuseMaxAccumulatedFrameNum = frame_num;
     relax.specularMaxAccumulatedFrameNum = frame_num;
     if (nrd::SetDenoiserSettings(*c->instance,
             nrd::Identifier(nrd::Denoiser::RELAX_DIFFUSE_SPECULAR), &relax)
             != nrd::Result::SUCCESS) {
         return -2;
+    }
+    if (haveTuned) {
+        auto* maybeRelax = static_cast<CausticaNrdRelax*>(c);
+        if (maybeRelax->kind == NrdDenoiserKind::RELAX) {
+            maybeRelax->tunedRelax = relax;
+        }
     }
     return 0;
 }

@@ -4,6 +4,10 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 import com.mojang.blaze3d.vulkan.VulkanQueue;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
+import dev.comfyfluffy.caustica.nativebridge.NativeRenderer;
+import dev.comfyfluffy.caustica.nativebridge.NativeRendererAbi;
+import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
+import dev.comfyfluffy.caustica.rt.accel.RtImage;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.util.vma.Vma;
@@ -239,6 +243,10 @@ public final class RtContext {
             throw new IllegalArgumentException("Device-address alignment must be zero or a positive power of two: "
                     + addressAlignment);
         }
+        final RtBuffer nativeBuffer = tryCreateNativeBuffer(size, usage, hostVisible, label, addressAlignment);
+        if (nativeBuffer != null) {
+            return nativeBuffer;
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkBufferCreateInfo bci = VkBufferCreateInfo.calloc(stack).sType$Default()
                     .size(size).usage(usage | VK12.VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
@@ -273,6 +281,30 @@ public final class RtContext {
         }
     }
 
+    private RtBuffer tryCreateNativeBuffer(long size, int usage, boolean hostVisible, String label,
+                                           long addressAlignment) {
+        if (!NativeRenderer.INSTANCE.isAttached()) {
+            return null;
+        }
+        int flags = hostVisible ? NativeRendererAbi.BUFFER_FLAG_HOST_VISIBLE : 0;
+        long resourceId = NativeRenderer.INSTANCE.createBuffer(size, usage, flags, addressAlignment);
+        if (resourceId == 0L) {
+            return null;
+        }
+        java.nio.ByteBuffer handleBuf = java.nio.ByteBuffer.allocateDirect(
+                NativeRendererAbi.BUFFER_HANDLE_SIZE).order(java.nio.ByteOrder.nativeOrder());
+        if (!NativeRenderer.INSTANCE.lookupBuffer(resourceId, handleBuf)) {
+            NativeRenderer.INSTANCE.release(resourceId);
+            return null;
+        }
+        long handle = handleBuf.getLong(NativeRendererAbi.BUFFER_OFFSET_HANDLE);
+        long allocation = handleBuf.getLong(NativeRendererAbi.BUFFER_OFFSET_ALLOCATION);
+        long deviceAddress = handleBuf.getLong(NativeRendererAbi.BUFFER_OFFSET_DEVICE_ADDRESS);
+        long mapped = handleBuf.getLong(NativeRendererAbi.BUFFER_OFFSET_MAPPED);
+        return new RtBuffer(resourceId, handle, allocation, deviceAddress, mapped, size, usage,
+                hostVisible, label, NativeRenderer.INSTANCE);
+    }
+
     /**
      * Create a pure device-local buffer and fill it from a host pointer via a one-shot staging copy.
      * Used for acceleration-structure geometry inputs on RADV: the AS builder GPUVM-faults while following
@@ -295,6 +327,13 @@ public final class RtContext {
         int deviceUsage = usage | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         // addressAlignment <= 0 falls back to BDA_REF_ALIGN so accidental 0 never reintroduces unaligned BDAs.
         long align = addressAlignment > 0L ? addressAlignment : BDA_REF_ALIGN;
+        if (hostBytes > 0) {
+            final RtBuffer nativeDevice = tryUploadDeviceLocalNative(size, deviceUsage, hostPtr,
+                    hostBytes, align, label);
+            if (nativeDevice != null) {
+                return nativeDevice;
+            }
+        }
         RtBuffer device = createAlignedBuffer(size, deviceUsage, false, label, align);
         if (hostBytes == 0) {
             return device;
@@ -338,11 +377,43 @@ public final class RtContext {
 
     /** VMA memory type index of an allocation (for RADV diagnostics). */
     public int memoryTypeOf(RtBuffer buffer) {
+        if (buffer.nativeId() != 0L) {
+            int nativeType = NativeRenderer.INSTANCE.memoryTypeOf(buffer.nativeId());
+            if (nativeType >= 0) {
+                return nativeType;
+            }
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VmaAllocationInfo info = VmaAllocationInfo.calloc(stack);
             Vma.vmaGetAllocationInfo(vma, buffer.allocation, info);
             return info.memoryType();
         }
+    }
+
+    private RtBuffer tryUploadDeviceLocalNative(long size, int usage, long hostPtr, long hostBytes,
+                                                long addressAlignment, String label) {
+        if (!NativeRenderer.INSTANCE.isAttached()) {
+            return null;
+        }
+        int flags = NativeRendererAbi.BUFFER_FLAG_SHADER_DEVICE_ADDRESS;
+        long resourceId = NativeRenderer.INSTANCE.createBuffer(size, usage, flags, addressAlignment);
+        if (resourceId == 0L) {
+            return null;
+        }
+        java.nio.ByteBuffer handleBuf = java.nio.ByteBuffer.allocateDirect(
+                NativeRendererAbi.BUFFER_HANDLE_SIZE).order(java.nio.ByteOrder.nativeOrder());
+        if (!NativeRenderer.INSTANCE.lookupBuffer(resourceId, handleBuf)) {
+            NativeRenderer.INSTANCE.release(resourceId);
+            return null;
+        }
+        long deviceHandle = handleBuf.getLong(NativeRendererAbi.BUFFER_OFFSET_HANDLE);
+        long deviceAddress = handleBuf.getLong(NativeRendererAbi.BUFFER_OFFSET_DEVICE_ADDRESS);
+        if (!NativeRenderer.INSTANCE.uploadDeviceLocal(size, usage, hostPtr, hostBytes, addressAlignment)) {
+            NativeRenderer.INSTANCE.release(resourceId);
+            return null;
+        }
+        return new RtBuffer(resourceId, deviceHandle, 0L, deviceAddress, 0L, size, usage, false, label,
+                NativeRenderer.INSTANCE);
     }
 
     /**
@@ -396,6 +467,10 @@ public final class RtContext {
      * see {@code VUID-VkRenderingInfo-colorAttachmentCount-06087}).
      */
     public RtImage createStorageImage(int width, int height, int format, String label, int extraUsage) {
+        final RtImage nativeImage = tryCreateNativeImage(width, height, format, label, extraUsage);
+        if (nativeImage != null) {
+            return nativeImage;
+        }
         int usage = VK10.VK_IMAGE_USAGE_STORAGE_BIT | VK10.VK_IMAGE_USAGE_SAMPLED_BIT
                 | VK10.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK10.VK_IMAGE_USAGE_TRANSFER_DST_BIT | extraUsage;
         requireStorageImageSupport(width, height, format, usage, label);
@@ -444,6 +519,26 @@ public final class RtContext {
         return new RtImage(vma, vk, image, allocation, view, width, height);
     }
 
+    private RtImage tryCreateNativeImage(int width, int height, int format, String label, int extraUsage) {
+        if (!NativeRenderer.INSTANCE.isAttached()) {
+            return null;
+        }
+        long resourceId = NativeRenderer.INSTANCE.createStorageImage(width, height, format, extraUsage);
+        if (resourceId == 0L) {
+            return null;
+        }
+        java.nio.ByteBuffer handleBuf = java.nio.ByteBuffer.allocateDirect(
+                NativeRendererAbi.IMAGE_HANDLE_SIZE).order(java.nio.ByteOrder.nativeOrder());
+        if (!NativeRenderer.INSTANCE.lookupImage(resourceId, handleBuf)) {
+            NativeRenderer.INSTANCE.release(resourceId);
+            return null;
+        }
+        long image = handleBuf.getLong(NativeRendererAbi.IMAGE_OFFSET_HANDLE);
+        long allocation = handleBuf.getLong(NativeRendererAbi.IMAGE_OFFSET_ALLOCATION);
+        long view = handleBuf.getLong(NativeRendererAbi.IMAGE_OFFSET_VIEW);
+        return new RtImage(resourceId, image, allocation, view, width, height);
+    }
+
     private void requireStorageImageSupport(int width, int height, int format, int usage, String label) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkFormatProperties formatProperties = VkFormatProperties.calloc(stack);
@@ -489,6 +584,20 @@ public final class RtContext {
      * often-unsupported device limit). Kept in {@code GENERAL} layout like every other image here.
      */
     public RtImage createTransientMsaaColorImage(int width, int height, int format, int samples, String label) {
+        if (NativeRenderer.INSTANCE.isAttached()) {
+            long resourceId = NativeRenderer.INSTANCE.createTransientMsaaImage(width, height, format, samples);
+            if (resourceId != 0L) {
+                java.nio.ByteBuffer handleBuf = java.nio.ByteBuffer.allocateDirect(
+                        NativeRendererAbi.IMAGE_HANDLE_SIZE).order(java.nio.ByteOrder.nativeOrder());
+                if (NativeRenderer.INSTANCE.lookupImage(resourceId, handleBuf)) {
+                    long image = handleBuf.getLong(NativeRendererAbi.IMAGE_OFFSET_HANDLE);
+                    long allocation = handleBuf.getLong(NativeRendererAbi.IMAGE_OFFSET_ALLOCATION);
+                    long view = handleBuf.getLong(NativeRendererAbi.IMAGE_OFFSET_VIEW);
+                    return new RtImage(resourceId, image, allocation, view, width, height);
+                }
+                NativeRenderer.INSTANCE.release(resourceId);
+            }
+        }
         long image;
         long allocation;
         long view;

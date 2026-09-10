@@ -1,0 +1,79 @@
+#version 460
+// ReSTIR PT Enhanced §3 — pair-table generator.
+// One-time GPU bake that fills the 3 paired-reuse tables and the shuffle image with deterministic
+// data so the per-frame spatial pass can be a 1-tap lookup. Mirrors the layout described in
+// docs/superpowers/specs/2026-07-29-restir-pt-enhanced.md §2.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, set = 0, rg16ui) uniform uimage2D outTex0;
+layout(binding = 1, set = 0, rg16ui) uniform uimage2D outTex1;
+layout(binding = 2, set = 0, rg16ui) uniform uimage2D outTex2;
+layout(binding = 3, set = 0, r32ui)  uniform uimage2D outShuffle;
+
+layout(push_constant) uniform Push {
+    uint  seed;        // frame-modulated seed so the same image can be re-baked cheaply
+    uint  mirrorTex1;  // 0 = identity for tex1, 1 = flip dx (independent sampling direction)
+    uint  tableSize;   // 512
+    uint  pairs;       // 254
+} pc;
+
+const float TAU = 6.28318530718;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.tableSize) || px.y >= int(pc.tableSize)) {
+        return;
+    }
+
+    // Independent sampling per channel: each texN picks a base ring entry from its own seed, then
+    // walks PAIRS directions using a per-channel offset. The mirrorTex1 flag flips the X of tex1
+    // to produce an anti-symmetric partner, which doubles effective sample coverage.
+    uint channelBase = pc.seed * 2654435761u;
+    uint pixIdx = uint(px.y) * uint(pc.tableSize) + uint(px.x);
+
+    // 254 candidate offsets spread around a unit ring. Radius ~64 in pixel units is large enough
+    // to be useful for a 512² table but stays within int16 range when scaled.
+    uint idx0 = (pixIdx * 73u + channelBase) % pc.pairs;
+    uint idx1 = (pixIdx * 131u + channelBase * 3u + 17u) % pc.pairs;
+    uint idx2 = (pixIdx * 197u + channelBase * 5u + 91u) % pc.pairs;
+
+    float a0 = TAU * (float(idx0) + 0.5) / float(pc.pairs);
+    float a1 = TAU * (float(idx1) + 0.5) / float(pc.pairs);
+    float a2 = TAU * (float(idx2) + 0.5) / float(pc.pairs);
+
+    int dx0 = int(round(cos(a0) * 64.0));
+    int dy0 = int(round(sin(a0) * 64.0));
+    int dx1 = int(round(cos(a1) * 64.0));
+    int dy1 = int(round(sin(a1) * 64.0));
+    int dx2 = int(round(cos(a2) * 64.0));
+    int dy2 = int(round(sin(a2) * 64.0));
+    if (pc.mirrorTex1 == 1u) {
+        dx1 = -dx1;
+    }
+    dx0 = clamp(dx0, -32768, 32767);
+    dy0 = clamp(dy0, -32768, 32767);
+    dx1 = clamp(dx1, -32768, 32767);
+    dy1 = clamp(dy1, -32768, 32767);
+    dx2 = clamp(dx2, -32768, 32767);
+    dy2 = clamp(dy2, -32768, 32767);
+
+    imageStore(outTex0, px, uvec4(uint(dx0) & 0xFFFFu, uint(dy0) & 0xFFFFu, 0u, 0u));
+    imageStore(outTex1, px, uvec4(uint(dx1) & 0xFFFFu, uint(dy1) & 0xFFFFu, 0u, 0u));
+    imageStore(outTex2, px, uvec4(uint(dx2) & 0xFFFFu, uint(dy2) & 0xFFFFu, 0u, 0u));
+
+    // Shuffle table: deterministic permutation. Precomputed once per seed in a tiny loop
+    // and broadcast across the whole image. cost = 254 * 4 bytes = ~1 KiB upload-equivalent.
+    uint pool[254];
+    for (uint i = 0u; i < pc.pairs; ++i) {
+        pool[i] = i;
+    }
+    uint s = pc.seed * 2246822519u + 1u;
+    for (uint i = pc.pairs; i > 1u; --i) {
+        s ^= s << 13u; s ^= s >> 17u; s ^= s << 5u;
+        uint j = s % i;
+        uint t = pool[i - 1u]; pool[i - 1u] = pool[j]; pool[j] = t;
+    }
+    uint shuffleIdx = (pixIdx * 17u) % pc.pairs;
+    imageStore(outShuffle, px, uvec4(pool[shuffleIdx], 0u, 0u, 0u));
+}

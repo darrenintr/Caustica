@@ -127,6 +127,43 @@ public final class RtEntityTextures {
         return slot > 0 && slot < slotHasN.length && slotHasN[slot];
     }
 
+    /**
+     * Reverse lookup of the Vulkan image-view handle backing bindless {@code slot} (slot 0 returns the
+     * block-atlas view). Callers that need a non-bindless descriptor — e.g., the post-tonemap break
+     * overlay, which samples its crack texture outside the bindless array — pass this view into a
+     * separate {@code COMBINED_IMAGE_SAMPLER} binding each frame. Returns 0 for unknown / fallback
+     * slots that have no dedicated view (slot 0 is always resolvable via the block atlas cache).
+     */
+    public long viewForSlot(int slot) {
+        if (slot <= 0) {
+            return atlasViewLocked();
+        }
+        // viewSlotCache is the only forward-of-slot map we maintain; reverse-walk it. The map is
+        // append-only and small (≤ maxTextures()), so an O(N) scan per breaking block is fine — at
+        // MAX_BREAKING=8 (one per currently-mined block) this runs at most a handful of times per
+        // present path.
+        for (var entry : viewSlotCache.entrySet()) {
+            if (entry.getValue() == slot) {
+                return entry.getKey();
+            }
+        }
+        return 0L;
+    }
+
+    /** Block-atlas view for slot 0 (same value {@link #slotForAtlas} returns for the block atlas). */
+    private long atlasViewLocked() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null) {
+            return 0L;
+        }
+        try {
+            GpuTextureView v = mc.getTextureManager().getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
+            return vkImageView(v);
+        } catch (Throwable t) {
+            return 0L;
+        }
+    }
+
     /** Whether the slot has a LabPBR {@code _s} (specular) map bound → the entity prim's {@code mat.z}. */
     public boolean slotHasSpec(int slot) {
         return slot > 0 && slot < slotHasS.length && slotHasS[slot];

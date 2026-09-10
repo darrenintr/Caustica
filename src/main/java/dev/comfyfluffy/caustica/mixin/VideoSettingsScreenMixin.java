@@ -75,5 +75,8 @@ public abstract class VideoSettingsScreenMixin {
     private void caustica$saveConfig(CallbackInfo ci) {
         // Persist any RT settings the player changed in this screen to the TOML config.
         CausticaConfig.save();
+        // The probe toggle instance belongs to this screen's widget tree; drop the
+        // holder reference so a stale widget can't be repainted after close.
+        dev.comfyfluffy.caustica.client.ProbeConfirmGate.ProbeToggleHolder.clear();
     }
 }

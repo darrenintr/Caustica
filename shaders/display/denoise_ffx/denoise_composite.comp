@@ -14,8 +14,9 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(binding = 0, rgba16f) readonly  uniform image2D gUnshadowed;
 layout(binding = 1, r8)      readonly  uniform image2D gShadowRaw;
-// Clean shadow may be rg16f (legacy) or rgba16f (P0: r=mask,g=count,b=var,a=mean). Read .r either way.
-layout(binding = 2, rgba16f) readonly  uniform image2D gShadowClean;
+// Clean shadow is the rg16f plate (r=shadow visibility [0,1], g=count).
+// Read .r either way.
+layout(binding = 2, rg16f) readonly  uniform image2D gShadowClean;
 layout(binding = 3, r11f_g11f_b10f) readonly  uniform image2D gBeauty;
 layout(binding = 4, rgba16f) readonly  uniform image2D gSpecRaw;
 layout(binding = 5, rgba16f) readonly  uniform image2D gSpecClean;

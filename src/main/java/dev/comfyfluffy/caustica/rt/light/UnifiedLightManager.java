@@ -56,11 +56,32 @@ public final class UnifiedLightManager {
             return;
         }
 
+        // 🔍 DEBUG: 最基本的日志 - 确认方法被调用
+        if (frameCounter % 60 == 0) {
+            dev.comfyfluffy.caustica.CausticaMod.LOGGER.info(
+                "[DynamicLight] UnifiedLightManager.updateFrame called at frame {}", frameCounter);
+        }
+
         if (CausticaConfig.Rt.DynamicLights.ENABLED.value()
                 && (lastDynamicUpdateFrame == Long.MIN_VALUE
                 || frameCounter - lastDynamicUpdateFrame >= DYNAMIC_UPDATE_INTERVAL_FRAMES)) {
-            dynamicLights.updateFrame(level.entitiesForRendering());
+            // 🔍 DEBUG: 记录更新触发
+            if (frameCounter % 60 == 0) {
+                dev.comfyfluffy.caustica.CausticaMod.LOGGER.info(
+                    "[DynamicLight] Update triggered at frame {}, entities count: {}",
+                    frameCounter, level.entitiesForRendering().iterator().hasNext() ? "has entities" : "empty");
+            }
+            boolean changed = dynamicLights.updateFrame(level.entitiesForRendering());
             lastDynamicUpdateFrame = frameCounter;
+            // 🔍 DEBUG: 记录动态光源检测
+            if (frameCounter % 120 == 0 || changed) {
+                dev.comfyfluffy.caustica.CausticaMod.LOGGER.info(
+                    "[DynamicLight] Frame {}: {} lights detected, config: held={} dropped={} entities={}",
+                    frameCounter, dynamicLights.getLightCount(),
+                    CausticaConfig.Rt.DynamicLights.HELD_ITEMS.value(),
+                    CausticaConfig.Rt.DynamicLights.DROPPED_ITEMS.value(),
+                    CausticaConfig.Rt.DynamicLights.ENTITIES.value());
+            }
         } else if (!CausticaConfig.Rt.DynamicLights.ENABLED.value() && dynamicLights.getLightCount() != 0) {
             dynamicLights.clear();
         }

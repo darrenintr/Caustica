@@ -41,9 +41,13 @@ import dev.comfyfluffy.caustica.CausticaMod;
 public final class NativeBridge {
 
     private static final String LIB_NAME = "caustica_native";
-    private static final String RESOURCE_PATH = "/caustica/natives/" + platformDir() + "/lib" + LIB_NAME + ".so";
+    // Platform file name. The build task (build.gradle) stages the artifact as libcaustica_native.so
+    // on Linux/macOS and libcaustica_native.dll on Windows (CMake's OUTPUT_NAME is set to match),
+    // so the JAR resource and the extracted path must use the same per-platform name.
+    private static final String LIB_FILE = libFileName();
+    private static final String RESOURCE_PATH = "/caustica/natives/" + platformDir() + "/" + LIB_FILE;
     private static final String GAME_DIR_RELATIVE =
-            "caustica-native/natives/" + platformDir() + "/lib" + LIB_NAME + ".so";
+            "caustica-native/natives/" + platformDir() + "/" + LIB_FILE;
 
     private static volatile boolean LOADED = false;
     private static volatile String LOAD_ERROR = null;
@@ -63,7 +67,7 @@ public final class NativeBridge {
         try {
             Path lib = locateOrExtract();
             if (lib == null) {
-                LOAD_ERROR = "libcaustica_native.so not present in JAR resources";
+                LOAD_ERROR = LIB_FILE + " not present in JAR resources";
                 if (logger != null) {
                     logger.warn("[caustica_native] not bundled in JAR; continuing with GLSL fallback");
                 }
@@ -173,8 +177,8 @@ public final class NativeBridge {
      */
     public static String tryCheckAmdFfxDenoiser(Logger logger) {
         Path gameDir = FabricLoader.getInstance().getGameDir();
-        String amdRes = "/caustica/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
-        String amdRel = "caustica/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
+        String amdRes = "/caustica/natives/" + platformDir() + "/" + amdLoaderFileName();
+        String amdRel = "caustica/natives/" + platformDir() + "/" + amdLoaderFileName();
         Path amdTarget = gameDir.resolve(amdRel);
         // Same unconditional re-extract as the loader check: the file is small, and
         // skipping means a stale .so would mask a real Phase 3 signal.
@@ -234,11 +238,11 @@ public final class NativeBridge {
     public static String tryCheckAmdFfxLoader(Logger logger) {
         // Extract the AMD loader from the JAR's caustica/natives/<platform>/ resource
         // tree (NOT caustica-fsr — that's the post-extraction on-disk target used by
-        // FSR2, not the source path in the JAR). The .so is unconditional re-write so a
+        // FSR2, not the source path in the JAR). The file is unconditional re-write so a
         // stale Phase 2 .so doesn't mask Phase 3's signal.
         Path gameDir = FabricLoader.getInstance().getGameDir();
-        String amdRes = "/caustica/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
-        String amdRel = "caustica/natives/" + platformDir() + "/libamd_fidelityfx_loader.so";
+        String amdRes = "/caustica/natives/" + platformDir() + "/" + amdLoaderFileName();
+        String amdRel = "caustica/natives/" + platformDir() + "/" + amdLoaderFileName();
         Path amdTarget = gameDir.resolve(amdRel);
         try {
             try (InputStream in = NativeBridge.class.getResourceAsStream(amdRes)) {
@@ -351,6 +355,20 @@ public final class NativeBridge {
             Files.write(target, bytes);
             return target;
         }
+    }
+
+    private static String libFileName() {
+        return isWindows() ? "lib" + LIB_NAME + ".dll" : "lib" + LIB_NAME + ".so";
+    }
+
+    /** AMD FidelityFX 2.x modular loader. Linux ships {@code libamd_fidelityfx_loader.so}; the Windows
+     *  build is the classic {@code amd_fidelityfx_vk.dll}. */
+    private static String amdLoaderFileName() {
+        return isWindows() ? "amd_fidelityfx_vk.dll" : "libamd_fidelityfx_loader.so";
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("windows");
     }
 
     private static String platformDir() {

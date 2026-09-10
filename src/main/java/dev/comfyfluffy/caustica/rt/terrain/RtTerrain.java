@@ -135,7 +135,11 @@ public final class RtTerrain {
     private static final int SECTION_ENTRY_BYTES = 32; // {u64 primAddr, u64 uvAddr, u32 triBase[4]}
     // Frames a retired resource must outlive before it's freed (> frames-in-flight). The frame counter
     // advances per composite; old TLAS/table/sections are freed this many frames after the swap.
-    private static final int KEEP_FRAMES = 4;
+    // Raised from 4: the deferred free is keyed to the CPU-side per-composite counter, but on a GPU
+    // that lags (slow RT + denoise at interactive spp on an RX 7600) the GPU can be several frames
+    // behind CPU, so 4 frames of grace freed buffers a lagging frame's TLAS/trace still read → GPU
+    // WRITE_INVALID into retired memory (device lost). 8 covers well past vanilla's ≤3 in-flight.
+    private static final int KEEP_FRAMES = 8;
     private static final long NO_TESS_TOKEN = Long.MIN_VALUE;
     private static final int PRIORITY_PLAYER = 0;
     private static final int PRIORITY_DIRTY = 1;
@@ -2047,6 +2051,10 @@ public final class RtTerrain {
 
     /** Full teardown (world exit / shutdown): drain the GPU, then free everything incl. an in-flight build. */
     private void clear(RtContext ctx, boolean shutdown) {
+        // The native backend holds VMA allocations / AS handles via the RtBuffer/RtImage wrappers.
+        // Bumping its generation up-front lets every destroy() below drop straight into the native
+        // release path, and any straggler that Java missed is freed when we re-attach next frame.
+        dev.comfyfluffy.caustica.rt.RtBackendSelector.releaseGeneration();
         cancelJobs();
         cancelAllDirtyGroups();
         synchronized (dirtyLock) {

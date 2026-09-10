@@ -13,10 +13,29 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Position-independent code is required for shared objects on Linux.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Single source file. All Phase 1 functionality is "ping" + a startup log line.
+# JNI bridge plus the shared-device C++ renderer core. The renderer borrows
+# Minecraft's Vulkan instance/device/queues; it never creates or destroys them.
 add_library(caustica_native SHARED
     src/caustica_native.cpp
+    jni/native_renderer_jni.cpp
+    renderer/src/backend.cpp
+    renderer/src/resource_factory.cpp
+    renderer/src/firefly_pass.cpp
+    renderer/src/frame_graph.cpp
+    renderer/src/world_pipeline.cpp
+    renderer/src/vk_mem_alloc.cpp
 )
+
+# vk_mem_alloc.cpp must be emitted with default visibility under a hidden-by-default build.
+# MSVC has no GCC/Clang-style -fvisibility flags; it relies on __declspec(dllexport) exports, which
+# CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS covers (set below). Guard the flag so the GCC/Clang-only option
+# never reaches a Windows compiler.
+if(NOT MSVC)
+    set_source_files_properties(renderer/src/vk_mem_alloc.cpp
+        PROPERTIES COMPILE_OPTIONS "-fvisibility=default")
+endif()
+
+find_package(Vulkan REQUIRED)
 
 # JNI headers live in the JDK. JAVA_HOME is the convention Caustica's build already uses.
 # `if(NOT DEFINED …)` is not valid CMake syntax (DEFINED only works un-negated), so we test
@@ -72,7 +91,12 @@ target_include_directories(caustica_native PRIVATE
     ${JNI_INCLUDE_DIR}
     ${JNI_PLATFORM_INCLUDE_DIR}
     ${FFX_DENOISER_INCLUDE}
-    ${FFX_API_INCLUDE})
+    ${FFX_API_INCLUDE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/renderer/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/renderer/src
+    ${CMAKE_SOURCE_DIR}/third_party/FidelityFX-SDK/Kits/OpenSource/amd/memoryallocator)
+
+target_link_libraries(caustica_native PRIVATE Vulkan::Vulkan ${CMAKE_DL_LIBS})
 
 # Linux: only export JNI_OnLoad and the bridge's JNIEXPORT functions. Hides internal
 # symbols and shrinks the .so. Future Phase 2+ (FFX/NRD/Vulkan) will add explicit
@@ -87,6 +111,15 @@ set_target_properties(caustica_native PROPERTIES
 # natives (libffx_*.so, libamd_*.so) already bring their own runtimes; we leave link line
 # to just the default shared object set.
 
-# Output a Caustica-style versioned name. strip-debug strips the heavy DWARF info that
-# CMakeDefaults sometimes leaves behind — we keep a debug variant at -dbg if needed.
-set_target_properties(caustica_native PROPERTIES OUTPUT_NAME "caustica_native")
+# Output a Caustica-style name. On Linux/macOS the CMake toolchain prefixed the plain "caustica_native"
+# with lib/ automatically (libcaustica_native.so); on Windows it does not, so the DLL must carry the
+# lib prefix itself to match the name build.gradle stages and NativeBridge.load extracts
+# (libcaustica_native.dll). WINDOWS_EXPORT_ALL_SYMBOLS guarantees the JNIEXPORT functions are actually
+# exported from the DLL without needing explicit .def files in the MSVC build.
+if(WIN32)
+    set_target_properties(caustica_native PROPERTIES
+        OUTPUT_NAME "libcaustica_native"
+        WINDOWS_EXPORT_ALL_SYMBOLS ON)
+else()
+    set_target_properties(caustica_native PROPERTIES OUTPUT_NAME "caustica_native")
+endif()

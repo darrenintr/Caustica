@@ -1,0 +1,200 @@
+// Enhanced reactive mask generator for AMD FSR2 — Material-aware version.
+//
+// Improvements over v1 (fsr2_reactive_mask.comp):
+//   1. Material-aware reactivity: metallic surfaces (high specular) get higher reactive values
+//      to prevent history ghosting on reflective materials (glass, metal, water).
+//   2. Emission-aware: emissive surfaces (torches, lava, glowstone) get boosted reactive to
+//      prevent temporal smearing of dynamic light sources.
+//   3. Roughness consideration: rough surfaces can tolerate more history accumulation; smooth
+//      surfaces (mirrors, polished metal) need aggressive reactive to preserve sharpness.
+//   4. Transparency handling: translucent materials (glass, ice, stained glass) flagged via
+//      gMaterialFlags get elevated reactive to prevent over-sharpening artifacts.
+//
+// Algorithm (preserves core motion/depth divergence from v1):
+//   baseReactive = max(motionDivergence, depthDivergence)  // unchanged
+//   materialBoost = f(metalness, roughness, emission, transparency)
+//   finalReactive = saturate(baseReactive + materialBoost)
+//
+// Inputs (v1 inputs preserved):
+//   0  gMotion              rg16f       motion vectors
+//   1  gDeviceDepth         r32f        reverse-Z depth
+//   2  gViewZ               r32f        linear view Z
+//   3  gNormalRough         rgba16f     xyz=normal, w=roughness
+//   4  gDisocclusionMix     rgba8       existing disocclusion signal
+// New inputs (v2):
+//   6  gSpecAlbedo          rgba16f     xyz=specular albedo, w=metalness
+//   7  gClearEmission       rgba16f     xyz=emission color, w=emission strength
+//   8  gMaterialFlags       r32ui       material classification flags
+// Outputs:
+//   5  gReactiveMask        r32f        FSR2 reactive (0=stable, 1=fully reactive)
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// v1 bindings (unchanged)
+layout(binding = 0, rg16f)   readonly  uniform image2D gMotion;
+layout(binding = 1, r32f)    readonly  uniform image2D gDeviceDepth;
+layout(binding = 2, r32f)    readonly  uniform image2D gViewZ;
+layout(binding = 3, rgba16f) readonly  uniform image2D gNormalRough;
+layout(binding = 4, rgba8)   readonly  uniform image2D gDisocclusionMix;
+layout(binding = 5, r32f)    writeonly uniform image2D gReactiveMask;
+
+// v2 new bindings (material data)
+layout(binding = 6, rgba16f) readonly  uniform image2D gSpecAlbedo;
+layout(binding = 7, rgba16f) readonly  uniform image2D gClearEmission;
+layout(binding = 8, r32ui)   readonly  uniform uimage2D gMaterialFlags;
+
+layout(push_constant) uniform Push {
+    float motionDivergenceScale;   // v1 scale (default 1.0)
+    float depthDivergenceScale;    // v1 scale (default 1.0)
+    float materialBoostScale;      // v2: global material boost multiplier (default 0.3)
+    float emissiveBoostScale;      // v2: emissive boost multiplier (default 0.4)
+} pc;
+
+// Material flags from world.rgen / gMaterialFlags (bits 0-1)
+const uint MATERIAL_OPAQUE = 0u;
+const uint MATERIAL_WATER = 1u;
+const uint MATERIAL_PARTICLE = 2u;
+const uint MATERIAL_GLASS = 3u;
+
+float clamp01(float x) { return clamp(x, 0.0, 1.0); }
+
+// v1 motion divergence (unchanged)
+float ComputeMotionDivergence(ivec2 texel, ivec2 size) {
+    float minConvergence = 1.0;
+    vec2 nucleusMV = imageLoad(gMotion, texel).rg;
+    float nucleusLenUV = length(nucleusMV);
+    const float kVelocityEpsilon = 1e-2;
+
+    if (nucleusLenUV > kVelocityEpsilon) {
+        float maxVelUV = nucleusLenUV;
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                ivec2 sp = texel + ivec2(x, y);
+                sp = clamp(sp, ivec2(0), size - 1);
+                vec2 v = imageLoad(gMotion, sp).rg;
+                float vLen = length(v);
+                if (vLen < kVelocityEpsilon) continue;
+                maxVelUV = max(maxVelUV, vLen);
+                float d = dot(v / vLen, nucleusMV / nucleusLenUV);
+                minConvergence = min(minConvergence, d);
+            }
+        }
+        return clamp01(1.0 - minConvergence) * clamp01(maxVelUV / kVelocityEpsilon);
+    }
+    return 0.0;
+}
+
+// v1 depth divergence (unchanged)
+float ComputeDepthDivergence(ivec2 texel, ivec2 size) {
+    float minDist = 1.0e20;
+    float maxDist = 0.0;
+    bool foundSky = false;
+
+    for (int y = -1; y < 2; ++y) {
+        for (int x = -1; x < 2; ++x) {
+            ivec2 samplePos = clamp(texel + ivec2(x, y), ivec2(0), size - 1);
+            vec4 normalRough = imageLoad(gNormalRough, samplePos);
+            bool isSky = length(normalRough.xyz) < 0.5;
+            float dist = imageLoad(gViewZ, samplePos).r;
+            if (isSky) {
+                foundSky = true;
+                continue;
+            }
+            minDist = min(minDist, dist);
+            maxDist = max(maxDist, dist);
+        }
+    }
+
+    if (maxDist <= 0.0) return 0.0;
+    float divergence = 1.0 - minDist / maxDist;
+    return foundSky ? 0.0 : clamp01(divergence);
+}
+
+// v2: Material-aware reactive boost
+// Returns [0, 1] boost value based on surface properties.
+float ComputeMaterialBoost(ivec2 pix, float roughness) {
+    vec4 specAlb = imageLoad(gSpecAlbedo, pix);
+    float metalness = specAlb.w;  // gSpecAlbedo.w = metalness (from world.rgen:2505)
+    float specLuma = dot(specAlb.rgb, vec3(0.2126, 0.7152, 0.0722));
+
+    // Emissive surfaces: read emission strength from gClearEmission.w (if available).
+    // Emissive pixels (torches, lava, glowstone) should not accumulate temporal history
+    // aggressively because their brightness can flicker/animate.
+    vec4 emission = imageLoad(gClearEmission, pix);
+    float emissionStrength = max(emission.r, max(emission.g, emission.b));
+
+    // Material classification
+    uint matFlags = imageLoad(gMaterialFlags, pix).r;
+    uint material = matFlags & 3u;  // bits 0-1
+
+    float boost = 0.0;
+
+    // 1. Metallic surfaces: high metalness → more reactive (prevent ghosting on mirrors/polished metal)
+    //    Metals have complex BRDF; temporal accumulation can smear reflections.
+    boost += metalness * 0.25;
+
+    // 2. Specular surfaces: high specular albedo → moderate reactive boost
+    //    Glossy non-metals (wet surfaces, polished stone) also benefit from less history.
+    boost += specLuma * 0.15;
+
+    // 3. Roughness modulation: smooth surfaces (low roughness) need higher reactive
+    //    because they show sharp reflections that don't tolerate blur. Rough surfaces
+    //    (diffuse-like) can accumulate more history safely.
+    //    roughness ∈ [0,1]; smooth=0 → boost; rough=1 → no boost
+    float smoothness = 1.0 - roughness;
+    boost += smoothness * smoothness * 0.2;  // quadratic: smooth surfaces prioritized
+
+    // 4. Emissive boost: emissive surfaces should prefer current frame to avoid smearing
+    //    animated/flickering light sources (torches, lava, redstone).
+    boost += emissionStrength * pc.emissiveBoostScale;
+
+    // 5. Transparency/glass: material==GLASS → elevated reactive to prevent over-sharpening
+    //    Translucent materials (ice, stained glass) show refraction; FSR's sharpening can
+    //    create ringing artifacts on edges. Keep them reactive to prefer current frame.
+    if (material == MATERIAL_GLASS) {
+        boost += 0.3;
+    }
+
+    // 6. Water: similar reasoning (refractive, dynamic normals from waves)
+    if (material == MATERIAL_WATER) {
+        boost += 0.25;
+    }
+
+    return clamp01(boost * pc.materialBoostScale);
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(gReactiveMask);
+    if (pix.x >= size.x || pix.y >= size.y) {
+        return;
+    }
+
+    // Sky pixels: always 0 (FSR never accumulates history for sky anyway)
+    vec4 normalRough = imageLoad(gNormalRough, pix);
+    bool sky = length(normalRough.xyz) < 0.5;
+    if (sky) {
+        imageStore(gReactiveMask, pix, vec4(0.0));
+        return;
+    }
+
+    // v1 base reactive: motion + depth divergence (unchanged logic)
+    float motionDiv = ComputeMotionDivergence(pix, size) * pc.motionDivergenceScale;
+    float depthDiv  = ComputeDepthDivergence(pix, size) * pc.depthDivergenceScale;
+    float baseReactive = max(motionDiv, depthDiv);
+
+    // v2 material boost: add surface-property-aware reactive contribution
+    float roughness = normalRough.w;
+    float materialBoost = ComputeMaterialBoost(pix, roughness);
+
+    // Combine: base (geometric) + material (appearance-driven)
+    float reactive = clamp01(baseReactive + materialBoost);
+
+    // Blend with NRD's coarse disocclusion signal (v1 behavior preserved)
+    float prepDisoccl = imageLoad(gDisocclusionMix, pix).b;
+    reactive = max(reactive, prepDisoccl);
+
+    imageStore(gReactiveMask, pix, vec4(reactive, 0.0, 0.0, 0.0));
+}

@@ -98,9 +98,12 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
      */
     private final Map<Long, long[]> descriptorBindings = new HashMap<>();
 
-    // Shadow buffers (rgba16f: r=mask, g=count, b=variance, a=mean)
+    // Shadow buffers (rg16f: r=shadow visibility [0,1], g=temporal count — 4 B/px.
+    // The rgba16f variance/mean lanes were dead weight: variance is re-derived
+    // from 3x3 moments each dispatch, mean was write-only. Half-float is ample
+    // for a [0,1] visibility and a 0..16 count.)
     private RtImage hitMask;       // r32ui tiles (ceil(w/8) x ceil(h/4))
-    private RtImage shadowDense;   // rgba16f dense float from prepare
+    private RtImage shadowDense;   // rg16f dense float from prepare
     private RtImage historyShadow;
     private RtImage shReproBuf;
     private RtImage shSpatA;
@@ -197,11 +200,13 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
         int tilesX = Math.max(1, (width + 7) / 8);
         int tilesY = Math.max(1, (height + 3) / 4);
         hitMask = ctx.createStorageImage(tilesX, tilesY, VK10.VK_FORMAT_R32_UINT, "ffx hitmask 8x4");
-        shadowDense = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx shadow dense");
-        historyShadow = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx shadow history");
-        shReproBuf = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx shadow reproject");
-        shSpatA = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx shadow spat A");
-        shSpatB = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "ffx shadow spat B");
+        // VRAM-first layout (2026-09): shadow moments are scalar statistics, not HDR
+        // colors. RG16F (r=shadow, g=count; 4 B/px instead of 8) halves the chain.
+        shadowDense = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16_SFLOAT, "ffx shadow dense");
+        historyShadow = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16_SFLOAT, "ffx shadow history");
+        shReproBuf = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16_SFLOAT, "ffx shadow reproject");
+        shSpatA = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16_SFLOAT, "ffx shadow spat A");
+        shSpatB = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16_SFLOAT, "ffx shadow spat B");
 
         int w1 = Math.max(1, width / 2);
         int h1 = Math.max(1, height / 2);
@@ -579,7 +584,14 @@ public final class OfficialFfxDenoiseBackend implements CausticaDenoiseBackend {
             depthPyrPool = createPool(ctx, stack, 2, 3);
             depthPyrSets = allocSets(ctx, stack, depthPyrPool, depthPyrDsl, 3);
             depthPyrLayout = createLayout(ctx, stack, depthPyrDsl, 0);
-            depthPyrPipe = createPipeline(ctx, stack, depthPyrLayout, "depth_pyramid.comp.spv");
+            // Subgroup-scheduled variant is preferred when enabled (default ON); the build
+            // emits both `depth_pyramid.comp.spv` and `depth_pyramid_group.comp.spv`, the
+            // runtime config picks between them. Subgroup ops are core in Vulkan 1.1 so the
+            // group variant works on every Caustica-capable device.
+            String depthPyrSpv = dev.comfyfluffy.caustica.CausticaConfig.Rt.SubgroupOps.ENABLED.value()
+                    ? "depth_pyramid_group.comp.spv"
+                    : "depth_pyramid.comp.spv";
+            depthPyrPipe = createPipeline(ctx, stack, depthPyrLayout, depthPyrSpv);
 
             // reflection reproject: refl, depth, normal, mv, history, out, mip1, mip2, mip3
             rfReproDsl = createDsl(ctx, stack, 9);

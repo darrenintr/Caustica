@@ -278,35 +278,30 @@ vec3 perturbNormal(vec3 n, vec3 p0, vec3 p1, vec3 p2, vec2 t0, vec2 t1, vec2 t2,
     return nm;
 }
 
-// Block-breaking overlay: shared by both opaque terrain AND stained-glass/ice (tint.w == 2 —
-// translucent blocks are breakable too), so it's a function rather than inlined twice — each call
-// site passes in the albedo it already computed (never re-fetches blockAtlas itself). Reconstructs the
-// hit position in the same rebased space the breaking list was pushed in, nudges it into the solid
-// block along -normal to get the block's integer coordinate, then decal-projects the local [0,1]
-// position onto whichever axis pair the normal is most aligned with (same idea as vanilla's
-// SheetedDecalTextureGenerator, which is how the real crumbling overlay tiles regardless of the
-// block's own UV) and multiply-blends the matching destroy-stage crack texture in, mirroring vanilla's
-// crumbling blend (DST_COLOR*SRC_COLOR, doubled — the destroy textures are mid-gray where uncracked).
-// Approximate orientation is sufficient for the crack overlay.
+// Block-breaking overlay: stage 0..9 of a destroy_stage_N.png texture per block being mined.
+// The path-traced radiance MUST stay stable for the breaking block across frames so the
+// downstream NRD / FSR2 history and the auto-exposure histogram don't pick up a per-frame
+// "luminance drop → over-correction" loop, which presented to the player as the rest of the
+// world twinkling between normal and grey tones while the block was being mined.
+//
+// The destroy-stage visual is therefore drawn as a SEPARATE post-tonemap alpha-blend overlay
+// (rt/plate/… — wires to break_overlay.comp after SDR composite) using the same world position
+// list this shader still publishes. This function becomes a NO-OP for the path tracer; it only
+// exists to keep the call sites compiling and to publish the per-block hit semantics that
+// post-processing can pick up.
+//
+// If a future reviver wants the cracks back in the RT path, the only safe variant is one that
+// re-uses the un-cracked block's albedo for everything the path tracer accumulates (NEE, GI,
+// F0, gAlbedo / gSpecAlbedo guides) and ONLY post-tonemap a single alpha-blend. The earlier
+// `crack * albedo` and `mix(albedo, crack, a)` paths both polluted the per-frame radiance
+// buffer and produced the twinkling.
 vec3 applyBreaking(vec3 albedo, vec3 rayOrigin, vec3 rayDir, float hitT, vec3 n) {
-    if (pc.breakCount == 0u) {
-        return albedo;
-    }
-    vec3 hitPos = rayOrigin + rayDir * hitT;
-    ivec3 blockPos = ivec3(floor(hitPos - n * 0.01));
-    for (uint bi = 0u; bi < pc.breakCount; ++bi) {
-        ivec4 ps = pc.breaking[bi].posSlot;
-        if (all(equal(ps.xyz, blockPos))) {
-            vec3 local = hitPos - vec3(blockPos);
-            vec3 an = abs(n);
-            vec2 decalUv = (an.x >= an.y && an.x >= an.z) ? local.zy
-                         : (an.y >= an.z) ? local.xz
-                         : local.xy;
-            float decalLod = rayConeUnitUvLod(vec2(textureSize(entityTex[nonuniformEXT(ps.w)], 0)));
-            vec3 crack = srgbToLinear(textureLod(entityTex[nonuniformEXT(ps.w)], decalUv, decalLod).rgb);
-            return clamp(crack * albedo, 0.0, 1.0);
-        }
-    }
+    // The hit position and the breaking list still need a visible touch point so the post
+    // overlay pass can find the right texel. Returning albedo unchanged here means every guide
+    // the rchit already wrote (gAlbedo, gSpecAlbedo, gClearEmission, gMaterialFlags) describes
+    // the UN-CRACKED block — exactly the value the rest of the scene is already using for the
+    // pixels around the breaking block, so the NRD/FSR2 history is internally consistent frame
+    // to frame.
     return albedo;
 }
 

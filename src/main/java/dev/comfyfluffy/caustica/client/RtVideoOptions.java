@@ -39,14 +39,27 @@ public final class RtVideoOptions {
             entities(),
             particles(),
             waterWaves(),
+            tileJitter(),
+            quarterResReservoir(),
+            giEnabled(),
+            giMaxMTemporal(),
+            giMaxMSpatial(),
+            hybridEnabled(),
+            pairedReuseEnabled(),
+            pairedReuseShufflePeriod(),
+            duplicationMapEnabled(),
+            footprintReconnection(),
+            footprintMotionCapPx(),
             upscalerMode(),
             denoiseMode(),
             upscalerQuality(),
+            drsEnabled(),
             hdrEnabled(),
             hdrPaperWhite(),
             hdrPeak(),
             debugOverlay(),
             debugView(),
+            probeRecord(),
         };
     }
 
@@ -124,6 +137,15 @@ public final class RtVideoOptions {
 
     private static OptionInstance<Boolean> waterWaves() {
         return bool("caustica.options.rt.waterWaves", CausticaConfig.Rt.Composite.WATER_WAVES);
+    }
+
+    private static OptionInstance<Boolean> tileJitter() {
+        return bool("caustica.options.rt.tileJitter", CausticaConfig.Rt.Composite.TILE_JITTER);
+    }
+
+    private static OptionInstance<Boolean> quarterResReservoir() {
+        return bool("caustica.options.rt.quarterResReservoir",
+                CausticaConfig.Rt.RestirEnhanced.QUARTER_RES_RESERVOIR);
     }
 
     private static OptionInstance<Integer> upscalerQuality() {
@@ -212,6 +234,82 @@ public final class RtVideoOptions {
             setting::set);
     }
 
+    private static OptionInstance<Boolean> giEnabled() {
+        return bool("caustica.options.rt.giEnabled", CausticaConfig.Rt.Gi.ENABLED);
+    }
+
+    private static OptionInstance<Integer> giMaxMTemporal() {
+        FloatSetting setting = CausticaConfig.Rt.Gi.MAX_M_TEMPORAL;
+        return new OptionInstance<>(
+            "caustica.options.rt.giMaxMTemporal",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.giMaxMTemporal.tooltip")),
+            (caption, v) -> Options.genericValueLabel(caption, Component.literal(String.valueOf(Math.round(v)))),
+            new OptionInstance.IntRange(1, 256),
+            Math.round(setting.value()),
+            v -> setting.set(v.floatValue()));
+    }
+
+    private static OptionInstance<Integer> giMaxMSpatial() {
+        FloatSetting setting = CausticaConfig.Rt.Gi.MAX_M_SPATIAL;
+        return new OptionInstance<>(
+            "caustica.options.rt.giMaxMSpatial",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.giMaxMSpatial.tooltip")),
+            (caption, v) -> Options.genericValueLabel(caption, Component.literal(String.valueOf(Math.round(v)))),
+            new OptionInstance.IntRange(1, 256),
+            Math.round(setting.value()),
+            v -> setting.set(v.floatValue()));
+    }
+
+    private static OptionInstance<Boolean> hybridEnabled() {
+        return bool("caustica.options.rt.hybridEnabled", CausticaConfig.Rt.Hybrid.ENABLED);
+    }
+
+    // ReSTIR PT Enhanced (Lin, Kettunen, Wyman, I3D 2026) — runtime-tunable gates for the
+    // compute passes we wired in P0-1/P0-2. Each flag maps 1:1 to caustica.toml under
+    // [restir-enhanced]. Toggle off to fall back to the legacy inline 9-tap spatial merge
+    // (paired-reuse) or the legacy roughness/distance temporal heuristic (footprint-reconnection).
+
+    private static OptionInstance<Boolean> pairedReuseEnabled() {
+        return bool("caustica.options.rt.pairedReuseEnabled",
+                CausticaConfig.Rt.RestirEnhanced.PAIRED_REUSE_ENABLED);
+    }
+
+    private static OptionInstance<Integer> pairedReuseShufflePeriod() {
+        IntSetting setting = CausticaConfig.Rt.RestirEnhanced.PAIRED_REUSE_SHUFFLE_PERIOD;
+        return new OptionInstance<>(
+            "caustica.options.rt.pairedReuseShufflePeriod",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.pairedReuseShufflePeriod.tooltip")),
+            (caption, v) -> Options.genericValueLabel(caption, Component.literal(v + " fr")),
+            new OptionInstance.IntRange(1, 32),
+            setting.value(),
+            setting::set);
+    }
+
+    private static OptionInstance<Boolean> duplicationMapEnabled() {
+        return bool("caustica.options.rt.duplicationMapEnabled",
+                CausticaConfig.Rt.RestirEnhanced.DUPLICATION_MAP_ENABLED);
+    }
+
+    private static OptionInstance<Boolean> footprintReconnection() {
+        return bool("caustica.options.rt.footprintReconnection",
+                CausticaConfig.Rt.RestirEnhanced.FOOTPRINT_RECONNECTION);
+    }
+
+    private static OptionInstance<Integer> footprintMotionCapPx() {
+        FloatSetting setting = CausticaConfig.Rt.RestirEnhanced.FOOTPRINT_MOTION_CAP_PX;
+        return new OptionInstance<>(
+            "caustica.options.rt.footprintMotionCapPx",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.footprintMotionCapPx.tooltip")),
+            (caption, v) -> Options.genericValueLabel(caption, Component.literal(String.valueOf(Math.round(v)) + " px")),
+            new OptionInstance.IntRange(1, 200),
+            Math.round(setting.value()),
+            v -> setting.set(v.floatValue()));
+    }
+
+    private static OptionInstance<Boolean> drsEnabled() {
+        return bool("caustica.options.rt.drsEnabled", CausticaConfig.Drs.ENABLED);
+    }
+
     private static OptionInstance<Integer> debugView() {
         IntSetting setting = CausticaConfig.Rt.Composite.DEBUG_VIEW;
         return new OptionInstance<>(
@@ -223,6 +321,19 @@ public final class RtVideoOptions {
             new OptionInstance.Enum<>(List.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10), Codec.INT),
             Math.clamp(setting.value(), 0, 10),
             setting::set);
+    }
+
+    private static OptionInstance<Boolean> probeRecord() {
+        BooleanSetting setting = CausticaConfig.Rt.Probe.ENABLED;
+        OptionInstance<Boolean> option = new OptionInstance<>(
+            "caustica.options.rt.probeRecord",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.probeRecord.tooltip")),
+            OptionInstance.BOOLEAN_TO_STRING,
+            OptionInstance.BOOLEAN_VALUES,
+            setting.value(),
+            ProbeConfirmGate.onProbeToggle(setting));
+        ProbeConfirmGate.ProbeToggleHolder.set(option);
+        return option;
     }
 
     private static OptionInstance<Boolean> bool(String captionKey, BooleanSetting setting) {

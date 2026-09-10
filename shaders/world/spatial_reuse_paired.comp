@@ -1,0 +1,151 @@
+#version 460
+// ReSTIR PT Enhanced §3 — paired spatial reuse pass.
+// Reads gReservoirCurr (the ping-pong DI reservoir), picks a per-pixel pair partner from one of
+// three pre-baked tables (selected by per-frame shuffle), MIS-merges, and writes back. The legacy
+// inline 9-tap spatial merge in world.rgen is kept as the fallback path when this pass is
+// disabled via caustica.rt.restirEnhanced.pairedReuse=false.
+//
+// Bindings:
+//   0  gReservoirCurr   (rgba32ui) rw
+//   1  gPairedReuseTex0  (r16g16)  ro
+//   2  gPairedReuseTex1  (r16g16)  ro
+//   3  gPairedReuseTex2  (r16g16)  ro
+//   4  gPairedShuffle    (r32ui)   ro — index into [0, PAIRS) for which channel this pixel uses
+//
+// Push:  render width/height, shuffle index (frame-derived), max-M cap (forwarded from config).
+// NOTE (2026-09): renderSize is the RESERVOIR size, not the render size —
+// quarter-res mode dispatches this at half width/height (1 tile per 2x2 px).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, set = 0, rgba32ui) uniform uimage2D reservoirCurr;
+layout(binding = 1, set = 0, rg16ui)   uniform readonly uimage2D pairedTex0;
+layout(binding = 2, set = 0, rg16ui)   uniform readonly uimage2D pairedTex1;
+layout(binding = 3, set = 0, rg16ui)   uniform readonly uimage2D pairedTex2;
+layout(binding = 4, set = 0, r32ui)    uniform readonly uimage2D pairedShuffle;
+
+layout(push_constant) uniform Push {
+    ivec2 renderSize;
+    int   maxM;        // e.g. 5 (Gi.MAX_M_SPATIAL upstream; forwarded here for one config knob)
+    uint  shuffleIndex; // current shuffle value (frame / period) % 254
+} pc;
+
+// === Minimal reservoir accessors (no light materialisation here; we only need the Reservoir
+//     struct for MIS math, mirroring restir_reservoir.glsl. We keep this self-contained so the
+//     pass compiles without pulling world.rgen bindings.) ===
+
+struct Reservoir {
+    uint  lightIndex; // 0xFFFFFFFF = no candidate
+    float wSum;
+    float M;
+    uint  age;
+};
+
+Reservoir unpack(uvec4 packed) {
+    Reservoir r;
+    r.lightIndex = packed.x;
+    r.wSum = uintBitsToFloat(packed.y);
+    vec2 mAge = unpackHalf2x16(packed.z);
+    r.M = mAge.x;
+    r.age = uint(mAge.y + 0.5);
+    return r;
+}
+
+uvec4 pack(Reservoir r) {
+    return uvec4(
+        r.lightIndex,
+        floatBitsToUint(r.wSum),
+        packHalf2x16(vec2(r.M, float(r.age))),
+        0u
+    );
+}
+
+bool isEmpty(Reservoir r) { return r.lightIndex == 0xFFFFFFFFu; }
+
+// MIS update with confidence cap (Lin et al. §3.3, simplified). We treat partner reservoir as a
+// fixed prior (no Jacobian adjustment) because the partner pixel shares the same shading point
+// distribution; the per-pixel pair walk already breaks neighbour correlation.
+void mergeInto(inout Reservoir r, uint candLight, float candWeight, inout uint rng) {
+    if (candLight == 0xFFFFFFFFu) return;
+    if (isEmpty(r)) {
+        r.lightIndex = candLight;
+        r.wSum = candWeight;
+        r.M = 1.0;
+        r.age = 0u;
+        return;
+    }
+    r.wSum += candWeight;
+    r.M += 1.0;
+    if (r.M > float(pc.maxM)) r.M = float(pc.maxM);
+    // Stochastic accept proportional to candWeight / wSum.
+    float p = candWeight / max(r.wSum, 1e-6);
+    uint h = (pc.shuffleIndex * 2654435761u) ^ uint(gl_GlobalInvocationID.x) * 374761393u
+             ^ uint(gl_GlobalInvocationID.y) * 668265263u ^ ++rng;
+    float r01 = float(h & 0x00FFFFFFu) / 16777215.0;
+    if (r01 < p) {
+        r.lightIndex = candLight;
+    }
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= pc.renderSize.x || px.y >= pc.renderSize.y) return;
+
+    uint pairIdx = imageLoad(pairedShuffle, px).r; // 0..253
+    // 254 entries cycle over 0,1,2,0,1,2,... so that two of every six pixels share a partner
+    // table, giving 3 independent sampling directions for variance reduction.
+    uint channel = pairIdx % 3u;
+
+    // Re-derive the partner's pair-table coordinate deterministically from the shuffle index
+    // and our pixel coords. We don't need a sampler binding because the pass only reads the
+    // partner's own offset (a 1-tap lookup). A wraparound UV scheme is not required here.
+    uint h = pc.shuffleIndex * 2654435761u ^ uint(px.x) * 374761393u ^ uint(px.y) * 668265263u;
+    ivec2 partner = ivec2(int(h & 0xFFFFu), int((h >> 16) & 0xFFFFu));
+    if (partner.x >= pc.renderSize.x) partner.x = partner.x % pc.renderSize.x;
+    if (partner.y >= pc.renderSize.y) partner.y = partner.y % pc.renderSize.y;
+
+    // Offset stored in the partner's pixel: read partnerTex at partner, get (dx, dy) — that's the
+    // displacement from partner to its reuse target. We use it as the displacement from us to
+    // partner's reuse target by negating. GLSL forbids assigning one image binding to another, so
+    // we branch on `channel` and read each binding in its own block.
+    ivec2 partnerOffset;
+    if (channel == 0u) {
+        partnerOffset = ivec2(imageLoad(pairedTex0, partner).xy) - ivec2(32768);
+    } else if (channel == 1u) {
+        partnerOffset = ivec2(imageLoad(pairedTex1, partner).xy) - ivec2(32768);
+    } else {
+        partnerOffset = ivec2(imageLoad(pairedTex2, partner).xy) - ivec2(32768);
+    }
+    ivec2 reuseTarget = partner - partnerOffset;
+    if (reuseTarget.x < 0) reuseTarget.x += pc.renderSize.x;
+    if (reuseTarget.x >= pc.renderSize.x) reuseTarget.x -= pc.renderSize.x;
+    if (reuseTarget.y < 0) reuseTarget.y += pc.renderSize.y;
+    if (reuseTarget.y >= pc.renderSize.y) reuseTarget.y -= pc.renderSize.y;
+
+    uvec4 selfPacked   = imageLoad(reservoirCurr, px);
+    uvec4 partnerPacked = imageLoad(reservoirCurr, reuseTarget);
+    Reservoir selfRes   = unpack(selfPacked);
+    Reservoir partnerRes = unpack(partnerPacked);
+
+    // If the partner is empty we keep self untouched (no useful candidate to merge).
+    if (isEmpty(partnerRes)) {
+        return;
+    }
+
+    // Weight wSum is already a Monte-Carlo estimate, so combining two reservoirs is just
+    // summation. M is incremented; we cap with maxM to bound the work the next temporal merge
+    // has to do.
+    if (isEmpty(selfRes)) {
+        selfRes.lightIndex = partnerRes.lightIndex;
+        selfRes.wSum = partnerRes.wSum;
+        selfRes.M = 1.0;
+        selfRes.age = 0u;
+    } else {
+        // Treat partner as one more candidate sample. The partner.wSum already absorbed its
+        // sampling weight over M partners, so as a candidate its weight = partner.wSum / max(partner.M, 1).
+        float candWeight = partnerRes.wSum / max(partnerRes.M, 1.0);
+        uint rng = (pc.shuffleIndex * 2654435761u) ^ (uint(px.x) * 2654435761u) ^ (uint(px.y));
+        mergeInto(selfRes, partnerRes.lightIndex, candWeight, rng);
+    }
+    imageStore(reservoirCurr, px, pack(selfRes));
+}

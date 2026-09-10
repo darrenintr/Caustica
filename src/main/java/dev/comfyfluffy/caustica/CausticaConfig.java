@@ -56,14 +56,23 @@ public final class CausticaConfig {
     public static void ensureRegistered() {
         @SuppressWarnings("unused")
         Object[] touch = {
-            Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Composite.MAX_RAY_DISTANCE, Rt.Composite.TEMPORAL_ACCUM, Rt.Composite.TEMPORAL_ALPHA, Rt.Composite.TEMPORAL_DISOCCLUSION, Rt.Composite.TILE_JITTER, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Omm.ENABLED,
-            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.Denoise.MODE, Rt.Denoise.NRD_MAX_ACCUMULATED_FRAMES, Rt.Denoise.NRD_RESIDUAL_BILATERAL,
+            Rt.ENABLED, Rt.Renderer.BACKEND, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Composite.MAX_RAY_DISTANCE, Rt.Composite.TEMPORAL_ACCUM, Rt.Composite.TEMPORAL_ALPHA, Rt.Composite.TEMPORAL_DISOCCLUSION, Rt.Composite.TILE_JITTER, Rt.Terrain.ASYNC_DISPATCH_PER_TICK, Rt.Ser.ENABLED, Rt.Omm.ENABLED,
+            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.AsyncCompute.ENABLED, Rt.SubgroupOps.ENABLED, Rt.Denoise.MODE, Rt.Denoise.NRD_MAX_ACCUMULATED_FRAMES, Rt.Denoise.NRD_RESIDUAL_BILATERAL,
+            Rt.Entities.RT_ENTITY_DISTANCE_BLOCKS,
             Rt.Gi.ENABLED, Rt.Gi.CANDIDATES, Rt.Gi.MAX_M_TEMPORAL, Rt.Gi.MAX_M_SPATIAL, Rt.Gi.HEMI_SKY_SCALE, Rt.Gi.HEMI_GROUND_SCALE, Rt.Gi.LIGHTFIELD_BLEND,
             Rt.Hybrid.ENABLED, Rt.Hybrid.ROUGH_THRESHOLD, Rt.Hybrid.LIGHTFIELD_THRESHOLD,
-            Rt.Exposure.MODE, Rt.FrameStats.ENABLED, Rt.DebugOverlay.ENABLED,
+            Rt.Exposure.MODE, Rt.FrameStats.ENABLED, Rt.DebugOverlay.ENABLED, Rt.Probe.ENABLED,
+            Rt.Probe.INTERVAL,
             Rt.Hdr.ENABLED, Rt.Upscaler.MODE, Rt.Upscaler.QUALITY, Rt.Upscaler.SHARPEN, Rt.Upscaler.SHARPNESS,
             Rt.Fsr.PATH,
             Rt.DynamicLights.ENABLED, Rt.DynamicLights.HELD_ITEMS, Rt.DynamicLights.DROPPED_ITEMS,
+            Rt.RestirEnhanced.PAIRED_REUSE_ENABLED, Rt.RestirEnhanced.PAIRED_REUSE_SHUFFLE_PERIOD,
+            Rt.RestirEnhanced.DUPLICATION_MAP_ENABLED, Rt.RestirEnhanced.DUPLICATION_MAP_RADIUS,
+            Rt.RestirEnhanced.FOOTPRINT_RECONNECTION, Rt.RestirEnhanced.FOOTPRINT_MOTION_CAP_PX,
+            Rt.RestirEnhanced.VISIBILITY_REUSE_DI,
+            Rt.RestirEnhanced.QUARTER_RES_RESERVOIR,
+            Rt.RestirEnhanced.UNIFIED_RESERVOIR, Rt.RestirEnhanced.VECTOR_VALUED_WEIGHTS,
+            Rt.RestirEnhanced.RR_PSS_SPLIT, Rt.RestirEnhanced.STREAM_COMPACTION,
         };
     }
 
@@ -605,8 +614,29 @@ public final class CausticaConfig {
         public static final BooleanSetting ENABLED = bool("caustica.rt", "enabled", true);
         public static final IntSetting WORKER_THREADS =
                 intAtLeast("caustica.rt.workerThreads", "worker-threads", defaultWorkerThreads(), 1);
+        // Selects which compiled .spv variant of world.rgen the composite path dispatches.
+        // FULL          — every light channel (NEE + ReSTIR DI + ReSTIR GI + SSS + emissive + specular).
+        //                 Default for NVIDIA RTX-class hardware where the hardware RT pipeline
+        //                 sustains the full trace depth at interactive rates.
+        // SPECULAR_ONLY — only the specular reflection + GGX bounce survive; diffuse NEE /
+        //                 ReSTIR DI / ReSTIR GI / SSS / block-light NEE are #ifdef'd out at
+        //                 compile time. Designed for AMD RDNA / Intel Xe-HPG / any card
+        //                 where the RT pipeline can afford one reflection trace per pixel but
+        //                 not a full path. The 268 KB SPIR-V variant (vs 351 KB for FULL)
+        //                 is materially cheaper to push through the Vulkan driver.
+        public static final EnumSetting<RtMode> MODE = enumSetting(
+                "caustica.rt.mode", "mode", RtMode.FULL, RtMode.class, RtMode::fromKey);
 
         private Rt() {
+        }
+
+        public static final class Renderer {
+            public static final EnumSetting<RendererBackend> BACKEND = enumSetting(
+                    "caustica.rt.renderer", "renderer.backend", RendererBackend.AUTO,
+                    RendererBackend.class, RendererBackend::fromKey);
+
+            private Renderer() {
+            }
         }
 
         public static final class Composite {
@@ -639,10 +669,11 @@ public final class CausticaConfig {
                     bool("caustica.rt.adaptiveSpp", "composite.adaptive-spp", false);
             // Per-tile stochastic jitter is a traversal-coherence optimization, not a quality feature.
             // It adds a small spatially quantized sample pattern which the temporal denoiser must undo.
-            // Keep it opt-in so quality-first configurations match the integrated temporal approach used
-            // by modern RT denoisers; enable it only after measuring the performance gain on a target GPU.
+            // Default ON (2026-09): the NRD pre-warp + TAAU reproject both consume gJitterGuide,
+            // so the pattern is undone downstream; the first-bounce coherence win on
+            // non-SER hardware (RDNA2/3, Arc, RADV) outweighs the warm-up cost.
             public static final BooleanSetting TILE_JITTER =
-                    bool("caustica.rt.tileJitter", "composite.tile-jitter", false);
+                    bool("caustica.rt.tileJitter", "composite.tile-jitter", true);
             // Secondary NEE: in addition to the primary directional light, fire one shadow ray at
             // the moon (when above the horizon and not at a too-thin phase) for every direct-light
             // bounce. Default on; cost = +1 shadow ray per primary hit. Trades a single-firefly risk
@@ -725,8 +756,24 @@ public final class CausticaConfig {
             }
         }
 
+        /**
+         * Shader Execution Reordering (VK_EXT_ray_tracing_invocation_reorder). Optional scheduling
+         * optimisation only — devices without the extension (or with this flag off) fall back to the
+         * {@code world_noser.rgen.spv} raygen and remain fully RT-capable. Default ON; toggle off to
+         * bisect a driver hang (some AMD LLPC builds fault with SER enabled at runtime).
+         */
+        public static final class Ser {
+            public static final BooleanSetting ENABLED = bool("caustica.rt.ser", "ser.enabled", true);
+
+            private Ser() {
+            }
+        }
+
         public static final class Omm {
-            public static final BooleanSetting ENABLED = bool("caustica.rt.omm", "omm.enabled", true);
+            // Vendor-neutral default: OFF. OMM is HW-accelerated on RTX 40+ but
+            // software-emulated elsewhere (extra BLAS memory + build cost, RADV
+            // bugs pending). The any-hit alpha-test fallback is always live.
+            public static final BooleanSetting ENABLED = bool("caustica.rt.omm", "omm.enabled", false);
             public static final IntSetting SUBDIVISION =
                     clampedInt("caustica.rt.ommSubdivision", "omm.subdivision", 4, 0, 6);
             public static final BooleanSetting STATS = bool("caustica.rt.ommStats", "omm.stats", false);
@@ -745,6 +792,12 @@ public final class CausticaConfig {
                     bool("caustica.rt.nameTags", "entities.name-tags.enabled", true);
             public static final IntSetting MAX_ENTITIES =
                     intAtLeast("caustica.rt.maxEntities", "entities.max-entities", 1024, 1);
+            // RT entity budget: entities beyond MAX_ENTITIES stay in vanilla raster
+            // instead of entering the TLAS. Captures are sorted by camera distance
+            // first, so the budget keeps the nearest (most visible) geometry in RT
+            // and drops only far/small casters (villagers, drops, XP orbs at range).
+            public static final IntSetting RT_ENTITY_DISTANCE_BLOCKS =
+                    intAtLeast("caustica.rt.entityDistanceBlocks", "entities.rt-distance-blocks", 48, 0);
             public static final IntSetting BE_VIEW_CHUNKS =
                     intAtLeast("caustica.rt.beViewChunks", "entities.block-entities.view-chunks", 8, 0);
             public static final IntSetting BE_BUILDS_PER_FRAME =
@@ -777,6 +830,48 @@ public final class CausticaConfig {
             }
         }
 
+        /**
+         * Async-compute scheduling for the standalone denoise / temporal-accumulation
+         * compute passes. When ENABLED is true and the device exposes a dedicated
+         * compute queue family (see {@code RtDeviceBringup.asyncComputeAvailable}),
+         * {@code RtAsyncCompute} submits the compute-segment command buffer on the
+         * compute queue and synchronises the graphics queue back via timeline
+         * semaphores after the work lands. Devices without a separate compute family
+         * (and frames where the queue family is shared with the present queue) fall
+         * back to the legacy single-queue path inside {@code RtAsyncCompute.submit}
+         * — the runtime never silently drops the work. Default OFF: turning it on
+         * changes frame pacing (compute work may overlap the next frame's setup),
+         * which a performance-focused player may want exposed via the explicit flag.
+         */
+        public static final class AsyncCompute {
+            public static final BooleanSetting ENABLED =
+                    bool("caustica.rt.asyncCompute", "async-compute.enabled", false);
+
+            private AsyncCompute() {
+            }
+        }
+
+        /**
+         * Subgroup-scheduling optimisation hooks. When ENABLED is true the renderer
+         * prefers the {@code depth_pyramid_group.comp.spv} variant of the denoise
+         * depth-hierarchy shader (built with {@code -DCAUSTICA_SUBGROUP_OPS=1}) which
+         * routes its 4-tap min reduction through {@code subgroupMin()} /
+         * {@code subgroupBallotBitCount()}. Subgroup support is core in Vulkan 1.1;
+         * the project's Vulkan 1.2 baseline already includes it, so this is a
+         * scheduler-style annotation rather than a capability gate. Default ON —
+         * the renderer always builds both variants at compile time and picks the
+         * subgroup one when this flag is true. Toggle off (then rebuild if the
+         * variant you need was excluded) to bisect a driver bug to subgroup
+         * scheduling.
+         */
+        public static final class SubgroupOps {
+            public static final BooleanSetting ENABLED =
+                    bool("caustica.rt.subgroupOps", "subgroup-ops.enabled", true);
+
+            private SubgroupOps() {
+            }
+        }
+
         public static final class DynamicLights {
             public static final BooleanSetting ENABLED = bool("caustica.rt.dynamicLights", "dynamic-lights.enabled", true);
             public static final BooleanSetting HELD_ITEMS =
@@ -789,6 +884,78 @@ public final class CausticaConfig {
                     clampedFloat("caustica.rt.dynamicLights.intensityScale", "dynamic-lights.intensity-scale", 1.0f, 0.0f, 2.0f);
 
             private DynamicLights() {
+            }
+        }
+
+        /**
+         * ReSTIR PT Enhanced algorithmic features. Each sub-flag is independently defaulted so older
+         * configs (which lack the {@code [restir-enhanced]} section) fall through to safe behaviour:
+         * <ul>
+         *   <li>P0 (paired reuse, duplication map): enabled by default; old 9-tap spatial path remains as fallback.</li>
+         *   <li>P1 (footprint reconnection, visibility reuse): enabled by default; existing heuristics are the fallback.</li>
+         *   <li>P2 (unified reservoir, vector-valued weights, RR-PSS split, streaming compaction): off by default;
+         *       the unified reservoir is the highest-risk change and requires lab validation before default-on.</li>
+         * </ul>
+         * See docs/superpowers/specs/2026-07-29-restir-pt-enhanced.md for the upstream paper mapping.
+         */
+        public static final class RestirEnhanced {
+            // P0-1 Paired spatial reuse textures (Lin et al. §3). Default ON; the inline 9-tap merge
+            // in world.rgen stays as the fallback when this is disabled.
+            public static final BooleanSetting PAIRED_REUSE_ENABLED =
+                    bool("caustica.rt.restirEnhanced.pairedReuse", "restir-enhanced.paired-reuse-enabled", true);
+            // Paired reuse table shuffle period (frames). Paper recommends 4–8; 4 is the default.
+            public static final IntSetting PAIRED_REUSE_SHUFFLE_PERIOD =
+                    intAtLeast("caustica.rt.restirEnhanced.pairedReuseShufflePeriod",
+                            "restir-enhanced.paired-reuse-shuffle-period", 4, 1);
+            // P0-2 Duplication map (Lin et al. §5). Default ON; disabling reverts temporal merge to the
+            // hard cap c_default (Gi.MAX_M_TEMPORAL) without D-driven cap reduction.
+            public static final BooleanSetting DUPLICATION_MAP_ENABLED =
+                    bool("caustica.rt.restirEnhanced.duplicationMap", "restir-enhanced.duplication-map-enabled", true);
+            public static final IntSetting DUPLICATION_MAP_RADIUS =
+                    intAtLeast("caustica.rt.restirEnhanced.duplicationMapRadius",
+                            "restir-enhanced.duplication-map-radius", 17, 3);
+            // P1-1 Footprint-based reconnection (Lin et al. §4). Default ON; disabling reverts to the
+            // existing roughness/distance heuristic in temporalValid().
+            public static final BooleanSetting FOOTPRINT_RECONNECTION =
+                    bool("caustica.rt.restirEnhanced.footprintReconnection",
+                            "restir-enhanced.footprint-reconnection", true);
+            // Footprint-rejection screen-space motion cap (pixels). Pixels with motion > this are
+            // rejected in the temporal merge because the projection-radius test (Lin et al. §4
+            // equation 7) is unlikely to pass. Default 25 px — well below the legacy 40 px hard
+            // cap, so more reuse events are rejected when the cap is enabled.
+            public static final FloatSetting FOOTPRINT_MOTION_CAP_PX =
+                    clampedFloat("caustica.rt.restirEnhanced.footprintMotionCapPx",
+                            "restir-enhanced.footprint-motion-cap-px", 25.0f, 1.0f, 200.0f);
+            // P1-2 Visibility reuse on the DI channel. Default ON once cachedVisibility is populated
+            // (currently GI-only; DI opt-in is a follow-up).
+            public static final BooleanSetting VISIBILITY_REUSE_DI =
+                    bool("caustica.rt.restirEnhanced.visibilityReuseDi",
+                            "restir-enhanced.visibility-reuse-di", false);
+            // P2-1 Unified DI+GI single reservoir (Lin et al. §6.1). Experimental; off by default.
+            public static final BooleanSetting UNIFIED_RESERVOIR =
+                    bool("caustica.rt.restirEnhanced.unifiedReservoir",
+                            "restir-enhanced.unified-reservoir", false);
+            // P2-2 Vector-valued weights, RR-PSS split, streaming compaction. Off until lab-validated.
+            public static final BooleanSetting VECTOR_VALUED_WEIGHTS =
+                    bool("caustica.rt.restirEnhanced.vectorValuedWeights",
+                            "restir-enhanced.vector-valued-weights", false);
+            // VRAM/stability-first path for RDNA2/RDNA3/Arc/RADV (2026-09): the DI
+            // + hit-position reservoirs are stored at quarter resolution (1 per 2x2
+            // tile) instead of 1 per pixel. Minecraft's large flat surfaces make
+            // per-pixel reservoirs redundant; expect ~-60% reservoir VRAM and
+            // ~-40% temporal/spatial merge cost. Default ON; disable to restore
+            // the legacy full-resolution reservoirs.
+            public static final BooleanSetting QUARTER_RES_RESERVOIR =
+                    bool("caustica.rt.restirEnhanced.quarterResReservoir",
+                            "restir-enhanced.quarter-res-reservoir", true);
+            public static final BooleanSetting RR_PSS_SPLIT =
+                    bool("caustica.rt.restirEnhanced.rrPssSplit",
+                            "restir-enhanced.rr-pss-split", false);
+            public static final BooleanSetting STREAM_COMPACTION =
+                    bool("caustica.rt.restirEnhanced.streamCompaction",
+                            "restir-enhanced.stream-compaction", false);
+
+            private RestirEnhanced() {
             }
         }
 
@@ -897,9 +1064,13 @@ public final class CausticaConfig {
             // value in caustica_nrd_shim.cpp until native rebuild); lowering to 8-16 saves
             // ~viewport * 4 bytes * 2 of history-texture memory per pixel and shortens the
             // anti-lag window. Range [1, 63] — NRD's documented max is 63.
+            // 2026-08-06: range loosened from [1, 63] to [0, 63]. 0 = disable the NRD REBLUR
+            // anti-lag cap (NRD native treats 0 as "no cap" and accumulates forever, eliminating
+            // the periodic brightness pulse when the cap triggers at low FPS). 1 still means
+            // "reset every frame" (worst-case constant noise), 2-63 is the normal cap range.
             public static final IntSetting NRD_MAX_ACCUMULATED_FRAMES =
                     clampedInt("caustica.rt.denoise.nrdMaxAccumulatedFrames",
-                            "denoise.nrd-max-accumulated-frames", 32, 1, 63);
+                            "denoise.nrd-max-accumulated-frames", 32, 0, 63);
             // Optional post-NRD spatial polish. NRD already performs temporal and spatial filtering;
             // leaving this off avoids a second edge-aware pass preserving a quantized residual pattern.
             // Enable for a strict spatial A/B comparison only.
@@ -1043,6 +1214,24 @@ public final class CausticaConfig {
             }
         }
 
+        /**
+         * Visual-data capture ("black box flight recorder"). When ENABLED, every Nth
+         * frame the composite records per-stage numbers (plate means/variances,
+         * firefly-kill effectiveness, denoise energy, upscale gain, motion /
+         * disocclusion health, NaN poisoning) into {@code <gameDir>/rt-probe/probe.csv}.
+         * Feed the CSV (+ a screenshot taken at the same time) to
+         * {@code scripts/analyze_probe.py} to find which stage is out of range —
+         * no visual guessing needed.
+         */
+        public static final class Probe {
+            public static final BooleanSetting ENABLED = bool("caustica.rt.probe", "probe.enabled", false);
+            public static final IntSetting INTERVAL =
+                    intAtLeast("caustica.rt.probe.interval", "probe.interval-frames", 30, 1);
+
+            private Probe() {
+            }
+        }
+
         /** Startup Vulkan inventory + {@code VK_EXT_device_fault} reporting on device loss. See {@code VulkanDiagnostics}. */
         public static final class Diagnostics {
             /** Heavy driver-side crash diagnostics: vendor diagnostics-config extensions (shader debug
@@ -1135,6 +1324,50 @@ public final class CausticaConfig {
         }
     }
 
+    public enum RendererBackend {
+        JAVA("java"),
+        NATIVE("native"),
+        AUTO("auto");
+
+        final String key;
+        RendererBackend(String key) { this.key = key; }
+        public String key() { return key; }
+
+        public static RendererBackend fromKey(String value) {
+            if (value == null) return AUTO;
+            for (RendererBackend backend : values()) {
+                if (backend.key.equalsIgnoreCase(value) || backend.name().equalsIgnoreCase(value)) {
+                    return backend;
+                }
+            }
+            return AUTO;
+        }
+    }
+
+    /** World RT raygen dispatch mode. Selects which compiled world.rgen SPIR-V variant the
+     * composite path actually dispatches (full vs specular-only, see caustica.toml [rt] mode). */
+    public enum RtMode {
+        FULL("full"),
+        /** Only specular reflection + GGX bounce survive; diffuse NEE / ReSTIR DI / GI / SSS
+         *  are compiled out. Designed for AMD RDNA + Mesa RADV where the hardware RT
+         *  pipeline can afford a reflection trace but not a full path trace. */
+        SPECULAR_ONLY("specular-only");
+
+        final String key;
+        RtMode(String key) { this.key = key; }
+        public String key() { return key; }
+
+        public static RtMode fromKey(String value) {
+            if (value == null) return FULL;
+            for (RtMode mode : values()) {
+                if (mode.key.equalsIgnoreCase(value) || mode.name().equalsIgnoreCase(value)) {
+                    return mode;
+                }
+            }
+            return FULL;
+        }
+    }
+
     /** User-requested upscaler mode. Runtime providers expose capabilities through {@code Upscaler}. */
     public enum UpscalerMode {
         OFF("off"),
@@ -1148,7 +1381,26 @@ public final class CausticaConfig {
          * backward compatibility (older configs don't fail to load) but the
          * AMD path no longer reads it.</li>
          */
-        FSR2("fsr2");
+        FSR2("fsr2"),
+        /**
+         * Classic FSR 3.4 / FFX 3.x upscaler ({@code libcaustica_ffx_fsr3_upscaler.so}).
+         * Loaded via Panama {@code Fsr3Bridge}. Frame generation is NOT enabled —
+         * this is upscaling only, same input contract as classic FSR 2 but with
+         * extra inputs the bridge handles: reactive mask v2, 1×1 R32F exposure
+         * image, view-space-to-meters factor.
+         * RADV/NAVI33 routes to TAAU (see {@link dev.comfyfluffy.caustica.upscale.UpscalerSelector}).
+         */
+        FSR3("fsr3"),
+        /**
+         * FSR 4.1 / FFX 4.x modular upscaler ({@code libffx_fsr41_caustica.so}).
+         * Preferred when {@code libffx_fsr41_linux.a} is present and the FSR 4.1
+         * Linux port's Vulkan backend is shipped. The shim is currently
+         * PROBE_ONLY: the wiring is in place but every dispatch returns -100
+         * and the renderer falls back to a 1:1 blit. Rebuild the shim with
+         * {@code -DCAUSTICA_FFX_FSR41_FULL=ON} once the FSR 4.1 Linux port's
+         * static lib is available.
+         */
+        FSR41("fsr41");
 
         final String key;
         UpscalerMode(String key) { this.key = key; }
@@ -1160,11 +1412,17 @@ public final class CausticaConfig {
                 if (m.key.equalsIgnoreCase(s) || m.name().equalsIgnoreCase(s)) return m;
             }
             // Tolerate legacy / alias keys so old caustica.toml doesn't crash on load.
-            if (s.equalsIgnoreCase("fsr-3") || s.equalsIgnoreCase("fsr3")
-                    || s.equalsIgnoreCase("fsr-2") || s.equalsIgnoreCase("fsr")) {
+            if (s.equalsIgnoreCase("fsr-4") || s.equalsIgnoreCase("fsr4")
+                    || s.equalsIgnoreCase("fsr-41")) {
+                return FSR41;
+            }
+            if (s.equalsIgnoreCase("fsr-2") || s.equalsIgnoreCase("fsr")) {
                 return FSR2;
             }
-            if (s.equalsIgnoreCase("dlss-rr") || s.equalsIgnoreCase("fsr-4")
+            if (s.equalsIgnoreCase("fsr-3") || s.equalsIgnoreCase("fsr3")) {
+                return FSR3;
+            }
+            if (s.equalsIgnoreCase("dlss-rr")
                     || s.equalsIgnoreCase("xess") || s.equalsIgnoreCase("nis")) {
                 return AUTO;
             }
@@ -1194,7 +1452,16 @@ public final class CausticaConfig {
          *  better quality on fine geometry and material boundaries. Same vendor-portable
          *  story as NRD REBLUR. Requires the bundled NRD shim to be built with RELAX
          *  support (caustica_nrd_create_relax_v2 symbol). 2026-07-21. */
-        RELAX("relax");
+        RELAX("relax"),
+        /** Official FidelityFX Denoiser 1.2 native provider via the bundled
+         *  shim ({@code libffx_denoiser_caustica.so}). Wires through AMD's
+         *  standalone denoiser SDK (the same effect the FSR 4.1 Linux port
+         *  uses for its trace-validation path). The shim is PROBE_ONLY until
+         *  AMD's shader blobs are built; while that is the case the
+         *  provider falls back to {@link OfficialFfxDenoiseBackend}'s
+         *  SPIR-V path internally and the user-visible behaviour matches
+         *  {@code FFX}. */
+        FFX_NATIVE("ffx-native");
 
         final String key;
         DenoiserKind(String key) { this.key = key; }

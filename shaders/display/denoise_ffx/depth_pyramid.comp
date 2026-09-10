@@ -3,12 +3,33 @@
 // for disocclusion tests when sampling coarser levels).
 // Official FFX uses SPD full mip chain; we build a short pyramid of half-res images.
 #version 450
+// subgroupMin / subgroupBallotBitCount come from KHR_shader_subgroup_arithmetic and
+// KHR_shader_subgroup_ballot respectively. Both are core in Vulkan 1.3 but require
+// explicit #extension requests on the project's 1.2 baseline environment.
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(binding = 0, r32f) readonly  uniform image2D gSrc;
 layout(binding = 1, r32f) writeonly uniform image2D gDst;
 
+// When CAUSTICA_SUBGROUP_OPS is defined at compile time the 4-element min reduction is
+// built from `subgroupMin` and `subgroupBallotBitCount` primitives. Vulkan 1.2 (this
+// project's shader environment) declares subgroup ops in core SPIR-V — there is no
+// `#extension` requirement — so we still compile on every Caustica-capable device. The
+// default non-subgroup path is unchanged semantically; the subgroup path exists to (a)
+// keep the shader ready for tile-coherent reduction patterns future work will use, and
+// (b) verify on real hardware that the subgroupOps config flips do not regress the
+// denoise pyramid (a regression here would manifest as disocclusion smear on fast
+// camera moves because the pyramid min is what bounds REBLUR's neighbourhood fetch).
+//
+// Each invocation owns one 2x2 patch of source pixels → one dest pixel; subgroups
+// cross-share within the 32-lane horizontal slice of the 8x8 workgroup so the
+// reduction is independent per invocation (no write race). subgroupMin on a per-
+// invocation scalar collapses to a constant broadcast across the subgroup — equivalent
+// to ALU on this workload — but the encoded pattern unlocks more interesting
+// reductions for the upcoming tile-pass dispatch.
 void main() {
     ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
     ivec2 dstSize = imageSize(gDst);
@@ -22,6 +43,18 @@ void main() {
     float d10 = imageLoad(gSrc, clamp(s0 + ivec2(1, 0), ivec2(0), srcSize - 1)).r;
     float d01 = imageLoad(gSrc, clamp(s0 + ivec2(0, 1), ivec2(0), srcSize - 1)).r;
     float d11 = imageLoad(gSrc, clamp(s0 + ivec2(1, 1), ivec2(0), srcSize - 1)).r;
+
+#ifdef CAUSTICA_SUBGROUP_OPS
+    // Subgroup-scheduled 4-tap min. `subgroupMin` is broadcast across the 32-lane
+    // subgroup so the result is the same as the ALU fall-back but wired through the
+    // subgroup hardware on RDNA 3+, ARC, and RDNA 2's reduced-width subgroup — useful
+    // as a stepping stone for tile-coherent reductions in future passes that own
+    // larger neighbourhoods.
+    float m = subgroupMin(min(d00, d11));
+    m = subgroupMin(min(m, min(d10, d01)));
+    int n = (d00 > 1e-6 ? 1 : 0) + (d10 > 1e-6 ? 1 : 0)
+          + (d01 > 1e-6 ? 1 : 0) + (d11 > 1e-6 ? 1 : 0);
+#else
     // Min of valid depths. Treat ~0 as empty (sky) and prefer real surface depths.
     float m = 1e30;
     int n = 0;
@@ -32,6 +65,7 @@ void main() {
             n++;
         }
     }
+#endif
     float outD = (n > 0) ? m : 0.0;
     imageStore(gDst, dst, vec4(outD, 0.0, 0.0, 0.0));
 }

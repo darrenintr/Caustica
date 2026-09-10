@@ -60,10 +60,16 @@ public final class CausticaMod implements ModInitializer {
 		LOGGER.info("[caustica_native] {}", amdFfxCheck);
 
 		// Phase 3 follow-up: minimum real call into the AMD FFX 2.x modular API.
-		// dlopen the loader, ffxQuery for the denoiser effect (FFX_API_EFFECT_ID_DENOISER).
-		// Tells us whether the loader actually exposes a usable denoiser effect, not
-		// just six symbols. Still no Vulkan handles, no context, no dispatch.
+		// dlopen the loader, ffxQuery for the denoiser effect (0x50000).
+		// NOTE: the 2.x loader ships no denoiser provider (upscale/framegen only; the 1.x
+		// denoiser predates the provider model), so rc=4 NO_PROVIDER is the EXPECTED healthy
+		// answer here — it proves the query path works, not that denoising is broken.
+		// The real 1.x denoiser .so is probed separately by NativeFfxDenoiseBackend.
 		String amdFfxDenoiser = NativeBridge.tryCheckAmdFfxDenoiser(LOGGER);
-		LOGGER.info("[caustica_native] {}", amdFfxDenoiser);
+		if (amdFfxDenoiser.contains("rc=4")) {
+			LOGGER.info("[caustica_native] {} (expected: 2.x loader has no denoiser provider)", amdFfxDenoiser);
+		} else {
+			LOGGER.info("[caustica_native] {}", amdFfxDenoiser);
+		}
 	}
 }

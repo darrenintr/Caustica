@@ -98,6 +98,16 @@ public final class RtEntities {
         return CausticaConfig.Rt.Entities.MAX_ENTITIES.value();
     }
 
+    private static int rtEntityDistanceBlocks() {
+        return CausticaConfig.Rt.Entities.RT_ENTITY_DISTANCE_BLOCKS.value();
+    }
+
+    /** One model entity queued for capture, sorted nearest-first so the RT budget keeps visible geometry. */
+    private record EntityCandidate(Entity entity, double dist2, float ix, float iy, float iz, boolean firstPersonSelf) {
+    }
+
+    private final ArrayList<EntityCandidate> entityCandidates = new ArrayList<>();
+
     private static int entityListCapacity() {
         return CausticaConfig.Rt.Entities.entityListCapacity();
     }
@@ -132,7 +142,7 @@ public final class RtEntities {
     // trace never races a later frame's host write. > frames-in-flight (mirrors RtPipeline RING).
     private static final int TABLE_RING = 6;
     // Frames a per-frame entity resource (mesh buffers + BLAS + scratch) must outlive before it's freed.
-    private static final int KEEP_FRAMES = 4;
+    private static final int KEEP_FRAMES = 8;
     private static final int FRAME_LIST_RING = KEEP_FRAMES;
     // Refit (UPDATE-mode) BLAS: persistent per-entity AS, refit in place each frame (cheap) while
     // topology is stable, instead of a full BUILD. Block entities always use the pooled-BUILD path.
@@ -491,18 +501,55 @@ public final class RtEntities {
         glowCamOffsetX = (float) (cameraState.pos.x - rbx);
         glowCamOffsetY = (float) (cameraState.pos.y - rby);
         glowCamOffsetZ = (float) (cameraState.pos.z - rbz);
+        // RT entity budget (2026-09): sort nearest-first so MAX_ENTITIES keeps the
+        // most visible geometry in the TLAS and drops only far/small casters.
+        // Beyond the distance gate (default 48 blocks) entities stay in vanilla
+        // raster instead of entering RT — cheap, and their contribution at that
+        // range is sub-pixel. The camera entity itself is always kept (needed for
+        // reflections/shadows via MASK_SECONDARY).
+        double camWx = cameraState.pos.x;
+        double camWy = cameraState.pos.y;
+        double camWz = cameraState.pos.z;
+        int distGate = rtEntityDistanceBlocks();
+        double distGate2 = distGate <= 0 ? Double.POSITIVE_INFINITY : (double) distGate * distGate;
+        List<EntityCandidate> candidates = entityCandidates;
+        candidates.clear();
+        int seenEntities = 0;
+        int culledByDistance = 0;
         for (Entity entity : level.entitiesForRendering()) {
-            if (build.full()) {
-                break;
-            }
             if (entity.isInvisible()) {
                 continue;
             }
+            seenEntities++;
             boolean firstPersonSelf = entity == cameraEntity && firstPerson;
-            int mask = firstPersonSelf ? MASK_SECONDARY : MASK_ALL;
             float ix = (float) Mth.lerp(partial, entity.xo, entity.getX());
             float iy = (float) Mth.lerp(partial, entity.yo, entity.getY());
             float iz = (float) Mth.lerp(partial, entity.zo, entity.getZ());
+            double dx = ix - camWx;
+            double dy = iy - camWy;
+            double dz = iz - camWz;
+            double dist2 = dx * dx + dy * dy + dz * dz;
+            if (!firstPersonSelf && dist2 > distGate2) {
+                culledByDistance++;
+                continue;
+            }
+            candidates.add(new EntityCandidate(entity, dist2, ix, iy, iz, firstPersonSelf));
+        }
+        if (candidates.size() > 1) {
+            candidates.sort((a, b) -> Double.compare(a.dist2(), b.dist2()));
+        }
+        int droppedByBudget = 0;
+        for (EntityCandidate candidate : candidates) {
+            if (build.full()) {
+                droppedByBudget++;
+                continue;
+            }
+            Entity entity = candidate.entity();
+            boolean firstPersonSelf = candidate.firstPersonSelf();
+            int mask = firstPersonSelf ? MASK_SECONDARY : MASK_ALL;
+            float ix = candidate.ix();
+            float iy = candidate.iy();
+            float iz = candidate.iz();
             int id = entity.getId();
             EntityPrev prev = prevVerts.get(id);
             capture.reset(prev != null ? prev.size / 3 : 0);
@@ -553,6 +600,17 @@ public final class RtEntities {
                 appendCapture(ctx, build, motion, id, ENTITY_BIT, mask);
             }
             RtFrameStats.FRAME.count("entitiesCaptured", 1);
+        }
+        try {
+            if (culledByDistance > 0) {
+                RtFrameStats.FRAME.count("entitiesCulledDistance", culledByDistance);
+            }
+            if (droppedByBudget > 0) {
+                RtFrameStats.FRAME.count("entitiesDroppedBudget", droppedByBudget);
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            candidates.clear();
         }
         Map<Integer, EntityPrev> oldPrev = prevVerts;
         prevVerts = curVerts;

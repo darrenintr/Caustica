@@ -82,6 +82,15 @@ public final class DenoiseBackendSelector {
             CausticaMod.LOGGER.info("  → FFX shadow/reflection + temporal radiance cleanup (no NRD)");
             return tryCreate(new AmdFidelityFxDenoiseBackend(), true);
         }
+        // FFX_NATIVE: prefers the bundled FFX denoiser shim (FULL link mode
+        // forwards shadow / reflection dispatch to the AMD standalone SDK),
+        // shadows to the SPIR-V hosted FFX path while the shim is
+        // probe-only. Net behaviour matches FFX today; flips to native
+        // SDK dispatch once -DCAUSTICA_FFX_DENOISER_LINK_SDK=ON is on.
+        if (mode == CausticaConfig.DenoiserKind.FFX_NATIVE) {
+            CausticaMod.LOGGER.info("  → FFX denoiser native (shim + SPIR-V hosted fallback)");
+            return tryCreate(new NativeFfxDenoiseBackend(), true);
+        }
         // BILATERAL: explicit spatial-only denoise. Portable performance floor — about 0.5 ms,
         // no NRD native dispatch and no SDK call.
         // Quality: edge-stopped 3x3 filter, no temporal. Leaves some grain on flat surfaces

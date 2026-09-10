@@ -231,9 +231,11 @@ public final class TaaUpscaler implements Upscaler {
             push.putFloat(4, (float) renderHeight);
             push.putFloat(8, (float) displayWidth);
             push.putFloat(12, (float) displayHeight);
-            // MV passed in is in render pixels; we want delta in display UV: mv / dstSize.
-            push.putFloat(16, 1.0f / displayWidth);
-            push.putFloat(20, 1.0f / displayHeight);
+            // MV is in RENDER pixels; display UV delta = renderPx / renderSize
+            // (== displayPx / displaySize). Dividing by display size under-projects
+            // by the upscale ratio (0.5x render → half the reproject offset → swim).
+            push.putFloat(16, 1.0f / renderWidth);
+            push.putFloat(20, 1.0f / renderHeight);
             // Composite feeds NRD/FFX-denoised beauty into TAAU. A second heavy temporal pass
             // (old alpha≈0.55, matte rough→0.27 current) milks the plate. Prefer current frame:
             // near-native = mild AA only; downscaled = slightly more history for upsample noise.
@@ -247,9 +249,12 @@ public final class TaaUpscaler implements Upscaler {
             push.putFloat(28, CausticaConfig.Rt.Composite.TEMPORAL_DISOCCLUSION.value());
             float sharpness = CausticaConfig.Rt.Upscaler.SHARPEN.value()
                     ? CausticaConfig.Rt.Upscaler.SHARPNESS.value() : 0.0f;
-            // Full sharpness range for the upsample kernel (shader multiplies; was *0.5 which
-            // halved user sharpness on top of RCAS post-pass already running).
-            push.putFloat(32, sharpness);
+            // Single sharpen stage only: the RCAS post-pass below owns sharpening.
+            // Passing sharpness into the shader too would stack in-shader unsharp +
+            // RCAS + the renderer's outer CAS polish (triple sharpen on noise).
+            // The shader's unsharp path runs only when RCAS will NOT run.
+            boolean rcasWillRun = sharpness > 1e-4f && casPipeline != 0L && casScratch != null;
+            push.putFloat(32, rcasWillRun ? 0.0f : sharpness);
             // varianceClipGamma: lower = tighter clip = less history bleed / less milk.
             push.putFloat(36, 1.0f);
             push.putInt(40, historyInitialized ? 1 : 0);
@@ -277,12 +282,37 @@ public final class TaaUpscaler implements Upscaler {
             // --- RCAS post-pass (AMD CAS sharpening, same algorithm as FFX RCAS) ---
             // Runs at display res, reads from `out` (just written by TAAU), writes back to `out`
             // in-place via descriptor aliasing. Skipped if sharpness <= 1e-4.
+            // In-place read-after-write in the SAME command buffer needs an explicit
+            // barrier: the TAAU store to `out` must be visible before RCAS loads it.
+            // Without this the RCAS tap can read stale/torn texels (one-frame lag
+            // shimmer on edges). RtComposite's post-upscale barrier comes too late.
+            // Single-sharpen rule: the TAAU main pass got sharpness=0 above exactly
+            // when this block runs (see rcasWillRun), so RCAS is the ONLY in-TAAU
+            // sharpen stage. (The renderer's outer CAS polish after upscale is a
+            // separate user-facing knob.)
             float sharpen = CausticaConfig.Rt.Upscaler.SHARPEN.value()
                     ? CausticaConfig.Rt.Upscaler.SHARPNESS.value() : 0.0f;
             if (sharpen > 1e-4f && casPipeline != 0L && casScratch != null) {
-                try {
-                    bindCasDescriptors(stack, out, out);
-                    ByteBuffer casPush = stack.malloc(16);
+                try (MemoryStack barrierStack = MemoryStack.stackPush()) {
+                    org.lwjgl.vulkan.VkImageMemoryBarrier2.Buffer rcasBar =
+                            org.lwjgl.vulkan.VkImageMemoryBarrier2.calloc(1, barrierStack);
+                    rcasBar.get(0).sType$Default()
+                            .srcStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                            .srcAccessMask(VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                            .dstStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                            .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT)
+                            .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                            .newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                            .image(out.image)
+                            .subresourceRange(it -> it.aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                                    .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1));
+                    org.lwjgl.vulkan.VkDependencyInfo rcasDep =
+                            org.lwjgl.vulkan.VkDependencyInfo.calloc(barrierStack).sType$Default()
+                                    .pImageMemoryBarriers(rcasBar);
+                    org.lwjgl.vulkan.KHRSynchronization2.vkCmdPipelineBarrier2KHR(
+                            new VkCommandBuffer(cmd, vkDevice.vkDevice()), rcasDep);
+                    bindCasDescriptors(barrierStack, out, out);
+                    ByteBuffer casPush = barrierStack.malloc(16);
                     casPush.putInt(0, displayWidth);
                     casPush.putInt(4, displayHeight);
                     casPush.putFloat(8, Math.min(sharpen, 1.0f));
@@ -290,7 +320,7 @@ public final class TaaUpscaler implements Upscaler {
                     VkCommandBuffer casCb = new VkCommandBuffer(cmd, vkDevice.vkDevice());
                     VK10.vkCmdBindPipeline(casCb, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, casPipeline);
                     VK10.vkCmdBindDescriptorSets(casCb, VK10.VK_PIPELINE_BIND_POINT_COMPUTE,
-                            casPipelineLayout, 0, stack.longs(casDescriptorSets[0]), null);
+                            casPipelineLayout, 0, barrierStack.longs(casDescriptorSets[0]), null);
                     VK10.vkCmdPushConstants(casCb, casPipelineLayout,
                             VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, casPush);
                     int casGx = (displayWidth + 7) / 8;
@@ -436,7 +466,10 @@ public final class TaaUpscaler implements Upscaler {
                     null, pLayout);
             pipelineLayout = pLayout.get(0);
 
-            // Linear sampler for history.
+            // Linear sampler for history (bilinear reproject).
+            // NOTE: the jitterGuide binding reuses this sampler object, but the
+            // shader now reads the guide with texelFetch (nearest) — the sampler
+            // is ignored for that binding. Do NOT "fix" this by splitting samplers.
             VkSamplerCreateInfo samplerInfo = VkSamplerCreateInfo.calloc(stack).sType$Default()
                     .magFilter(VK10.VK_FILTER_LINEAR).minFilter(VK10.VK_FILTER_LINEAR)
                     .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_NEAREST)
@@ -482,8 +515,9 @@ public final class TaaUpscaler implements Upscaler {
                                   RtImage inMotionLow, RtImage inNormalLow, RtImage inAlbedoLow,
                                   RtImage prevHistory, RtImage newHistory, RtImage out) {
         long descriptorSet = descriptorSets[setIndex];
-        // jitterGuide is optional; when null use a placeholder (any view) — the sampler
-        // returns 0.5 which the shader decodes to offset=0, preserving legacy behaviour.
+        // jitterGuide is REQUIRED for correct reprojection (tile-quantized jitter
+        // is always on in world.rgen). Null only happens with a stale shader set;
+        // the shader texelFetches whatever is bound, so keep the legacy placeholder.
         long jitterView = (jitterGuide != null) ? jitterGuide.view : inColorLow.view;
         long[] views = {
                 inColorLow.view,

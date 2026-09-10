@@ -1,0 +1,26 @@
+// Caustica — Vulkan cube demo compute shader (spike only).
+//
+// Trivially increments a single uint in the output storage buffer
+// (one invocation). The dispatch reads back the value to confirm
+// compute shaders actually run on this device. There is no image
+// rendering — that comes in a later iteration.
+#version 450
+layout(local_size_x = 4) in;
+layout(set = 0, binding = 0) buffer Spike {
+    uint counter;
+    uint marker;
+} o;
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        o.counter = 0u;
+        o.marker = 0xCAFEu;
+    }
+
+    memoryBarrierBuffer();
+    barrier();
+
+    if (gl_LocalInvocationIndex == 1u) {
+        atomicAdd(o.counter, 7u);
+    }
+}

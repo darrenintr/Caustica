@@ -187,6 +187,33 @@ public interface Upscaler {
     }
 
     /**
+     * Bind the compositor-owned 1×1 R32_SFLOAT exposure image (single linear scale
+     * multiplier). FSR 3's {@code FfxFsr3DispatchParams} expects this; passing 0/0
+     * causes the SDK to fall back to the {@code preExposure} scalar. RtComposite
+     * calls this once per frame after the exposure pipeline is sized; the image
+     * still holds the previous frame's value at that point because exposure is
+     * recorded after the upscale (acceptable — AE changes smoothly frame-to-frame).
+     *
+     * <p>Default no-op is safe: upscalers that don't read exposure (FSR 2, XeSS,
+     * TAAU) ignore it.
+     */
+    default void setExposureImage(RtImage exposure) {
+    }
+
+    /**
+     * v2: Bind additional material-property guides for enhanced reactive mask derivation.
+     * When all three are non-null, the reactive mask shader uses material-aware logic:
+     *   - {@code specAlbedo.w} = metalness → boost reactive on metallic surfaces
+     *   - {@code emission} = emissive strength → boost reactive on emissive pixels
+     *   - {@code materialFlags} = material classification (glass/water) → boost reactive on transparent surfaces
+     *
+     * <p>Falls back to v1 (motion+depth divergence only) when any of these are null.
+     * Caller (RtComposite) should set this alongside {@link #setReactiveMaskGuides}.
+     */
+    default void setMaterialGuides(RtImage specAlbedo, RtImage emission, RtImage materialFlags) {
+    }
+
+    /**
      * Inject the composite-owned RT plate bridge. Implementations must treat it as
      * non-owning and must not destroy it. Format-adapting upscalers (currently
      * classic FSR2) use it for denoise-to-upscale staging.

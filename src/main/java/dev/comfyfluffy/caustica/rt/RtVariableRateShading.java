@@ -192,7 +192,7 @@ public final class RtVariableRateShading {
     }
 
     private ByteBuffer loadShader(String name) {
-        try (InputStream in = getClass().getClassLoader().getResourceAsStream("assets/caustica/shaders/" + name)) {
+        try (InputStream in = getClass().getResourceAsStream("/caustica/rt/" + name)) {
             if (in == null) {
                 throw new IllegalStateException("Shader not found: " + name);
             }

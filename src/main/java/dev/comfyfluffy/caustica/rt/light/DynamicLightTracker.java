@@ -47,6 +47,23 @@ public final class DynamicLightTracker {
         boolean droppedItems = dev.comfyfluffy.caustica.CausticaConfig.Rt.DynamicLights.DROPPED_ITEMS.value();
         boolean entityLights = dev.comfyfluffy.caustica.CausticaConfig.Rt.DynamicLights.ENTITIES.value();
 
+        // 🔍 DEBUG: 计算实体数量
+        int entityCount = 0;
+        int playerCount = 0;
+        for (Entity entity : entities) {
+            entityCount++;
+            if (entity instanceof Player) {
+                playerCount++;
+            }
+        }
+
+        // 🔍 DEBUG: 记录每次更新
+        if (revision % 30 == 0) {
+            dev.comfyfluffy.caustica.CausticaMod.LOGGER.info(
+                "[DynamicLight] updateFrame: {} entities ({} players), config: held={} dropped={} entities={}",
+                entityCount, playerCount, heldItems, droppedItems, entityLights);
+        }
+
         for (Entity entity : entities) {
             if (entity.isRemoved() || !entity.isAlive()) {
                 continue;
@@ -70,6 +87,11 @@ public final class DynamicLightTracker {
                         scaledLight,
                         getHeldLightColor(entity)
                     ));
+                    // 🔍 DEBUG: 记录检测到的手持光源（改为 INFO 确保输出）
+                    dev.comfyfluffy.caustica.CausticaMod.LOGGER.info(
+                        "[DynamicLight] Detected held light: entity={} type={} light={} pos=({}, {}, {})",
+                        entityId, entity.getType().getDescription().getString(),
+                        heldLight, (int)pos.x, (int)pos.y, (int)pos.z);
                     continue; // One light per entity
                 }
             }
@@ -165,8 +187,24 @@ public final class DynamicLightTracker {
         int maxLight = 0;
 
         if (entity instanceof Player player) {
-            maxLight = Math.max(maxLight, getItemLightLevel(player.getMainHandItem()));
-            maxLight = Math.max(maxLight, getItemLightLevel(player.getOffhandItem()));
+            ItemStack mainHand = player.getMainHandItem();
+            ItemStack offHand = player.getOffhandItem();
+
+            int mainLight = getItemLightLevel(mainHand);
+            int offLight = getItemLightLevel(offHand);
+
+            maxLight = Math.max(mainLight, offLight);
+
+            // 🔍 DEBUG: 记录玩家手持物品检测
+            if (!mainHand.isEmpty() || !offHand.isEmpty()) {
+                dev.comfyfluffy.caustica.CausticaMod.LOGGER.info(
+                    "[DynamicLight] Player {} mainHand={} (light={}) offHand={} (light={})",
+                    player.getName().getString(),
+                    mainHand.isEmpty() ? "empty" : mainHand.getItem().toString(),
+                    mainLight,
+                    offHand.isEmpty() ? "empty" : offHand.getItem().toString(),
+                    offLight);
+            }
         } else if (entity instanceof LivingEntity living) {
             // For mobs, check main hand item
             ItemStack mainHand = living.getMainHandItem();
@@ -211,9 +249,18 @@ public final class DynamicLightTracker {
 
         // Try to get the block state from the item
         Block block = Block.byItem(stack.getItem());
-        if (block != null) {
+        if (block != null && block != net.minecraft.world.level.block.Blocks.AIR) {
             BlockState state = block.defaultBlockState();
-            return state.getLightEmission();
+            int light = state.getLightEmission();
+
+            // 🔍 DEBUG: 记录所有物品检测（改为 INFO 级别确保输出）
+            if (light > 0) {
+                dev.comfyfluffy.caustica.CausticaMod.LOGGER.info(
+                    "[DynamicLight] Item {} has light level {}",
+                    stack.getItem().toString(), light);
+            }
+
+            return light;
         }
 
         return 0;

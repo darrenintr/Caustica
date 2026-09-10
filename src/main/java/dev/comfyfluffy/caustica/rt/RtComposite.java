@@ -50,9 +50,12 @@ import dev.comfyfluffy.caustica.rt.accel.RtImage;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
 import dev.comfyfluffy.caustica.rt.material.RtMaterialSystem;
+import dev.comfyfluffy.caustica.rt.pipeline.RtBreakOverlayPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDisplayPipeline;
+import dev.comfyfluffy.caustica.rt.pipeline.RtDuplicationMapPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtExposure;
 import dev.comfyfluffy.caustica.rt.pipeline.RtHdrCompositePipeline;
+import dev.comfyfluffy.caustica.rt.pipeline.RtPairedReusePipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtSdrPresentPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtTemporalAccumulation;
@@ -87,6 +90,13 @@ public final class RtComposite {
         return CausticaConfig.Rt.ENABLED.value();
     }
 
+    /** True when caustica.toml [rt] mode = "specular-only". The composite stage reads vanilla
+     * SDR + Caustica reflection output instead of replacing vanilla with the full path-trace. */
+    public static boolean isSpecularOnlyMode() {
+        return CausticaConfig.Rt.MODE.value()
+                == dev.comfyfluffy.caustica.CausticaConfig.RtMode.SPECULAR_ONLY;
+    }
+
     // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80) + debugView(@88) + frameIndex(@92)
     // + prevViewProj(@96) + camDelta(@160) + spp(@172) + jitter(@176) + entityTableAddr(@184)
     // + flags(@192): bit 0 = camera submerged, bit 1 = PBR BRDF enabled, bit 4 = water waves, bit 5 = tile jitter
@@ -107,8 +117,11 @@ public final class RtComposite {
     // ReSTIR GI: 32 bytes for giEnabled(4) + giCandidates(4) + giMaxMTemporal(4) + giMaxMSpatial(4)
     // + giAmbientParams vec4 (16) @592
     private static final int GI_PUSH_BYTES = 32;
-    // Hybrid: 16 bytes for hybridEnabled(4) + hybridRoughThreshold(4) + hybridLightfieldThreshold(4) + pad(4) @624
-    private static final int HYBRID_PUSH_BYTES = 16;
+    // Hybrid base: 16 bytes for hybridEnabled(4) + hybridRoughThreshold(4) +
+    // hybridLightfieldThreshold(4) + pairedReuseActive(4) @624..@640.
+    // + ReSTIR PT Enhanced §4 footprint (8 bytes): footprintReconnectionActive(@640) +
+    // footprintMotionCapPx(@644), padded to 32 so WORLD_PUSH_SIZE covers the writes.
+    private static final int HYBRID_PUSH_BYTES = 32;
     private static final int WORLD_PUSH_SIZE = BREAKING_OFFSET + MAX_BREAKING * 16
             + RESTIR_PUSH_BYTES + LIGHTFIELD_PUSH_BYTES + GI_PUSH_BYTES + HYBRID_PUSH_BYTES;
     // Real inline push constants (fast constant-bank reads), separate from the WORLD_PUSH_SIZE BDA ring
@@ -124,29 +137,37 @@ public final class RtComposite {
     // 13-16 GI reservoir images (currA, currB, prevA, prevB), 17-22 misc guides,
     // 23 tile-jitter guide (R8G8).
     private static final int GUIDE_COUNT = 24; // bindings 3..26 (guides + standard RT outputs)
+    // ReSTIR PT Enhanced §5 duplication-map bindings (P0-2). Two extra storage images appended to
+    // the GUIDE set so the temporal merge in world.rgen can sample last-frame's V2-match ratio.
+    // Slot 24 = binding 27 = gDupMapCurr (this frame); slot 25 = binding 28 = gDupMapPrev
+    // (last frame, after the per-frame ping-pong swap).
+    private static final int DUP_MAP_SLOT_CURR = 24;
+    private static final int DUP_MAP_SLOT_PREV = 25;
+    // ReSTIR PT Enhanced §4 footprint-based reconnection (P1-1). Two extra storage images store
+    // the per-pixel world-space hit position (terrain-rebased) in a parallel ping-pong pair —
+    // the DI reservoir is 16 B packed (1× uvec4) and has no room for an extra vec3 inside it.
+    // Slot 26 = binding 29 = gHitPosCurr (this frame); slot 27 = binding 30 = gHitPosPrev
+    // (last frame). R32G32B32A32_FLOAT keeps the layout aligned with the GI reservoir images.
+    private static final int HIT_POS_SLOT_CURR = 26;
+    private static final int HIT_POS_SLOT_PREV = 27;
+    private static final int GUIDE_COUNT_WITH_DUP_MAP = 26;
+    private static final int GUIDE_COUNT_WITH_HIT_POS = 28;
 
-    // ReSTIR Direct Illumination feature flag
-    // ReSTIR DI currently loses the AMD device after the live light set grows while NRD is
-    // active (VK_ERROR_DEVICE_LOST is reported later by swapchain acquire). Keep the stable
-    // direct-light path as the baseline until the reservoir/resource lifetime path is rebuilt.
-    private static final boolean ENABLE_RESTIR_DI = false;
-    private static final boolean ENABLE_RESTIR_GI = false;
-    private static final boolean ENABLE_LIGHTFIELD_GI = false;
-    // Stable RT baseline: dynamic entity BLAS capture/refit is temporarily isolated from the
-    // terrain-only TLAS while AMD device-loss causes are being reduced to one submission path.
-    private static final boolean ENABLE_DYNAMIC_ENTITY_RT = false;
-    // Stable profiling baseline: keep VRS and pseudo-async compute out of the frame until their
-    // individual cost and synchronization behavior are measured in isolation.
-    private static final boolean ENABLE_VRS = false;
-    private static final boolean ENABLE_ASYNC_COMPUTE = false;
-    private static final boolean ENABLE_DRS = false;
+    // ReSTIR Direct Illumination: the stable baseline direct-light path. Always on; toggling
+    // is exposed via the ConfigBridge in pause menu (Rt.RestirEnhanced flags modulate its reuse
+    // variants, not the DI path itself).
+    private static final boolean ENABLE_RESTIR_DI = true;
+    // Stable RT baseline: async compute dispatch. Mesa/RADV requires explicit async-queue
+    // submission, so this is on by default. The Hybrid/Hard fallback path picks sync queue
+    // automatically if async isn't available.
+    private static final boolean ENABLE_ASYNC_COMPUTE = true;
     // Adaptive SPP: path tracer spends extra samples on transparent/water/emissive-adjacent pixels.
     // Hard-disabled during RADV isolation; re-enabled now that the RT path is stable.
     private static final boolean ENABLE_ADAPTIVE_SPP = true;
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
     // the composite frame counter has advanced this far past it (so no in-flight frame still reads it).
-    private static final int KEEP_FRAMES = 4;
+    private static final int KEEP_FRAMES = 8;
 
     private static int debugView() {
         return CausticaConfig.Rt.Composite.DEBUG_VIEW.value();
@@ -252,7 +273,6 @@ public final class RtComposite {
     public static long frameCounter() {
         return frameCounter;
     }
-
     /** Forward vanilla block edits to the bounded light-cache updater. */
     public void markBlockLightsDirty(int minX, int minY, int minZ, int maxX, int maxY, int maxZ) {
         if (unifiedLightManager != null) {
@@ -302,6 +322,8 @@ public final class RtComposite {
 
     // Variable Rate Shading for adaptive sampling
     private RtVariableRateShading vrs;
+    // Latched on first VRS failure: VRS is optional, a broken shader must not spam the log.
+    private boolean vrsInitFailed;
     // Firefly-killed radiance plate. Written by the FireflyKill pass (3x3 median)
     // and read by both NRD (gBeautyRaw) and TAAU (inColorLow). Replaces the raw
     // path-tracer output as the source of truth for both temporal paths so
@@ -337,6 +359,12 @@ public final class RtComposite {
     private volatile boolean lastNrdComposeOk;
     private volatile float lastJitterPixelsX;
     private volatile float lastJitterPixelsY;
+    // Last computed celestial light (writeSky → push @208..252), snapshotted for the probe log.
+    private volatile float lastSkySunY;
+    private volatile float lastSkyDayFactor;
+    private volatile float lastSkyLightR;
+    private volatile float lastSkyLightG;
+    private volatile float lastSkyLightB;
     // Frame-generation "hudless" resource: a copy of the main render target before the combined UI overlay
     // composites back on top. Lazily allocated (only meaningful once FG + the UI overlay redirect are both
     // active), resized on demand.
@@ -366,6 +394,29 @@ public final class RtComposite {
     private final Matrix4f fgClipToPrev = new Matrix4f();
     private final Matrix4f fgPrevToClip = new Matrix4f();
     private final Matrix4f fgMatTmp = new Matrix4f();
+    // Post-tonemap destroy-stage crack overlay (Tier 2 from the legacy SDK stack). Running it on
+    // the HDR display image AFTER the temporal upscaler instead of inside world.rchit's
+    // applyBreaking() keeps the breaking block's per-frame stage transition out of the NRD/FSR2
+    // history and the auto-exposure histogram — that's what was causing the world-wide twinkle
+    // during mining. The pipeline is shared across all breaking blocks; we just rebind a
+    // different destroy-stage texture per dispatch.
+    private RtBreakOverlayPipeline breakOverlayPipeline;
+    // Per-frame breaking list captured at the end of writeBreaking() and consumed in presentHdr.
+    // blockX/Y/Z/Slot are rebased against the terrain origin (same space as the world push
+    // breaking list). lastBreakInvViewProj / lastBreakCamOffset were captured at the same push
+    // site so the overlay's unprojection matches the trace's hit positions to the exact pixel.
+    private final int[] lastBreakPosX = new int[MAX_BREAKING];
+    private final int[] lastBreakPosY = new int[MAX_BREAKING];
+    private final int[] lastBreakPosZ = new int[MAX_BREAKING];
+    private final int[] lastBreakSlot = new int[MAX_BREAKING];
+    private int lastBreakCount;
+    private boolean lastBreakValid;
+    private final Matrix4f lastBreakInvViewProj = new Matrix4f();
+    private final org.joml.Vector3f lastBreakCamOffset = new org.joml.Vector3f();
+    private int lastBreakRenderW;
+    private int lastBreakRenderH;
+    private int lastBreakDisplayW;
+    private int lastBreakDisplayH;
     // Guide buffers (first-hit attributes for denoise and temporal upscalers): normal+roughness, albedo, depth, motion,
     // specular albedo, and reflection motion.
     private RtImage gNormal;
@@ -408,6 +459,31 @@ public final class RtComposite {
     private dev.comfyfluffy.caustica.rt.light.ReservoirImages reservoirImages;
     private dev.comfyfluffy.caustica.rt.light.ReservoirImagesGI giReservoirImages;
     private dev.comfyfluffy.caustica.rt.light.LightFieldVolume lightFieldVolume;
+    // ReSTIR PT Enhanced §3 paired spatial-reuse textures. The images are lazily created on the first
+    // composite() call. The actual compute-pass dispatch is wired in a follow-up — this just
+    // keeps the resources live so a future dispatch can bind them without recreating each frame.
+    private final dev.comfyfluffy.caustica.rt.light.PairedReuseTextures pairedReuseTextures =
+            new dev.comfyfluffy.caustica.rt.light.PairedReuseTextures();
+    // Lazily-created compute pipelines for the ReSTIR PT Enhanced §3 paired spatial-reuse pass.
+    // Generator runs once on first dispatch (bake-only); spatial runs per frame before the
+    // world RT trace, mutating the DI reservoir that the trace consumes.
+    private dev.comfyfluffy.caustica.rt.pipeline.RtPairedReusePipeline pairedReusePipeline;
+    private boolean pairedReuseTablesGenerated;
+    // ReSTIR PT Enhanced §5 duplication-map resources + pipeline. Two compute passes: v2_seed_init
+    // fills the per-pixel V2 seed image each frame; duplication_map reads the previous-frame seed
+    // and writes the per-pixel V2-match ratio. Both ping-pong after the trace so the temporal
+    // merge consumes them with a one-frame lag (matches the reservoir ping-pong lag).
+    private final dev.comfyfluffy.caustica.rt.light.V2SeedImage v2SeedImages =
+            new dev.comfyfluffy.caustica.rt.light.V2SeedImage();
+    private final dev.comfyfluffy.caustica.rt.light.DuplicationMap dupMap =
+            new dev.comfyfluffy.caustica.rt.light.DuplicationMap();
+    private dev.comfyfluffy.caustica.rt.pipeline.RtDuplicationMapPipeline duplicationMapPipeline;
+    // ReSTIR PT Enhanced §4 footprint-based reconnection (P1-1). Ping-pong world-space hit
+    // positions for the temporal merge's projection-radius test. Allocated together with the
+    // DI reservoir images, swapped together at the end of composite(). The .w = 0 sentinel
+    // in the shader discards empty / sky pixels so the test never sees garbage data.
+    private final dev.comfyfluffy.caustica.rt.light.ReservoirHitPosImages hitPosImages =
+            new dev.comfyfluffy.caustica.rt.light.ReservoirHitPosImages();
 
     // Trace + guide buffers run at render res; composite (display-mapping) runs at display res.
     private int displayW = -1;
@@ -421,6 +497,9 @@ public final class RtComposite {
 
     // Async Compute - overlap denoise with frame setup
     private RtAsyncCompute asyncCompute;
+    // Pipeline probe ("black box flight recorder", [probe] enabled). Records
+    // per-stage plate moments into rt-probe/probe.csv every Nth frame.
+    private dev.comfyfluffy.caustica.rt.pipeline.RtProbe probe;
     // What ensureOutput last sized the render/guide images for, so a quality change (or RR being
     // toggled) at a fixed window size is noticed even though displayW/displayH didn't change.
     private boolean renderSizeRrEnabled;
@@ -539,6 +618,7 @@ public final class RtComposite {
      * on an upscaler with no SDK reset path (default no-op on the interface).
      */
     public void invalidateHistory() {
+        RtBackendSelector.invalidateHistory();
         try {
             var device = RenderSystem.getDevice();
             if (device != null
@@ -704,8 +784,16 @@ public final class RtComposite {
     }
 
     private static int __debugCompositeCounter;
-    public boolean composite(GpuTexture nativeColor, int width, int height) {
+    public boolean composite(GpuTexture nativeColor, GpuTextureView nativeColorView, int width, int height) {
+        long nativeColorViewHandle = nativeColorView != null ? vkImageView(nativeColorView) : VK10.VK_NULL_HANDLE;
         frameCounter++; // advances once per frame; RtTerrain retires resources relative to it
+        // Bump the paired-reuse shuffle index. The actual compute pass dispatch is a follow-up
+        // (P0-1.e) — for now this keeps the table index current so any future dispatch sees the
+        // right permutation.
+        if (pairedReuseTextures.tex0() != null) {
+            pairedReuseTextures.advanceShuffle((int) frameCounter,
+                    dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.PAIRED_REUSE_SHUFFLE_PERIOD.value());
+        }
         hdrWrittenThisFrame = false; // set true again below once this frame's HDR display image is written
 
         // Dynamic Resolution Scaling - update resolution based on last frame time
@@ -812,7 +900,7 @@ public final class RtComposite {
                     return false;
                 }
             }
-            ensureOutput(ctx, width, height);
+            ensureOutput(ctx, width, height, nativeColorViewHandle);
             // Cheap idempotent check every frame (not just on resize): if the exposure mode is switched
             // manual -> auto at runtime (video settings), the auto-mode histogram/state/pipeline must be
             // allocated before recordFrame's exposure.record() below needs them, or it throws.
@@ -821,7 +909,7 @@ public final class RtComposite {
             RtPipeline active = ensureWorld(ctx);
             refreshMaterialBindingsIfNeeded(ctx);
             updateMotion();
-            recordFrame(ctx, active, nativeColor, dbgCount);
+            recordFrame(ctx, active, nativeColor, nativeColorView, dbgCount);
             if (!loggedActive) {
                 loggedActive = true;
                 CausticaMod.LOGGER.info("RT composite active (terrain): {}x{}, RT output replaces the world target", width, height);
@@ -872,7 +960,7 @@ public final class RtComposite {
             // stable on RADV with single-geom BLAS. FSR2 remains forced OFF separately.
             worldPipeline = RtPipeline.create(ctx, RtDeviceBringup.worldRaygenShader(),
                     new String[]{"world.rmiss.spv", "shadow.rmiss.spv"}, RtDeviceBringup.worldClosestHitShader(), "world.rahit.spv",
-                    WORLD_PUSH_CONST_SIZE, true, GUIDE_COUNT, bindlessTextureCapacity, true, true);
+                    WORLD_PUSH_CONST_SIZE, true, GUIDE_COUNT_WITH_HIT_POS, bindlessTextureCapacity, true, true);
             if (RtDeviceBringup.isRadv()) {
                 CausticaMod.LOGGER.info("RADV path: closest-hit={}, any-hit=world.rahit.spv, single-geom BLAS",
                         RtDeviceBringup.worldClosestHitShader());
@@ -897,6 +985,7 @@ public final class RtComposite {
             }
             bindWorldTextures(ctx);
             reloadRebindRequested = false;
+            RtBackendSelector.endReload();
         }
         // The TLAS is rebuilt and bound per frame in recordFrame since dynamic entity content animates
         // the instance set every frame.
@@ -943,7 +1032,7 @@ public final class RtComposite {
         // LabPBR _s + _n parallel atlases. The material system builds them before terrain tessellates so
         // ensure() is a pure lookup on the build path. Fall back to albedo only to keep every descriptor
         // valid; prim presence flags prevent the shader from sampling a missing material map.
-        // materialBase = firstExtra(3)+GUIDE_COUNT(24)=27 → _s@27, _n@28, sky@29.
+        // materialBase = firstExtra(3)+GUIDE_COUNT_WITH_HIT_POS(28)=31 → _s@31, _n@32, sky@33.
         if (worldPipeline.hasBlockMaterialAtlases()) {
             long specView = materialViews.specular();
             long normalView = materialViews.normal();
@@ -1042,6 +1131,7 @@ public final class RtComposite {
      * {@code markAllDirty()} so material flags pick up the new pack.
      */
     public void onResourceReloadStart() {
+        RtBackendSelector.beginReload();
         reloadRebindRequested = true;
         materialBindingsReady = false;
         setCelestialUvAtlas(0L);
@@ -1096,7 +1186,7 @@ public final class RtComposite {
             worldPipeline.setExtraStorageImage(11, reservoirImages.previous().view);
         }
         // ReSTIR GI bindings (13-16): four rgba32f images for direction+wSum / M+age+targetPdf.
-        if (ENABLE_RESTIR_GI && giReservoirImages != null
+        if (giReservoirImages != null
                 && giReservoirImages.currentA() != null) {
             worldPipeline.setExtraStorageImage(13, giReservoirImages.currentA().view);
             worldPipeline.setExtraStorageImage(14, giReservoirImages.currentB().view);
@@ -1186,9 +1276,25 @@ public final class RtComposite {
             lightFieldVolume.destroy();
             lightFieldVolume = null;
         }
+        // ReSTIR PT Enhanced §3 paired-reuse textures. The fields are re-created on the next
+        // composite() call via ensurePairedReuse(). Lazily creating is fine because the actual
+        // compute pass (TODO P0-1.e follow-up) only needs them at frame time.
+        pairedReuseTextures.destroy();
+        if (pairedReusePipeline != null) {
+            pairedReusePipeline.destroy();
+            pairedReusePipeline = null;
+        }
+        pairedReuseTablesGenerated = false;
+        v2SeedImages.destroy();
+        dupMap.destroy();
+        if (duplicationMapPipeline != null) {
+            duplicationMapPipeline.destroy();
+            duplicationMapPipeline = null;
+        }
+        hitPosImages.destroy();
     }
 
-    private void ensureOutput(RtContext ctx, int width, int height) {
+    private void ensureOutput(RtContext ctx, int width, int height, long nativeColorViewHandle) {
         Upscaler activeUpscaler = UpscalerSelector.current();
         // Temporal upscalers run at reduced internal resolution after denoise. Off/noop remains 1:1.
         boolean reducedRender = isTemporalUpscaler(activeUpscaler);
@@ -1204,6 +1310,7 @@ public final class RtComposite {
             return;
         }
         ctx.waitIdle(); // resize is rare; no in-flight frame may use the old image/descriptor
+        RtBackendSelector.resize(width, height);
         if (displayImage != null) {
             displayImage.destroy();
         }
@@ -1219,7 +1326,7 @@ public final class RtComposite {
         displayH = height;
 
         // Initialize DRS if enabled and not yet created
-        if (ENABLE_DRS && drs == null && CausticaConfig.Drs.ENABLED.value()) {
+        if (drs == null && CausticaConfig.Drs.ENABLED.value()) {
             try {
                 drs = new RtDynamicResolution();
                 drs.setDisplayResolution(width, height);
@@ -1299,6 +1406,8 @@ public final class RtComposite {
         // PQ-encoded ([0,1], ST.2084) HDR display image, written in parallel by display.comp when HDR mode is active.
         hdrDisplayImage = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "RT HDR display image " + width + "x" + height);
         // Guide buffers match the trace resolution; denoise and temporal upscalers consume them there.
+        // VRAM note (2026-09): gNormal/gAlbedo stay RGBA16F for now — gDepth is the
+        // only guide that can be dropped without a shader re-layout (see below).
         gNormal = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide normal roughness " + renderW + "x" + renderH);
         gAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide diffuse albedo " + renderW + "x" + renderH);
         gDepth = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT, "guide linear depth " + renderW + "x" + renderH);
@@ -1315,7 +1424,10 @@ public final class RtComposite {
         gClearEmission = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "clear emission " + renderW + "x" + renderH);
         gTransmission = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "transmission radiance " + renderW + "x" + renderH);
         gViewZ = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT, "view z " + renderW + "x" + renderH);
-        gConfidenceDisocclusion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "confidence disocclusion " + renderW + "x" + renderH);
+        // VRAM-first layout (2026-09): confidence/disocclusion are three scalar
+        // [0,1] signals (prepare_nrd_inputs reads .r/.g/.b only). R8G8B8A8_UNORM
+        // quarters the plate (4 B/px vs 8) at ample precision for confidences.
+        gConfidenceDisocclusion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R8G8B8A8_UNORM, "confidence disocclusion " + renderW + "x" + renderH);
         gMaterialFlags = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_UINT, "material flags " + renderW + "x" + renderH);
         // Tile-jitter guide (v0.6.8+): per-tile sub-pixel offset written by world.rgen, read by
         // nrd_prewarp.comp. R8G8_UNORM is the minimum precision that fits the ±0.5 render-pixel
@@ -1330,6 +1442,9 @@ public final class RtComposite {
 
         // ReSTIR Direct Illumination: reservoir images + light buffer. Real emissive blocks are
         // harvested each frame by UnifiedLightManager.rescanAround() — no fake test lights.
+        // Quarter-res (2026-09): 1 reservoir per 2x2 tile by default (see
+        // RestirEnhanced.QUARTER_RES_RESERVOIR) — the raygen maps pix->pix/2 on
+        // every reservoir access. MC's large flat surfaces share well.
         if (ENABLE_RESTIR_DI) {
             if (unifiedLightManager == null) {
                 unifiedLightManager = new dev.comfyfluffy.caustica.rt.light.UnifiedLightManager();
@@ -1340,17 +1455,46 @@ public final class RtComposite {
             if (reservoirImages == null) {
                 reservoirImages = new dev.comfyfluffy.caustica.rt.light.ReservoirImages();
             }
-            reservoirImages.ensureSized(ctx, renderW, renderH);
+            boolean quarterRes = dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.QUARTER_RES_RESERVOIR.value();
+            reservoirImages.ensureSized(ctx, renderW, renderH, quarterRes);
         }
         // ReSTIR GI: direction-based reservoir images (4 rgba32f).
-        if (ENABLE_RESTIR_GI) {
+        if (CausticaConfig.Rt.Gi.ENABLED.value()) {
             if (giReservoirImages == null) {
                 giReservoirImages = new dev.comfyfluffy.caustica.rt.light.ReservoirImagesGI();
             }
             giReservoirImages.ensureSized(ctx, renderW, renderH);
         }
-        if (ENABLE_LIGHTFIELD_GI && lightFieldVolume == null) {
+        if (CausticaConfig.Rt.Gi.ENABLED.value() && lightFieldVolume == null) {
             lightFieldVolume = new dev.comfyfluffy.caustica.rt.light.LightFieldVolume();
+        }
+        // ReSTIR PT Enhanced §3 paired-reuse textures. Lazily allocated at fixed 512² (the compute
+        // pass handles tiling). The dispatch wiring is a follow-up (P0-1.e); the resources are
+        // live now so future work can bind them without recreating each frame.
+        if (dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.PAIRED_REUSE_ENABLED.value()) {
+            pairedReuseTextures.ensureSized(ctx);
+            if (pairedReusePipeline == null) {
+                pairedReusePipeline = dev.comfyfluffy.caustica.rt.pipeline.RtPairedReusePipeline.create(ctx);
+            }
+        }
+        // ReSTIR PT Enhanced §5 duplication map. Render-res R8 UNORM (curr/prev ping-pong) +
+        // R32 UI V2 seed (curr/prev ping-pong). All lazily sized when the feature is enabled.
+        if (dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.DUPLICATION_MAP_ENABLED.value()) {
+            v2SeedImages.ensureSized(ctx, renderW, renderH);
+            dupMap.ensureSized(ctx, renderW, renderH);
+            if (duplicationMapPipeline == null) {
+                duplicationMapPipeline = RtDuplicationMapPipeline.create(ctx);
+            }
+        }
+        // ReSTIR PT Enhanced §4 footprint-based reconnection (P1-1). RGBA32F hit-positions
+        // (curr/prev). Always allocated when ReSTIR DI is enabled — the image is small enough
+        // (16 B/px × 1080p ≈ 33 MB) and the shader writes nothing extra cost-wise (1 imageStore
+        // piggy-backs on the existing reservoir write). The projection-radius test is gated by
+        // pc.footprintReconnectionActive in the shader, so the cost is one extra imageStore in
+        // the dominant path and conditional imageLoad in the temporal merge.
+        if (reservoirImages != null && reservoirImages.current() != null) {
+            boolean quarterRes = dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.QUARTER_RES_RESERVOIR.value();
+            hitPosImages.ensureSized(ctx, renderW, renderH, quarterRes);
         }
 
         mvHasPrev = false; // recreated images -> first MV frame is zero
@@ -1358,7 +1502,13 @@ public final class RtComposite {
             worldPipeline.setStorageImage(output.view);
             bindGuideImages();
         }
-        displayPipeline.setImages(displayImage.view, rrOutput.view, exposure.image().view, hdrDisplayImage.view);
+        displayPipeline.setImages(displayImage.view, rrOutput.view, exposure.image().view, hdrDisplayImage.view,
+                // Phase 2 hybrid bindings (binding 4/5 in display.comp). Full mode passes VK_NULL_HANDLE
+                // — display.comp's specularOnlyMode gate never reads them. SPECULAR_ONLY passes the
+                // vanilla MC mainTarget SDR view + the reflection RT output (gReflection) so display.comp
+                // can sample-blend vanilla SDR + Caustica specular into displayImage.
+                isSpecularOnlyMode() ? nativeColorViewHandle : VK10.VK_NULL_HANDLE,
+                isSpecularOnlyMode() && gReflection != null ? gReflection.view : VK10.VK_NULL_HANDLE);
     }
 
     /**
@@ -1412,8 +1562,10 @@ public final class RtComposite {
         mvHasPrev = true;
     }
 
-    private void recordFrame(RtContext ctx, RtPipeline active, GpuTexture nativeColor, int dbgCount) {
+    private void recordFrame(RtContext ctx, RtPipeline active, GpuTexture nativeColor, GpuTextureView nativeColorView, int dbgCount) {
         long dstImage = vkImage(nativeColor);
+        long nativeColorViewHandle = nativeColorView != null ? vkImageView(nativeColorView) : VK10.VK_NULL_HANDLE;
+        // Re-derived here (cheap vkImageView() lookup) so recordFrame is callable standalone if needed.
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).caustica$getBackend();
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
         RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "composite command buffer");
@@ -1532,16 +1684,25 @@ public final class RtComposite {
             // only the cheap instance-level TLAS is rebuilt per frame. Retired KEEP_FRAMES later.
             // Entity BLASes are built inline below and merged into the per-frame TLAS. geomTableAddr
             // feeds the hit shader entity path (per-prim normal/tint) and motion vectors.
-            RtEntities.FrameEntities fe = ENABLE_DYNAMIC_ENTITY_RT
-                    ? RtEntities.INSTANCE.beginFrame(ctx, terrain.staticInstances(),
-                    terrain.blockX, terrain.blockY, terrain.blockZ, camX, camY, camZ,
-                    frameProjection, frameViewRotation)
-                    : new RtEntities.FrameEntities(terrain.staticInstances(), java.util.List.of(), 0L);
+            RtEntities.FrameEntities fe = new RtEntities.FrameEntities(terrain.staticInstances(),
+                    java.util.List.of(), 0L);
             push.putLong(184, fe.geomTableAddr());
             // Block-breaking overlay: resolves each destroy-stage RenderType's texture into the
             // SAME bindless entity-texture array (destroy_stage_N.png is a standalone Sampler0 texture,
             // not a block-atlas sprite — see ModelBakery.BREAKING_LOCATIONS/DESTROY_TYPES), so any newly
             // resolved slot rides along with the uploadPending() call right below.
+            // Capture the same invViewProj + cam-offset that the trace just used, so presentHdr can
+            // dispatch the post-tonemap break overlay (Tier 2, see RtBreakOverlayPipeline) with the
+            // EXACT matrices — world-space hit positions must match the trace's to the sub-block,
+            // or the overlay would land on the wrong texel of the breaking block.
+            lastBreakInvViewProj.set(frameInvViewProj);
+            lastBreakCamOffset.set(camX - terrain.blockX, camY - terrain.blockY, camZ - terrain.blockZ);
+            lastBreakRenderW = renderW;
+            lastBreakRenderH = renderH;
+            lastBreakDisplayW = displayW;
+            lastBreakDisplayH = displayH;
+            lastBreakCount = 0;
+            lastBreakValid = true;
             writeBreaking(push, terrain);
 
             // ReSTIR DI: harvest nearby emissives, rebase into terrain space, upload, then write
@@ -1567,11 +1728,16 @@ public final class RtComposite {
                 push.putInt(restirOffset + 4, 4);        // bounded ReSTIR DI candidates
                 push.putFloat(restirOffset + 8, 12.0f);  // bounded temporal reservoir weight
                 push.putFloat(restirOffset + 12, 24.0f); // bounded spatial reservoir weight
-                if (frameCounter % 60 == 0) {
-                    CausticaMod.LOGGER.info("ReSTIR DI: {} lights ({} static + {} dynamic)",
+                // 🔍 DEBUG: 详细记录 ReSTIR DI 状态（用于诊断 VK_ERROR_DEVICE_LOST）
+                if (frameCounter % 60 == 0 || lightUploadChanged) {
+                    CausticaMod.LOGGER.info("ReSTIR DI Frame {}: {} lights ({} static + {} dynamic), buffer=0x{}, bufferChanged={}, reservoirSize={}x{}",
+                            frameCounter,
                             blockLightBuffer.count(),
                             unifiedLightManager.getBlockLights().getLightCount(),
-                            unifiedLightManager.getDynamicLights().getLightCount());
+                            unifiedLightManager.getDynamicLights().getLightCount(),
+                            Long.toHexString(blockLightBuffer.buffer()),
+                            lightUploadChanged,
+                            renderW, renderH);
                 }
             } else {
                 push.putInt(restirOffset, 0);
@@ -1583,7 +1749,7 @@ public final class RtComposite {
             // Vanilla light-field GI base: packed sky/block levels around the camera.
             // Origin is rebased into terrain space so shader hitPos can index it directly.
             int lightFieldOffset = restirOffset + RESTIR_PUSH_BYTES;
-            if (ENABLE_LIGHTFIELD_GI && lightFieldVolume != null && level != null) {
+            if (CausticaConfig.Rt.Gi.ENABLED.value() && lightFieldVolume != null && level != null) {
                 lightFieldVolume.update(level, Mth.floor(camX), Mth.floor(camY), Mth.floor(camZ), (int) frameCounter);
                 lightFieldVolume.upload(ctx);
                 if (worldPipeline != null && lightFieldVolume.valid()) {
@@ -1603,7 +1769,7 @@ public final class RtComposite {
 
             // ReSTIR GI: direction-based reservoir push constants (@592, 32 bytes total).
             int giOffset = lightFieldOffset + LIGHTFIELD_PUSH_BYTES;
-            if (ENABLE_RESTIR_GI) {
+            if (CausticaConfig.Rt.Gi.ENABLED.value()) {
                 push.putInt(giOffset + 0, CausticaConfig.Rt.Gi.ENABLED.value() ? 1 : 0);
                 push.putInt(giOffset + 4, CausticaConfig.Rt.Gi.CANDIDATES.value());
                 push.putFloat(giOffset + 8, CausticaConfig.Rt.Gi.MAX_M_TEMPORAL.value());
@@ -1619,6 +1785,18 @@ public final class RtComposite {
                     worldPipeline.setExtraStorageImage(16, giReservoirImages.previousB().view);
                 }
             } else {
+                // GI disabled above still left the slot count check uninitialised; bind nothing.
+            }
+
+            // ReSTIR PT Enhanced §5 duplication-map bindings (P0-2). gDupMapCurr = this frame,
+            // gDupMapPrev = last frame (post-swap). world.rgen reads gDupMapPrev in temporalReuse
+            // for the D-aware M-cap formula. Skipped when the feature is off so we don't bind a
+            // 1×1 dummy image and pollute the descriptor pool.
+            if (dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.DUPLICATION_MAP_ENABLED.value()
+                    && dupMap.curr() != null && dupMap.prev() != null) {
+                worldPipeline.setExtraStorageImage(DUP_MAP_SLOT_CURR, dupMap.curr().view);
+                worldPipeline.setExtraStorageImage(DUP_MAP_SLOT_PREV, dupMap.prev().view);
+            } else {
                 push.putInt(giOffset + 0, 0);
                 push.putInt(giOffset + 4, 0);
                 push.putFloat(giOffset + 8, 0.0f);
@@ -1629,12 +1807,51 @@ public final class RtComposite {
                 push.putFloat(giOffset + 28, 0.0f);
             }
 
+            // ReSTIR PT Enhanced §4 footprint-reconnection bindings (P1-1). gHitPosCurr is
+            // written by world.rgen at every reservoir store (xyz = hitPos, w = 1.0 sentinel);
+            // gHitPosPrev is read by the projection-radius test in temporalReuse. Always bound
+            // when ReSTIR DI is enabled — the .w = 0 sentinel makes the read safe even when
+            // the previous frame was sky / first frame. The write cost is 1 imageStore that
+            // piggy-backs on the existing reservoir write, no extra kernel.
+            if (hitPosImages.curr() != null && hitPosImages.prev() != null) {
+                worldPipeline.setExtraStorageImage(HIT_POS_SLOT_CURR, hitPosImages.curr().view);
+                worldPipeline.setExtraStorageImage(HIT_POS_SLOT_PREV, hitPosImages.prev().view);
+            }
+
             // Hybrid rendering fast-path push constants (@624, 16 bytes total).
             int hybridOffset = giOffset + GI_PUSH_BYTES;
             push.putInt(hybridOffset + 0, CausticaConfig.Rt.Hybrid.ENABLED.value() ? 1 : 0);
             push.putFloat(hybridOffset + 4, CausticaConfig.Rt.Hybrid.ROUGH_THRESHOLD.value());
             push.putFloat(hybridOffset + 8, CausticaConfig.Rt.Hybrid.LIGHTFIELD_THRESHOLD.value());
-            push.putFloat(hybridOffset + 12, 0.0f);
+            // ReSTIR PT Enhanced §3 paired-reuse flag (@636, 1 byte effective). When the paired
+            // spatial-reuse compute pass has run for this frame, world.rgen skips its inline
+            // 9-tap spatial merge to avoid double-counting candidates. Mirror what the
+            // paired-reuse pass does in this frame.
+            push.putInt(hybridOffset + 12,
+                    (pairedReusePipeline != null && pairedReuseTablesGenerated
+                            && dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.PAIRED_REUSE_ENABLED.value())
+                            ? 1 : 0);
+            // ReSTIR PT Enhanced §4 footprint-based reconnection flag + motion cap (@640..648).
+            // When enabled, the legacy 40-px motion threshold in temporalReuse is replaced by the
+            // user-configurable `footprintMotionCapPx` (default 25 px).
+            // @648: pixelsToWorld = 2 * tan(fov_y/2) / screen_height. The projection-radius test
+            // rejects pixels whose Rp = sqrt(|Δx|²·cosθ/4π) > c·maxFootprint, where
+            // maxFootprint = |viewZ|·pixelsToWorld. Derivation matches Fsr2ClassicUpscaler:
+            // m11 = 1/tan(fov_y/2), so pixelsToWorld = 2·tan(fov_y/2)/H = 2/(m11·H).
+            // Guarded against m11 == 0 (orthographic projection, rare) by defaulting to 1.0.
+            push.putInt(hybridOffset + 16,
+                    dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.FOOTPRINT_RECONNECTION.value() ? 1 : 0);
+            push.putFloat(hybridOffset + 20,
+                    dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.FOOTPRINT_MOTION_CAP_PX.value());
+            float m11 = frameProjection.m11();
+            float pixelsToWorld;
+            if (Math.abs(m11) > 1e-5f && renderH > 0) {
+                pixelsToWorld = 2.0f / (Math.abs(m11) * (float) renderH);
+            } else {
+                pixelsToWorld = 1.0f; // safer-than-default: large maxFootprint, no spurious rejection
+            }
+            push.putFloat(hybridOffset + 24, pixelsToWorld);
+            push.putInt(hybridOffset + 28, dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.QUARTER_RES_RESERVOIR.value() ? 1 : 0); // quarterResReservoir @652
 
             // Flush host push staging, then copy into pure device-local VRAM before raygen reads it.
             // RADV GPUVM-faults at a fixed doorbell VA when WorldPushRef follows a host-visible BDA
@@ -1701,17 +1918,18 @@ public final class RtComposite {
                 VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
 
                 // Initialize VRS on first use (lazy init)
-                if (ENABLE_VRS && vrs == null && RtDeviceBringup.vrsEnabled()) {
+                if (vrs == null && !vrsInitFailed && RtDeviceBringup.vrsEnabled()) {
                     try {
                         vrs = new RtVariableRateShading(ctx);
                         CausticaMod.LOGGER.info("Variable Rate Shading lazy initialized");
                     } catch (Exception e) {
-                        CausticaMod.LOGGER.error("Failed to lazy init VRS", e);
+                        vrsInitFailed = true;
+                        CausticaMod.LOGGER.warn("VRS unavailable; continuing without variable-rate shading", e);
                     }
                 }
 
                 // Generate shading rate before raygen (if VRS enabled and resources created)
-                if (vrs != null && gDepth != null && gAlbedo != null) {
+                if (vrs != null && !vrsInitFailed && gDepth != null && gAlbedo != null) {
                     try {
                         // Create/resize VRS resources if needed
                         if (vrs.getShadingRateImageView() == 0L) {
@@ -1720,7 +1938,10 @@ public final class RtComposite {
                         // Generate shading rate from depth and albedo
                         vrs.generateShadingRate(cmd, gDepth, gAlbedo, renderW, renderH);
                     } catch (Exception e) {
-                        CausticaMod.LOGGER.error("VRS generation failed", e);
+                        vrsInitFailed = true;
+                        vrs.destroy();
+                        vrs = null;
+                        CausticaMod.LOGGER.warn("VRS unavailable; continuing without variable-rate shading", e);
                     }
                 }
 
@@ -1736,6 +1957,49 @@ public final class RtComposite {
                     } else if (renderW <= 0 || renderH <= 0) {
                         System.err.println("[Caustica RT] ALARM: trace dispatched with zero size " + renderW + "x" + renderH);
                     }
+                    // === ReSTIR PT Enhanced §3 paired spatial-reuse ===
+                    // Bake the 4 pair tables once, then run the per-frame spatial pass to MIS-merge
+                    // neighbours into the DI reservoir the trace is about to read. The trace
+                    // depends on the merge having completed (in COMMAND_BUFFER_GENERAL layout) before
+                    // it executes.
+                    if (dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.PAIRED_REUSE_ENABLED.value()
+                            && pairedReusePipeline != null
+                            && reservoirImages != null
+                            && reservoirImages.current() != null) {
+                        if (!pairedReuseTablesGenerated) {
+                            pairedReusePipeline.bindGeneratorImages(pairedReuseTextures);
+                            pairedReusePipeline.dispatchGenerator(cmd, (int) frameCounter);
+                            pairedReuseTablesGenerated = true;
+                        }
+                        pairedReusePipeline.bindSpatialImages(reservoirImages.current().view, pairedReuseTextures);
+                        // Quarter-res: the paired pass walks the tiled reservoir, not full-res pixels.
+                        boolean pairedQuarter = dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.QUARTER_RES_RESERVOIR.value();
+                        int pairedW = pairedQuarter
+                                ? dev.comfyfluffy.caustica.rt.light.ReservoirImages.tiledSize(renderW, true) : renderW;
+                        int pairedH = pairedQuarter
+                                ? dev.comfyfluffy.caustica.rt.light.ReservoirImages.tiledSize(renderH, true) : renderH;
+                        pairedReusePipeline.dispatchSpatial(cmd, pairedW, pairedH,
+                                (int) dev.comfyfluffy.caustica.CausticaConfig.Rt.Gi.MAX_M_SPATIAL.value(),
+                                pairedReuseTextures.shuffleIndex());
+                        VulkanCommandEncoder.memoryBarrier(cmd, stack); // ensure visibility to the trace
+                    }
+                    // === ReSTIR PT Enhanced §5 duplication map ===
+                    // Two compute passes per frame: v2_seed_init fills the per-pixel V2 seed,
+                    // duplication_map reads last frame's seed and writes this frame's V2-match
+                    // ratio. Together they tell the temporal merge (a future patch) how similar
+                    // this pixel's neighbourhood is to its previous-frame counterpart, so it can
+                    // cap history reuse when the world around the pixel has changed.
+                    if (dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.DUPLICATION_MAP_ENABLED.value()
+                            && duplicationMapPipeline != null
+                            && v2SeedImages.curr() != null
+                            && dupMap.curr() != null) {
+                        duplicationMapPipeline.bindSeedImage(v2SeedImages.curr().view);
+                        duplicationMapPipeline.dispatchSeed(cmd, renderW, renderH, (int) frameCounter);
+                        VulkanCommandEncoder.memoryBarrier(cmd, stack); // seed write → map read
+                        duplicationMapPipeline.bindMapImages(v2SeedImages.prev().view, dupMap.curr().view);
+                        duplicationMapPipeline.dispatchMap(cmd, renderW, renderH, (int) frameCounter);
+                        VulkanCommandEncoder.memoryBarrier(cmd, stack); // map write → trace read
+                    }
                     active.trace(cmd, renderW, renderH, pushAddr);
                     if (dbgCount <= 5 || dbgCount % 60 == 0) {
                         System.err.println("[Caustica RT] trace dispatched #" + dbgCount + " size=" + renderW + "x" + renderH
@@ -1747,17 +2011,38 @@ public final class RtComposite {
                 System.err.println("[Caustica RT] skip trace: zero TLAS instances (waiting for terrain residency)");
             }
 
-            // Firefly-kill pre-pass (always, before any denoise). The shader only replaces the centre when
-            // it is a >4× outlier vs EVERY neighbour — isolated SPP=1 spikes die; real emissives that
-            // light 2+ neighbour texels pass through. Without this, NRD-only gets raw single-sample
-            // HDR spikes and REBLUR leaves them as white grit on snow/grass (the screenshot case).
+            // === Pre-upscale compute segment ===
+            // Everything between the trace and the upscale is pure compute (firefly-kill,
+            // denoise, beauty TAA). When the device exposes a dedicated compute queue AND
+            // the user has enabled async-compute, we record the whole segment onto the
+            // compute queue so it can overlap the graphics-queue upscale / display work.
+            // Otherwise we drop down to the single-queue fallback below.
+            //
+            // Decide per-component which path each takes. firefly-kill doesn't need
+            // backend / plateBridge so its flag is decided before the denoise-backend
+            // selection block; denoise / TAA flags are decided right after that block
+            // because they depend on it.
+            final boolean preUpscaleAsync = asyncCompute != null && asyncCompute.isAvailable();
+            final boolean willFirefly = fireflyKilled != null && output != null && fireflyKill.isReady();
+            final boolean fireflyOnAsync = preUpscaleAsync && willFirefly;
+
+            // Firefly-kill pre-pass (always, before any denoise). The shader only replaces
+            // the centre when it is a >4× outlier vs EVERY neighbour — isolated SPP=1
+            // spikes die; real emissives that light 2+ neighbour texels pass through.
+            // Without this, NRD-only gets raw single-sample HDR spikes and REBLUR leaves
+            // them as white grit on snow/grass (the screenshot case).
+            // When fireflyOnAsync is true we skip the inline graphics-queue dispatch
+            // because the same work is recorded inside the async compute segment below.
             RtImage beautyForDenoise = output;
-            if (fireflyKilled != null && output != null && fireflyKill.isReady()) {
+            if (willFirefly && !fireflyOnAsync) {
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "firefly kill");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.firefly")) {
-                    fireflyKill.dispatch(cmd.address(), ctx, output, fireflyKilled);
-                }
-                VulkanCommandEncoder.memoryBarrier(cmd, stack);
+                    boolean nativeRecorded = RtBackendSelector.recordFirefly(
+                            ctx, cmd.address(), frameCounter, output, fireflyKilled);
+                    if (!nativeRecorded) {
+                        fireflyKill.dispatch(cmd.address(), ctx, output, fireflyKilled);
+                    }
+                }                VulkanCommandEncoder.memoryBarrier(cmd, stack);
                 beautyForDenoise = fireflyKilled;
             }
 
@@ -1794,6 +2079,26 @@ public final class RtComposite {
                 plateReady = plateBridge.ensureSized(
                         plateProfile, renderW, renderH, displayW, displayH);
                 activeUpscaler.setPlateBridge(plateBridge);
+            }
+            // Now that backend / plateReady / plateProfile are known, decide the
+            // denoise- and TAA-shape flags and which of them ride the async compute path.
+            final boolean willDenoise = playablePath && caustica$denoiseEnabled() && denoisedColor != null
+                    && backend != null && plateReady && plateProfile != null;
+            final boolean willTaa = playablePath && temporalAccumEnabled(activeUpscaler)
+                    && accumulatedColor != null && !willDenoise;
+            final boolean denoiseOnAsync = preUpscaleAsync && willDenoise;
+            // TAA only goes async when there is NO denoise (mutually-exclusive rule).
+            final boolean taaOnAsync = preUpscaleAsync && willTaa && !willDenoise;
+
+            // Lazy-create the temporal-accum pipeline BEFORE the async lambda so the
+            // recorder can hand its command buffer off without touching resource state
+            // inside the lambda (where it would conflict with ensureSized / pipeline
+            // creation that may need the device's descriptor pool mutex).
+            if (taaOnAsync) {
+                if (temporalAccum == null) {
+                    temporalAccum = RtTemporalAccumulation.create(ctx);
+                }
+                temporalAccum.ensureSized(renderW, renderH);
             }
             // Any denoise (NRD REBLUR or FFX temporal) already owns temporal accumulation — stacking the
             // standalone beauty TAA on top makes the image milky/soft and produces ghost trails along
@@ -1877,16 +2182,113 @@ public final class RtComposite {
                         // Denoise dispatch
                         // Note: True async compute (dual-queue overlap) requires fundamental refactoring
                         // of composite() to split submissions. For now, use single-queue path.
+                        // 🔍 DEBUG: 记录 NRD 执行前的 ReSTIR 状态
+                        if (ENABLE_RESTIR_DI && reservoirImages != null) {
+                            CausticaMod.LOGGER.debug("Frame {}: NRD dispatch with ReSTIR DI active, backend={}, lights={}",
+                                    frameCounter, backend.name(),
+                                    blockLightBuffer != null ? blockLightBuffer.count() : 0);
+                        }
                         RtImage denoiseTarget = plateBridge.denoiseOutputColor() != null
                                 ? plateBridge.denoiseOutputColor()
                                 : denoisedColor;
-                        boolean denoiseSucceeded = backend.dispatch(stack, cmd,
-                                plateBridge.adaptToDenoise(cmd, beautyForDenoise), gNormal, gDepth, gMotion,
-                                1.0f / Math.max(1, renderW), 1.0f / Math.max(1, renderH),
-                                denoiseTarget);
-
-                        if (asyncCompute != null) {
-                            asyncCompute.recordFallbackFrame();
+                        boolean denoiseSucceeded;
+                        // Async-compute dispatch path: when enabled in config AND the device
+                        // exposed a dedicated compute family at bringup, record the entire
+                        // denoise segment (adapt + backend + finalize) into the preallocated
+                        // compute command buffer, submit on the compute queue, and let the
+                        // graphics queue barrier inserted by submitComputeSegment wait for the
+                        // signal. Falls back to the legacy single-queue path on any failure so
+                        // a flaky async setup never silently drops work.
+                        // The backend's boolean return (initOk / fallback) is intentionally
+                        // not surfaced across the lambda — Java would force a captured-local
+                        // write to escape through an effectively-final holder, which makes the
+                        // surrounding code harder to reason about. Async path is best-effort:
+                        // if the recorder throws, submitComputeSegment records the fallback and
+                        // returns false, which sends us into the single-queue path below.
+                        if (asyncCompute != null && asyncCompute.isAvailable()) {
+                            // Hoist captures into effectively-final locals so the lambda body
+                            // can read them (Java 21+ still requires refs to method-scope
+                            // locals to be effectively final).
+                            final MemoryStack asyncStack = stack;
+                            // For the async denoise path the firefly-kill output is what the
+                            // denoise reads; if we did NOT take firefly onto the compute queue,
+                            // the existing single-queue firefly block above has already written
+                            // it on the graphics queue, and the compute-queue lambda must read
+                            // it across queues (handled below by skipping firefly here).
+                            final boolean fireflyInThisSegment = fireflyOnAsync;
+                            final RtImage asyncFireflySource = output;
+                            final RtImage asyncFireflyDst = fireflyKilled;
+                            final RtImage asyncDenoiseIn = willFirefly ? fireflyKilled : output;
+                            final RtImage asyncBeauty = asyncDenoiseIn; // alias for clarity inside lambda
+                            final float asyncInvW = 1.0f / Math.max(1, renderW);
+                            final float asyncInvH = 1.0f / Math.max(1, renderH);
+                            final CausticaDenoiseBackend asyncBackend = backend;
+                            // TAA takes the same async slot only when denoise is NOT going to
+                            // run on compute (mutually exclusive). We may still leave the TAA
+                            // single-queue path alone when both preUpscaleAsync and willTaa are
+                            // true but a denoise has claimed the segment — that case is
+                            // unreachable here because willTaa already short-circuits when
+                            // willDenoise holds. The taaOnAsync guard below makes that explicit.
+                            final boolean taaInThisSegment = taaOnAsync;
+                            final RtImage asyncTaaSrc = beautyForDenoise; // overridden below for firefly-only
+                            denoiseSucceeded = asyncCompute.submitComputeSegment(
+                                    asyncStack,
+                                    VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                    cb -> {
+                                        try (RtFrameStats.Scope preUpscaleStats = RtFrameStats.FRAME.stage("frame.preUpscale")) {
+                                            if (fireflyInThisSegment) {
+                                                try (RtDebugLabels.Scope fireflyLabel = RtDebugLabels.scope(ctx, cb, "firefly kill");
+                                                     RtFrameStats.Scope fireflyStats = RtFrameStats.FRAME.stage("frame.firefly")) {
+                                                    boolean nativeRecorded = RtBackendSelector.recordFirefly(
+                                                            ctx, cb.address(), frameCounter, asyncFireflySource, asyncFireflyDst);
+                                                    if (!nativeRecorded) {
+                                                        fireflyKill.dispatch(cb.address(), ctx, asyncFireflySource, asyncFireflyDst);
+                                                    }
+                                                }
+                                                try (MemoryStack ss = MemoryStack.stackPush()) {
+                                                    VulkanCommandEncoder.memoryBarrier(cb, ss);
+                                                }
+                                            }
+                                            RtImage segTarget = plateBridge.denoiseOutputColor() != null
+                                                    ? plateBridge.denoiseOutputColor()
+                                                    : denoisedColor;
+                                            asyncBackend.dispatch(asyncStack, cb,
+                                                    plateBridge.adaptToDenoise(cb, asyncBeauty),
+                                                    gNormal, gDepth, gMotion,
+                                                    asyncInvW, asyncInvH,
+                                                    segTarget);
+                                            if (taaInThisSegment) {
+                                                // TAA on async is only reachable when willDenoise
+                                                // is false (mutually exclusive). Synthesize the
+                                                // beauty plate the TAA expects in that case.
+                                                try (RtDebugLabels.Scope taaLabel = RtDebugLabels.scope(ctx, cb, "beauty temporal (TAA)");
+                                                     RtFrameStats.Scope taaStats = RtFrameStats.FRAME.stage("frame.temporalAccum")) {
+                                                    float taaAlpha = Math.min(temporalAlpha(), 0.45f);
+                                                    temporalAccum.dispatch(asyncStack, cb, asyncTaaSrc, gNormal, gDepth, gMotion,
+                                                            asyncInvW, asyncInvH,
+                                                            taaAlpha, temporalDisocclusion(), accumulatedColor);
+                                                }
+                                            }
+                                        }
+                                    },
+                                    cmd,
+                                    VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                            if (!denoiseSucceeded) {
+                                denoiseSucceeded = backend.dispatch(stack, cmd,
+                                        plateBridge.adaptToDenoise(cmd, beautyForDenoise),
+                                        gNormal, gDepth, gMotion,
+                                        1.0f / Math.max(1, renderW),
+                                        1.0f / Math.max(1, renderH),
+                                        denoiseTarget);
+                            }
+                        } else {
+                            denoiseSucceeded = backend.dispatch(stack, cmd,
+                                    plateBridge.adaptToDenoise(cmd, beautyForDenoise), gNormal, gDepth, gMotion,
+                                    1.0f / Math.max(1, renderW), 1.0f / Math.max(1, renderH),
+                                    denoiseTarget);
+                            if (asyncCompute != null) {
+                                asyncCompute.recordFallbackFrame();
+                            }
                         }
 
                         lastDenoiseOn = denoiseSucceeded;
@@ -1914,16 +2316,20 @@ public final class RtComposite {
                             // for any path where the SO lacks the v2 entry point.
                             if (activeUpscaler != null) {
                                 activeUpscaler.setReactiveMaskGuides(gViewZ, hybrid.getDisocclusionMix());
+                                // v2: material-aware reactive mask (metalness/emission/transparency)
+                                activeUpscaler.setMaterialGuides(gSpecAlbedo, gClearEmission, gMaterialFlags);
                             }
                         } else if (backend instanceof dev.comfyfluffy.caustica.denoise.AmdFidelityFxDenoiseBackend amd) {
                             lastDenoisePath = amd.lastPathLabel();
                             if (activeUpscaler != null) {
                                 activeUpscaler.setReactiveMaskGuides(null, null);
+                                activeUpscaler.setMaterialGuides(null, null, null);
                             }
                         } else if (backend instanceof dev.comfyfluffy.caustica.denoise.OfficialFfxDenoiseBackend) {
                             lastDenoisePath = "ffx";
                             if (activeUpscaler != null) {
                                 activeUpscaler.setReactiveMaskGuides(null, null);
+                                activeUpscaler.setMaterialGuides(null, null, null);
                             }
                         }
                     } catch (Throwable t) {
@@ -1937,6 +2343,7 @@ public final class RtComposite {
                         // healthy frame's NRD outputs against this frame's raw beauty.
                         if (activeUpscaler != null) {
                             activeUpscaler.setReactiveMaskGuides(null, null);
+                            activeUpscaler.setMaterialGuides(null, null, null);
                         }
                     }
                     VulkanCommandEncoder.memoryBarrier(cmd, stack);
@@ -1947,7 +2354,15 @@ public final class RtComposite {
             // a second TAA reprojects bright sky/leaves onto new pixels → dark outline ghosts (exactly
             // the "sky silhouette smear" with NRD + light TAA, and the equivalent FFX + TAA smear).
             // Keep TAA only for raw / denoise-off paths.
-            if (playablePath && temporalAccumEnabled(activeUpscaler) && accumulatedColor != null
+            // When taaOnAsync is true the dispatch already happened inside the async denoise
+            // lambda (which is mutually exclusive with the standalone async-denoise slot),
+            // so we skip this block and only set the flag.
+            if (taaOnAsync) {
+                temporalAccumRan = true;
+                if (lastDenoiseOn) {
+                    lastDenoisePath = lastDenoisePath + " + beauty TAA";
+                }
+            } else if (playablePath && temporalAccumEnabled(activeUpscaler) && accumulatedColor != null
                     && !denoiseWillRun) {
                 try {
                     if (temporalAccum == null) {
@@ -1980,6 +2395,16 @@ public final class RtComposite {
             if (activeUpscaler != null) {
                 activeUpscaler.setPlateBridge(plateBridge);
                 activeUpscaler.setInputColorFormat(displayPlateFormat);
+                // Inject the 1×1 R32_SFLOAT exposure image for FSR 3 (and any future
+                // upscaler that wants it). At this point the image holds last frame's
+                // value because exposure.record() runs after the upscale; that's
+                // acceptable — auto-exposure changes smoothly frame-to-frame.
+                // Upscaler interface default is no-op, so other providers ignore this.
+                if (exposure.ready()) {
+                    activeUpscaler.setExposureImage(exposure.image());
+                } else {
+                    activeUpscaler.setExposureImage(null);
+                }
             }
 
             int upscalerQuality = activeUpscalerQuality(activeUpscaler);
@@ -2049,6 +2474,85 @@ public final class RtComposite {
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // rrOutput visible to exposure histogram
 
+            // Pipeline probe ("black box flight recorder"): per-stage plate moments
+            // into rt-probe/probe.csv every Nth frame. Zero-stall (one interval lag
+            // on the readback, never a fence wait). Any probe failure is swallowed —
+            // diagnosis must never break the frame.
+            try {
+                if (dev.comfyfluffy.caustica.CausticaConfig.Rt.Probe.ENABLED.value()
+                        && playablePath && debugView == 0 && hasTraceGeometry) {
+                    int interval = Math.max(1,
+                            dev.comfyfluffy.caustica.CausticaConfig.Rt.Probe.INTERVAL.value());
+                    if (frameCounter % interval == 0) {
+                        try {
+                            if (probe == null) {
+                                probe = dev.comfyfluffy.caustica.rt.pipeline.RtProbe.create(ctx);
+                            }
+                        } catch (Throwable t) {
+                            // Loud: create() already logs the cause; this line marks
+                            // the consequence (no rows this session) exactly once.
+                            CausticaMod.LOGGER.warn(
+                                    "RtProbe unavailable (frame {}); probe.csv will stay empty — "
+                                            + "see the RtProbe cause above",
+                                    frameCounter);
+                            probe = null;
+                        }
+                        if (probe == null) {
+                            return;
+                        }
+                        RtImage disoccGuide = null;
+                        RtImage nrdOutDiff = null;
+                        RtImage nrdOutSpec = null;
+                        RtImage nrdOutShadow = null;
+                        if (backend instanceof dev.comfyfluffy.caustica.denoise.HybridFfxNrdBackend hybridProbe) {
+                            try {
+                                disoccGuide = hybridProbe.getDisocclusionMix();
+                                nrdOutDiff = hybridProbe.getNrdOutDiff();
+                                nrdOutSpec = hybridProbe.getNrdOutSpec();
+                                nrdOutShadow = hybridProbe.getNrdOutShadow();
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                        int probeBlockLights = 0;
+                        int probeDynLights = 0;
+                        int probeUploadCount = 0;
+                        long probeLightRev = 0L;
+                        try {
+                            if (unifiedLightManager != null) {
+                                probeBlockLights = unifiedLightManager.getBlockLights().getLightCount();
+                                probeDynLights = unifiedLightManager.getDynamicLights().getLightCount();
+                                probeLightRev = unifiedLightManager.revision();
+                            }
+                            if (blockLightBuffer != null) {
+                                probeUploadCount = blockLightBuffer.count();
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        probe.record(stack, cmd, frameCounter, displayW, displayH, renderW, renderH,
+                                lastJitterPixelsX, lastJitterPixelsY,
+                                lastDenoiseOn, lastDenoisePath,
+                                lastUpscalerPath, lastUpscalerOk,
+                                output, beautyForDenoise, beautyAfterDenoise, rrOutput,
+                                gMotion, disoccGuide,
+                                gDiffuse, gReflection, gUnshadowedDirect,
+                                gClearEmission, gTransmission, gShadowHit,
+                                gViewZ, exposure.ready() ? exposure.image() : null,
+                                nrdOutDiff, nrdOutSpec, nrdOutShadow,
+                                lastSkySunY, lastSkyDayFactor,
+                                lastSkyLightR, lastSkyLightG, lastSkyLightB,
+                                probeBlockLights, probeDynLights, probeUploadCount, probeLightRev,
+                                spp(), maxBounces(),
+                                camX, camY, camZ);
+                        VulkanCommandEncoder.memoryBarrier(cmd, stack);
+                    }
+                }
+            } catch (Throwable t) {
+                // Loud (not debug): record() only throws for create/dispatch-level
+                // failures, which mean zero rows — the player must see WHY.
+                CausticaMod.LOGGER.warn("RtProbe record failed (frame {}); probe.csv missing rows — "
+                        + "see cause", frameCounter, t);
+            }
+
             // Real-time pipeline flow capture (not code inference): log what actually ran this frame.
             // Every 60 frames after the first few — answers "did firefly/NRD/TAAU execute?" from live state.
             if (dbgCount <= 8 || dbgCount % 60 == 0) {
@@ -2105,20 +2609,52 @@ public final class RtComposite {
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // exposure image visible to the display mapper
 
+            // Phase 2 hybrid: SPECULAR_ONLY mode samples vanilla's mainTarget SDR (binding 4 in display.comp),
+            // tonemaps (vanillaLinear + RT specular) into displayImage, then copies displayImage back to
+            // mainTarget. Full mode ignores vanilla/specular bindings — rtImage drives displayImage.
+//
+// Layout dance for mainTarget (dstImage):
+//   SPECULAR_ONLY: vanilla left it in COLOR_ATTACHMENT_OPTIMAL. We need GENERAL (imageLoad in
+//   display.comp + vkCmdCopyImage both want sample-able / writeable), then back to
+//   COLOR_ATTACHMENT_OPTIMAL so next frame's vanilla render pass can attach it.
+//   Full: dstImage is in UNDEFINED — vanilla was cancelled. Existing UNDEFINED→GENERAL path applies.
+            if (isSpecularOnlyMode()) {
+                // COLOR_ATTACHMENT_OPTIMAL → GENERAL so display.comp can sample vanilla SDR.
+                VkImageMemoryBarrier2.Buffer toGen = VkImageMemoryBarrier2.calloc(1, stack).sType$Default();
+                toGen.get(0).srcStageMask(VK10.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)
+                        .srcAccessMask(VK10.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                        .dstStageMask(VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                        .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT)
+                        .oldLayout(VK10.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                        .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(dstImage);
+                toGen.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+                VkDependencyInfo preDisplayDep = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toGen);
+                KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, preDisplayDep);
+            }
+
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "map RT to display");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.displayMap")) {
-                displayPipeline.dispatch(cmd, displayW, displayH, CausticaConfig.Rt.Hdr.enabled(),
-                        CausticaConfig.Rt.Hdr.paperWhiteNits(), CausticaConfig.Rt.Hdr.headroom());
+                // HDR PQ output stays SDR-only in SPECULAR_ONLY mode (vanilla MC's mainTarget is SDR;
+                // an HDR PQ encode of the blend would orphan from what swapchain actually displays).
+                boolean hdrThisFrame = CausticaConfig.Rt.Hdr.enabled() && !isSpecularOnlyMode();
+                displayPipeline.dispatch(cmd, displayW, displayH, hdrThisFrame,
+                        CausticaConfig.Rt.Hdr.paperWhiteNits(), CausticaConfig.Rt.Hdr.headroom(),
+                        isSpecularOnlyMode());
+                hdrWrittenThisFrame = hdrThisFrame;
             }
-            hdrWrittenThisFrame = CausticaConfig.Rt.Hdr.enabled();
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "copy composite to main target");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.copyOutput")) {
                 VkImageMemoryBarrier2.Buffer toGeneral = VkImageMemoryBarrier2.calloc(1, stack).sType$Default();
+                // Full mode: dstImage is UNDEFINED → GENERAL for the copy.
+                // SPECULAR_ONLY: dstImage is already GENERAL (set above), so this barrier is a no-op
+                // layout-wise but still serves as the dependency between display.comp and the copy.
                 toGeneral.get(0).srcStageMask(0L).srcAccessMask(0L)
                         .dstStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT).dstAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
-                        .oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                        .oldLayout(isSpecularOnlyMode() ? VK10.VK_IMAGE_LAYOUT_GENERAL : VK10.VK_IMAGE_LAYOUT_UNDEFINED)
+                        .newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
                         .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(dstImage);
                 toGeneral.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
                         .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
@@ -2133,10 +2669,19 @@ public final class RtComposite {
                 VK10.vkCmdCopyImage(cmd, displayImage.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                         dstImage, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, displayW, displayH));
                 VkImageMemoryBarrier2.Buffer toSrc = VkImageMemoryBarrier2.calloc(1, stack).sType$Default();
+                // Full mode: keep dstImage in GENERAL (next frame's vanilla render still cancelled).
+                // SPECULAR_ONLY: transition GENERAL → COLOR_ATTACHMENT_OPTIMAL so vanilla's next
+                // frame render pass can attach it as a color attachment.
                 toSrc.get(0).srcStageMask(VK10.VK_PIPELINE_STAGE_TRANSFER_BIT)
                         .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
-                        .dstStageMask(VK10.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT).dstAccessMask(0L)
-                        .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                        .dstStageMask(isSpecularOnlyMode()
+                                ? VK10.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                : VK10.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT)
+                        .dstAccessMask(isSpecularOnlyMode() ? VK10.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0L)
+                        .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                        .newLayout(isSpecularOnlyMode()
+                                ? VK10.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                : VK10.VK_IMAGE_LAYOUT_GENERAL)
                         .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(dstImage);
                 toSrc.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
                         .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
@@ -2151,11 +2696,26 @@ public final class RtComposite {
         encoder.execute(cmd); // deferred into the frame's submission — correct for per-frame work
 
         // ReSTIR DI: swap reservoir images for next frame's temporal reuse
+        // 🔍 DEBUG: 记录 swap 操作（确保没有 WAR hazard）
         if (ENABLE_RESTIR_DI && reservoirImages != null) {
+            if (frameCounter % 120 == 0) {
+                CausticaMod.LOGGER.debug("Frame {}: ReSTIR reservoir swap", frameCounter);
+            }
             reservoirImages.swap();
         }
+        // ReSTIR PT Enhanced §5 duplication-map ping-pong (matches the reservoir one-frame lag).
+        if (dev.comfyfluffy.caustica.CausticaConfig.Rt.RestirEnhanced.DUPLICATION_MAP_ENABLED.value()) {
+            v2SeedImages.swap();
+            dupMap.swap();
+        }
+        // ReSTIR PT Enhanced §4 footprint-reconnection ping-pong. The hit position is written
+        // every frame at the same cadence as the DI reservoir, so swapping these together keeps
+        // the projection-radius test in lock-step with the temporal merge's `gReservoirPrev` read.
+        if (hitPosImages.curr() != null) {
+            hitPosImages.swap();
+        }
         // ReSTIR GI: swap direction-reservoir images for next frame's temporal reuse.
-        if (ENABLE_RESTIR_GI && giReservoirImages != null) {
+        if (giReservoirImages != null) {
             giReservoirImages.swap();
         }
     }
@@ -2179,11 +2739,14 @@ public final class RtComposite {
     /**
      * Block-breaking overlay: mirrors vanilla's {@code ClientLevel.destructionProgress()} (populated
      * by network packets, independent of the cancelled {@code LevelRenderer.render()} — see
-     * [[rt-native-overlay-tier1]]) into the push's {@code breaking[]} list, so {@code world.rchit} can blend
-     * the matching destroy-stage crack texture into a hit terrain block's albedo. Each block's own
-     * destroy-stage texture ({@code minecraft:textures/block/destroy_stage_N.png}, resolved via
-     * {@link ModelBakery#DESTROY_TYPES}) is a standalone {@code Sampler0} texture, not a block-atlas sprite,
-     * so it rides the same bindless entity-texture array as entity textures ({@link RtEntityTextures}).
+     * [[rt-native-overlay-tier1]]) into the push's {@code breaking[]} list AND a host-side
+     * mirror, so the post-tonemap {@link RtBreakOverlayPipeline} can stamp the matching
+     * destroy-stage crack texture onto each breaking block's faces (last stage of presentHdr).
+     * Each block's own destroy-stage texture ({@code minecraft:textures/block/destroy_stage_N.png},
+     * resolved via {@link ModelBakery#DESTROY_TYPES}) is a standalone {@code Sampler0} texture, not
+     * a block-atlas sprite, so it rides the same bindless entity-texture array as entity textures
+     * ({@link RtEntityTextures}); the overlay pipeline reads each entry's view via
+     * {@link RtEntityTextures#viewForSlot(int)}.
      */
     private void writeBreaking(ByteBuffer push, RtTerrain terrain) {
         int count = 0;
@@ -2201,14 +2764,25 @@ public final class RtComposite {
                 BlockPos pos = BlockPos.of(entry.getLongKey());
                 int slot = RtEntityTextures.INSTANCE.slotFor(ModelBakery.DESTROY_TYPES.get(stage));
                 int off = BREAKING_OFFSET + count * 16;
-                push.putInt(off, pos.getX() - terrain.blockX);
-                push.putInt(off + 4, pos.getY() - terrain.blockY);
-                push.putInt(off + 8, pos.getZ() - terrain.blockZ);
+                int bx = pos.getX() - terrain.blockX;
+                int by = pos.getY() - terrain.blockY;
+                int bz = pos.getZ() - terrain.blockZ;
+                push.putInt(off, bx);
+                push.putInt(off + 4, by);
+                push.putInt(off + 8, bz);
                 push.putInt(off + 12, slot);
+                // Per-frame mirror for the post-tonemap overlay. Rebased against terrain origin
+                // so the overlay's unprojection recovers the same world position the trace used
+                // and lands on the correct sub-block texel.
+                lastBreakPosX[count] = bx;
+                lastBreakPosY[count] = by;
+                lastBreakPosZ[count] = bz;
+                lastBreakSlot[count] = slot;
                 count++;
             }
         }
         push.putInt(416, count);
+        lastBreakCount = count;
     }
 
     private void writeSky(ByteBuffer push) {
@@ -2252,10 +2826,11 @@ public final class RtComposite {
             // the sun fade also reaches zero) so the switch is invisible. Scaled by the lit fraction so
             // a new moon gives near-zero moonlight, and tinted by the same transmittance so a low moon
             // is warm amber, silver once high (or zero while it is below the horizon).
+            // 🔧 TUNED: Increased moonPeak from 0.20f to 0.50f for better night visibility
             atmosphereTransmittance(moonX, moonY, moonZ, trans);
             float moonStrength = smoothstep(0.04f, 0.22f, -sunY);
             float litFraction = 1.0f - Math.abs(moonPhase - 4.0f) / 4.0f; // 0 new .. 1 full
-            float moonPeak = 0.20f * (0.15f + 0.85f * litFraction);
+            float moonPeak = 0.50f * (0.15f + 0.85f * litFraction);  // 🔧 从 0.20f 提高到 0.50f (2.5倍亮度)
             lx = moonX; ly = moonY; lz = moonZ;
             rr = 0.30f * moonPeak * moonStrength * trans[0];
             rg = 0.36f * moonPeak * moonStrength * trans[1];
@@ -2265,6 +2840,11 @@ public final class RtComposite {
         push.putFloat(208, sunX); push.putFloat(212, sunY); push.putFloat(216, sunZ); push.putFloat(220, dayFactor);
         push.putFloat(224, lx); push.putFloat(228, ly); push.putFloat(232, lz); push.putFloat(236, lightRadius);
         push.putFloat(240, rr); push.putFloat(244, rg); push.putFloat(248, rb); push.putFloat(252, starBrightness);
+        lastSkySunY = sunY;
+        lastSkyDayFactor = dayFactor;
+        lastSkyLightR = rr;
+        lastSkyLightG = rg;
+        lastSkyLightB = rb;
         // Sky rewrite: moon direction + phase, celestial axis + star rotation angle (real world time).
         push.putFloat(256, moonX); push.putFloat(260, moonY); push.putFloat(264, moonZ); push.putFloat(268, moonPhase);
         push.putFloat(272, 0f); push.putFloat(276, celestialAxisY()); push.putFloat(280, celestialAxisZ()); push.putFloat(284, starAngle);
@@ -2355,6 +2935,7 @@ public final class RtComposite {
     }
 
     public void destroy() {
+        RtBackendSelector.shutdown();
         // Teardown runs after the device is idle (CLIENT_STOPPING waits), so the TLAS ring's slots are no
         // longer in flight and can be freed immediately.
         tlasRing.destroy();
@@ -2392,6 +2973,7 @@ public final class RtComposite {
             vrs.destroy();
             vrs = null;
         }
+        vrsInitFailed = false;
         if (output != null) {
             output.destroy();
             output = null;
@@ -2410,6 +2992,14 @@ public final class RtComposite {
         }
         DenoiseBackendSelector.invalidate();
         destroyGuideImages();
+        if (probe != null) {
+            try {
+                probe.destroy();
+            } catch (Throwable t) {
+                CausticaMod.LOGGER.warn("RtProbe destroy failed", t);
+            }
+            probe = null;
+        }
         exposure.destroy();
         casSharpen.destroy();
         if (displayPipeline != null) {
@@ -2419,6 +3009,10 @@ public final class RtComposite {
         if (hdrCompositePipeline != null) {
             hdrCompositePipeline.destroy();
             hdrCompositePipeline = null;
+        }
+        if (breakOverlayPipeline != null) {
+            breakOverlayPipeline.destroy();
+            breakOverlayPipeline = null;
         }
         if (hdrUiSampler != 0L) {
             RtContext hdrCtx = RtContext.currentOrNull();
@@ -2568,6 +3162,17 @@ public final class RtComposite {
             if (FrameGenSelector.current().isEnabled()) {
                 captureFgHdrHudless(cmd, stack, src);
             }
+
+            // Tier 2 break overlay: stamp the per-block destroy_stage cracks onto hdrDisplayImage in
+            // place, AFTER the temporal upscaler so it cannot poison NRD / FSR2 history or the
+            // auto-exposure histogram (the root cause of the previous "twinkling world while mining"
+            // bug — applyBreaking was being called inside world.rchit and feeding a per-frame
+            // radiance delta downstream that flipped between current / history every other frame).
+            // The break list is the same one written into the world push this frame, captured to
+            // host fields for the post-tonemap stage. Up to MAX_BREAKING dispatches per present,
+            // each covering the full display image and early-exiting on the cheap bpos check for
+            // pixels outside the targeted block.
+            dispatchBreakOverlay(cmd, stack);
 
             // Step C.2: composite the combined UI overlay over the HDR world image (in place) at paper white,
             // before the swapchain blit. The overlay is an MC render target kept in GENERAL layout, sampled by
@@ -2847,6 +3452,61 @@ public final class RtComposite {
         VK10.vkCmdCopyImage(cmd, src.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                 fgHdrHudlessImage.image, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, src.width, src.height));
         VulkanCommandEncoder.memoryBarrier(cmd, stack);
+    }
+
+    /**
+     * Tier 2 destroy-stage crack overlay. Records one {@link RtBreakOverlayPipeline} dispatch per
+     * currently-mined block onto the post-upscaler HDR display image, in place. Matrices are the
+     * exact ones used by the trace's world push this frame (rebased against terrain origin), so
+     * the unprojection in {@code break_overlay.comp} recovers the same world position the trace
+     * did and lands on the correct sub-block texel.
+     *
+     * <p>Why this lives outside {@code world.rchit}: a per-frame stage transition (the destroy
+     * progress advances every tick) reshapes the breaking block's albedo every frame. Inside the
+     * path tracer, that delta flowed into NRD history, FSR2's reactive / history blend, and the
+     * exposure histogram — and since all three of those modules work in temporal-accumulation
+     * space, the per-frame delta alternated between "use current" and "use history" and produced
+     * the visible <em>world twinkle while mining</em>. Running the overlay here, after the
+     * temporal accumulators and right before the swapchain blit, decouples the visual feedback
+     * from those modules entirely.
+     */
+    private void dispatchBreakOverlay(VkCommandBuffer cmd, MemoryStack stack) {
+        if (!lastBreakValid || lastBreakCount == 0 || hdrDisplayImage == null || gDepth == null) {
+            return;
+        }
+        RtContext ctx = RtContext.get();
+        if (ctx == null || !ensureUiSampler(ctx)) {
+            return;
+        }
+        if (breakOverlayPipeline == null) {
+            breakOverlayPipeline = RtBreakOverlayPipeline.create(ctx);
+        }
+        // Make the upscaler's writes to hdrDisplayImage (and the gDepth writes from the trace) visible
+        // to the overlay's storage-image read. After the overlay writes, the UI composite dispatch
+        // below inserts its own barrier before it consumes hdrDisplayImage again.
+        VulkanCommandEncoder.memoryBarrier(cmd, stack);
+
+        int overlayW = Math.min(hdrDisplayImage.width, lastBreakDisplayW);
+        int overlayH = Math.min(hdrDisplayImage.height, lastBreakDisplayH);
+        for (int i = 0; i < lastBreakCount; ++i) {
+            int slot = lastBreakSlot[i];
+            long crackView = RtEntityTextures.INSTANCE.viewForSlot(slot);
+            if (crackView == 0L) {
+                // Texture couldn't be resolved (the destroy-stage texture wasn't ready yet, or the
+                // bindless array is full). Skip this entry rather than dispatching against the
+                // fallback block atlas — that would paint the block in random atlas colours.
+                continue;
+            }
+            // Wire the per-block view + the HDR display + the depth guide. setImages() rebinds the
+            // descriptor set only when the views actually change, so the inner loop is cheap.
+            breakOverlayPipeline.setImages(hdrDisplayImage.view, gDepth.view, crackView, hdrUiSampler);
+            breakOverlayPipeline.dispatch(cmd,
+                    lastBreakInvViewProj,
+                    lastBreakRenderW, lastBreakRenderH,
+                    overlayW, overlayH,
+                    lastBreakPosX[i], lastBreakPosY[i], lastBreakPosZ[i],
+                    lastBreakCamOffset.x, lastBreakCamOffset.y, lastBreakCamOffset.z);
+        }
     }
 
     /**

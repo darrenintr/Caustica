@@ -1,14 +1,15 @@
 // FidelityFX Shadow Denoiser — spatial EAW-style filter (Caustica-hosted).
-// Variance from reproject (.b) drives blur strength; thins off over 3 dilated passes.
-// Input/output rgba16f: r=shadow, g=count, b=variance, a=mean.
+// Count-gated blur that thins off over 3 dilated passes.
+// VRAM-first layout (2026-09): rg16f plates (r=shadow, g=count) at 4 B/px.
+// Count rides through untouched; the old variance/mean lanes are gone.
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(binding = 0, rgba16f) readonly  uniform image2D gIn;
+layout(binding = 0, rg16f) readonly  uniform image2D gIn;
 layout(binding = 1, r32f)    readonly  uniform image2D gDepth;
 layout(binding = 2, rgba16f) readonly  uniform image2D gNormal;
-layout(binding = 3, rgba16f) writeonly uniform image2D gOut;
+layout(binding = 3, rg16f) writeonly uniform image2D gOut;
 
 layout(push_constant) uniform Push {
     int step;           // 1, 2, 4  (EAW dilation)
@@ -24,32 +25,33 @@ void main() {
         return;
     }
 
-    vec4 center = imageLoad(gIn, pix);
-    float cShadow = center.r;
-    float cCount = center.g;
-    float cVar = center.b;
-    float cMean = center.a;
+    vec2 centerPack = imageLoad(gIn, pix).rg;
+    float cShadow = centerPack.r;
+    float cCount = centerPack.g;
     float cDepth = imageLoad(gDepth, pix).r;
     vec3 cN = normalize(imageLoad(gNormal, pix).xyz + 1e-6);
 
     if (length(imageLoad(gNormal, pix).xyz) < 1e-4 || cDepth <= 1e-6) {
-        imageStore(gOut, pix, center);
+        imageStore(gOut, pix, vec4(cShadow, cCount, 0.0, 0.0));
         return;
     }
 
     // Keep spatial mild — over-blur turns player/leaves contact shadows into soft ghosts.
+    // cCount (temporal convergence 0..16) throttles the blur: converged pixels
+    // blur less. The old cVar term is gone with the variance lane — the count
+    // gate below carries the same "thin off as history builds" behaviour.
     float spatialBoost = mix(1.25, 1.0, clamp(cCount / 12.0, 0.0, 1.0));
-    spatialBoost *= (1.0 + 0.25 * clamp(cVar, 0.0, 1.0));
     float depthSigma = max(pc.depthSigma * spatialBoost, 1e-4);
     float normalSigma = max(pc.normalSigma, 1e-4);
 
     // Tight phi preserves hard umbra edges (player silhouette under sun).
-    float phiShadow = max(sqrt(cVar) * 0.75 + 0.02, 0.02);
+    // Fixed 0.02 floor (was sqrt(cVar)*0.75+0.02): without the variance lane
+    // the kernel keeps a constant tight edge stop instead of widening on noise.
+    float phiShadow = 0.02;
 
     const float k[3] = float[3](0.4, 0.25, 0.05);
     float wSum = 0.0;
     float sSum = 0.0;
-    float vSum = 0.0;
     int step = max(pc.step, 1);
 
     for (int dy = -2; dy <= 2; dy++) {
@@ -58,7 +60,7 @@ void main() {
             if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size))) {
                 continue;
             }
-            vec4 sPack = imageLoad(gIn, q);
+            vec2 sPack = imageLoad(gIn, q).rg;
             float s = sPack.r;
             float d = imageLoad(gDepth, q).r;
             vec3 n = normalize(imageLoad(gNormal, q).xyz + 1e-6);
@@ -70,13 +72,11 @@ void main() {
             float w = wSpatial * wDepth * wNormal * wShadow;
             wSum += w;
             sSum += s * w;
-            vSum += sPack.b * w;
         }
     }
 
     float outShadow = (wSum > 1e-5) ? (sSum / wSum) : cShadow;
     outShadow = clamp(outShadow, 0.0, 1.0);
-    // Variance cools after each blur pass (official behaviour).
-    float outVar = (wSum > 1e-5) ? (vSum / wSum) * 0.65 : cVar * 0.65;
-    imageStore(gOut, pix, vec4(outShadow, cCount, outVar, cMean));
+    // Count rides through (temporal convergence survives the spatial passes).
+    imageStore(gOut, pix, vec4(outShadow, cCount, 0.0, 0.0));
 }

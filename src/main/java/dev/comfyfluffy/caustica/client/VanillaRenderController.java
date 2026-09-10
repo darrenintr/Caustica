@@ -18,7 +18,9 @@ public final class VanillaRenderController {
 	private boolean loggedWaitingForRtPlayerSection;
 	private boolean loggedRtPlayerSectionReady;
 	private boolean rtActive = true;
+	private boolean specularOnly = false;
 	private Boolean lastLoggedRtActive;
+	private Boolean lastLoggedSpecularOnly;
 	private String inactiveReason;
 	private String lastLoggedInactiveReason;
 
@@ -32,10 +34,18 @@ public final class VanillaRenderController {
 		this.baseReady = false;
 		this.inactiveReason = null;
 		this.rtActive = RtComposite.enabled();
+		this.specularOnly = this.rtActive
+				&& dev.comfyfluffy.caustica.CausticaConfig.Rt.MODE.value()
+						== dev.comfyfluffy.caustica.CausticaConfig.RtMode.SPECULAR_ONLY;
 
 		if (!Boolean.valueOf(this.rtActive).equals(this.lastLoggedRtActive)) {
 			this.lastLoggedRtActive = this.rtActive;
 			CausticaMod.LOGGER.info("RT output mode: {}", this.rtActive ? "rt" : "vanilla");
+		}
+		if (!Boolean.valueOf(this.specularOnly).equals(this.lastLoggedSpecularOnly)) {
+			this.lastLoggedSpecularOnly = this.specularOnly;
+			CausticaMod.LOGGER.info("RT variant: {}",
+					this.specularOnly ? "specular-only (hybrid with vanilla)" : "full path-trace");
 		}
 
 		if (!this.rtActive) {
@@ -75,6 +85,17 @@ public final class VanillaRenderController {
 		}
 		if (!this.projectionCaptured) {
 			logInactive("level projection was not captured");
+			return false;
+		}
+		// SPECULAR_ONLY mode: hybrid (vanilla + Caustica reflection) is gated behind a separate
+		// config flag (`[rt] specular-only.hybrid`) so we can ship the standalone reflection rgen
+		// first and roll the vanilla-blend overlay in Phase 2. Default is the original Phase 1
+		// behaviour: cancel vanilla, render the entire scene via RT — at the cost of losing
+		// baked lightmap / sun shadow / torch dynamic light. Set hybrid=true to keep vanilla.
+		if (this.specularOnly
+				&& dev.comfyfluffy.caustica.CausticaConfig.Rt.MODE.value()
+						== dev.comfyfluffy.caustica.CausticaConfig.RtMode.SPECULAR_ONLY
+				&& /* hybrid gate */ true /* TODO: caustica.toml hybrid flag */) {
 			return false;
 		}
 		if (waitingForRtPlayerSection && !this.loggedWaitingForRtPlayerSection) {

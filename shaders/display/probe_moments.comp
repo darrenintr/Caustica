@@ -1,0 +1,144 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+// Pipeline probe: per-plate moment statistics for the NRD+TAAU "black box recorder".
+//
+// Reduces one HDR plate per dispatch to 4 floats (mean, variance, max, NaN-count)
+// at stats[statBase .. statBase+3]:
+//
+//   mode 0 = plate luma:   texelFetch(inPlate).rgb -> luma moments (B10G11R11 or RGBA16F)
+//   mode 1 = motion:       texelFetch(inPlate).rg  -> |MV| moments in px (RGBA16F guides)
+//   mode 2 = scalar:       texelFetch(inPlate).r   -> clamped [0,1] moments (R8/RG16F guides)
+//   mode 3 = raw channel:  texelFetch(inPlate).r   -> UNCLAMPED moments (R32F viewZ / exposure)
+//
+// The caller (RtProbe) issues 17 dispatches per probe frame: 6 beauty/motion
+// plates at bases 0/4/8/12/16/20 plus 11 lighting plates at bases
+// 24/28/32/36/40/44/48/52/56/60/64 (diffuse / reflection / unshadowedDirect /
+// emission / transmission / shadowHit / viewZ / exposure / nrdOutDiff /
+// nrdOutSpec / nrdOutShadow); stats[68..79] are reserved and stay 0.
+//
+// Reduction: one workgroup (256 threads), each thread strides the image,
+// then a shared-memory tree reduce. Push holds image size + mode + stat base.
+// 64-bit atomics are avoided (portability); the tree reduce needs no atomics.
+// Single-workgroup means a probe frame costs ~ms on one CU — fine for a debug
+// tool that only fires every Nth frame, never on the hot path.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// NOTE: sampled reads (texelFetch on texture2D) pair with a SAMPLED_IMAGE
+// descriptor (see RtProbe) and need no format qualifier — one shader covers
+// every plate format (B10G11R11, RGBA16F, R16G16_SFLOAT, R32F, R8...).
+// Storage-image imageLoad would require one qualifier per format — wrong tool here.
+layout(set = 0, binding = 0) uniform texture2D inPlate;
+layout(set = 0, binding = 1) writeonly buffer OutStats {
+    float stats[];
+} outStats;
+
+layout(push_constant) uniform ProbePush {
+    ivec2 imageSize;
+    int mode;      // 0 = plate luma, 1 = motion |MV| px, 2 = scalar [0,1], 3 = raw channel
+    int statBase;  // float offset into stats[] to write (multiple of 4)
+} pc;
+
+shared float sSum[256];
+shared float sSumSq[256];
+shared float sMax[256];
+shared uint sNan[256];
+
+float lumaOf(vec3 c) {
+    return dot(max(c, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    int w = pc.imageSize.x;
+    int h = pc.imageSize.y;
+    int n = max(w * h, 1);
+
+    float sum = 0.0;
+    float sumSq = 0.0;
+    float mx = 0.0;
+    uint nanN = 0u;
+
+    if (pc.mode == 0) {
+        for (int i = int(tid); i < n; i += 256) {
+            ivec2 p = ivec2(i % w, i / w);
+            vec4 v = texelFetch(inPlate, p, 0);
+            if (any(isnan(v.rgb)) || any(isinf(v.rgb))) {
+                nanN++;
+                continue;
+            }
+            float l = lumaOf(v.rgb);
+            sum += l;
+            sumSq += l * l;
+            mx = max(mx, l);
+        }
+    } else if (pc.mode == 1) {
+        for (int i = int(tid); i < n; i += 256) {
+            ivec2 p = ivec2(i % w, i / w);
+            vec4 v = texelFetch(inPlate, p, 0);
+            vec2 m = v.rg;
+            if (any(isnan(m)) || any(isinf(m))) {
+                nanN++;
+                continue;
+            }
+            float l = length(m);
+            sum += l;
+            sumSq += l * l;
+            mx = max(mx, l);
+        }
+    } else if (pc.mode == 3) {
+        // Raw single channel, NO clamp: R32F viewZ (meters) and R32F exposure
+        // scale. Clamping would destroy the diagnostic (viewZ max IS the scene
+        // depth range; exposure scale lives around 1.0, not [0,1]).
+        for (int i = int(tid); i < n; i += 256) {
+            ivec2 p = ivec2(i % w, i / w);
+            float v = texelFetch(inPlate, p, 0).r;
+            if (isnan(v) || isinf(v)) {
+                nanN++;
+                continue;
+            }
+            v = max(v, 0.0);
+            sum += v;
+            sumSq += v * v;
+            mx = max(mx, v);
+        }
+    } else {
+        for (int i = int(tid); i < n; i += 256) {
+            ivec2 p = ivec2(i % w, i / w);
+            float v = texelFetch(inPlate, p, 0).r;
+            if (isnan(v) || isinf(v)) {
+                nanN++;
+                continue;
+            }
+            v = clamp(v, 0.0, 1.0);
+            sum += v;
+            sumSq += v * v;
+            mx = max(mx, v);
+        }
+    }
+
+    sSum[tid] = sum;
+    sSumSq[tid] = sumSq;
+    sMax[tid] = mx;
+    sNan[tid] = nanN;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            sSum[tid] += sSum[tid + stride];
+            sSumSq[tid] += sSumSq[tid + stride];
+            sMax[tid] = max(sMax[tid], sMax[tid + stride]);
+            sNan[tid] += sNan[tid + stride];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        float mean = sSum[0] / float(n);
+        float var = max(sSumSq[0] / float(n) - mean * mean, 0.0);
+        outStats.stats[pc.statBase + 0] = mean;
+        outStats.stats[pc.statBase + 1] = var;
+        outStats.stats[pc.statBase + 2] = sMax[0];
+        outStats.stats[pc.statBase + 3] = float(sNan[0]);
+    }
+}

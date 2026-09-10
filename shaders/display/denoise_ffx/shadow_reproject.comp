@@ -1,17 +1,21 @@
 // FidelityFX Shadow Denoiser — temporal reproject + local moments (Caustica-hosted).
 // Anti-ghost first: contact shadows of moving entities (player/mobs) must not leave
 // dark trails. History is useful only for static geometry under low motion.
-// Outputs rgba16f: r=shadow, g=count, b=variance, a=mean.
+// Outputs rg16f: r=shadow visibility [0,1], g=temporal count 0..16.
+// Variance/mean are re-derived from 3x3 moments downstream (spatial pass).
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(binding = 0, rgba16f) readonly  uniform image2D gShadowDense; // r=raw shadow (from prepare)
+// Shadow moments (VRAM-first layout, 2026-09): rg16f plates
+// (r=shadow visibility [0,1], g=temporal count) at 4 B/px instead of
+// rgba16f 8 B/px. Variance/mean are re-derived from 3x3 moments each dispatch.
+layout(binding = 0, rg16f) readonly  uniform image2D gShadowDense; // r=raw shadow, g=count seed
 layout(binding = 1, r32f)    readonly  uniform image2D gDepth;
 layout(binding = 2, rgba16f) readonly  uniform image2D gNormal;
 layout(binding = 3, rgba16f) readonly  uniform image2D gMotion;
-layout(binding = 4, rgba16f) readonly  uniform image2D gHistoryShadow;
-layout(binding = 5, rgba16f) writeonly uniform image2D gOut;
+layout(binding = 4, rg16f) readonly  uniform image2D gHistoryShadow;
+layout(binding = 5, rg16f) writeonly uniform image2D gOut;
 // Optional packed hitmask (tiles). Used for cheap local stats when available.
 layout(binding = 6, r32ui)   readonly  uniform uimage2D gHitMask;
 
@@ -50,7 +54,7 @@ void main() {
 
     bool noSurface = (length(imageLoad(gNormal, pix).xyz) < 1e-4) || (curDepth <= 1e-6);
     if (noSurface || pc.reset > 0.5) {
-        imageStore(gOut, pix, vec4(curShadow, 1.0, 0.0, curShadow));
+        imageStore(gOut, pix, vec4(curShadow, 1.0, 0.0, 0.0));
         return;
     }
 
@@ -58,7 +62,6 @@ void main() {
     float nMin = curShadow;
     float nMax = curShadow;
     float sum = 0.0;
-    float sumSq = 0.0;
     float wSum = 0.0;
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
@@ -66,12 +69,10 @@ void main() {
             nMin = min(nMin, s);
             nMax = max(nMax, s);
             sum += s;
-            sumSq += s * s;
             wSum += 1.0;
         }
     }
     float mean = sum / max(wSum, 1.0);
-    float var = max(sumSq / max(wSum, 1.0) - mean * mean, 0.0);
 
     // ---- Reproject history ----
     vec2 motionPx = imageLoad(gMotion, pix).xy;
@@ -85,7 +86,6 @@ void main() {
 
     float histShadow = curShadow;
     float histCount = 0.0;
-    float histVar = var;
     if (!offscreen && !motionReject) {
         vec2 prevPx = prevUv * vec2(size) - 0.5;
         ivec2 i0 = ivec2(floor(prevPx));
@@ -94,13 +94,16 @@ void main() {
         ivec2 c10 = clamp(i0 + ivec2(1, 0), ivec2(0), size - 1);
         ivec2 c01 = clamp(i0 + ivec2(0, 1), ivec2(0), size - 1);
         ivec2 c11 = clamp(i0 + ivec2(1, 1), ivec2(0), size - 1);
-        vec4 h00 = imageLoad(gHistoryShadow, c00);
-        vec4 h10 = imageLoad(gHistoryShadow, c10);
-        vec4 h01 = imageLoad(gHistoryShadow, c01);
-        vec4 h11 = imageLoad(gHistoryShadow, c11);
-        histShadow = mix(mix(h00.r, h10.r, f.x), mix(h01.r, h11.r, f.x), f.y);
-        histCount  = mix(mix(h00.g, h10.g, f.x), mix(h01.g, h11.g, f.x), f.y);
-        histVar    = mix(mix(h00.b, h10.b, f.x), mix(h01.b, h11.b, f.x), f.y);
+        float h00 = imageLoad(gHistoryShadow, c00).r;
+        float h10 = imageLoad(gHistoryShadow, c10).r;
+        float h01 = imageLoad(gHistoryShadow, c01).r;
+        float h11 = imageLoad(gHistoryShadow, c11).r;
+        histShadow = mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+        float c00n = imageLoad(gHistoryShadow, c00).g;
+        float c10n = imageLoad(gHistoryShadow, c10).g;
+        float c01n = imageLoad(gHistoryShadow, c01).g;
+        float c11n = imageLoad(gHistoryShadow, c11).g;
+        histCount = mix(mix(c00n, c10n, f.x), mix(c01n, c11n, f.x), f.y);
 
         // Current-frame depth at reprojected UV is only a proxy (no prev depth). Keep it tight.
         float histDepth = fetchDepth(c00, size);
@@ -110,19 +113,16 @@ void main() {
         if (depthErr > thresh) {
             histCount = 0.0;
             histShadow = curShadow;
-            histVar = var;
         }
         vec3 histN = fetchNormal(c00, size);
         if (dot(curN, histN) < 0.7) {
             histCount = 0.0;
             histShadow = curShadow;
-            histVar = var;
         }
         // Hard anti-ghost: history much darker than current = leftover contact shadow of a mover.
         if ((curShadow - histShadow) > 0.25) {
             histCount = 0.0;
             histShadow = curShadow;
-            histVar = var;
         }
         // History much brighter than current on a hard umbra is usually wrong too (flicker),
         // but prefer a short blend rather than full reject so static penumbra can settle.
@@ -133,7 +133,6 @@ void main() {
     } else {
         histCount = 0.0;
         histShadow = curShadow;
-        histVar = var;
     }
 
     // Neighborhood clamp — tight box around current sample + 3x3 min/max.
@@ -146,13 +145,9 @@ void main() {
     nmax = min(nmax, curShadow + 0.10);
     float shadowClamped = clamp(histShadow, nmin, nmax);
 
-    float variance = max(var, histVar);
-    if (histCount < 8.0) {
-        variance = max(variance, var) * max(8.0 - histCount, 1.0) * 0.25;
-    }
-    variance = clamp(variance, 0.0, 1.0);
-
     // alpha = weight of CURRENT. Keep temporal mild — FFX residual bilateral cleans GI.
+    // (No variance term: the rg16f plates carry shadow+count only; the count
+    // gate below is the convergence signal.)
     float alpha;
     if (histCount < 1.0) {
         alpha = 1.0;
@@ -172,5 +167,5 @@ void main() {
     outShadow = clamp(outShadow, 0.0, 1.0);
 
     float outCount = min(histCount + 1.0, 16.0);
-    imageStore(gOut, pix, vec4(outShadow, outCount, variance, mean));
+    imageStore(gOut, pix, vec4(outShadow, outCount, 0.0, 0.0));
 }

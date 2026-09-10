@@ -79,7 +79,9 @@ public final class RtPlateBridge {
     private static final String UNPACK_SPV = "/caustica/rt/fsr_color_unpack.comp.spv";
     private static final String GUARD_B10_SPV = "/caustica/rt/fsr_blackout_guard.comp.spv";
     private static final String GUARD_RGBA16F_SPV = "/caustica/rt/fsr_blackout_guard_rgba16f.comp.spv";
-    private static final String REACTIVE_SPV = "/caustica/rt/fsr2_reactive_mask.comp.spv";
+    // v2: material-aware reactive mask (9 bindings: motion/depth/viewZ/normalRough/disoccl + specAlbedo/emission/matFlags + out)
+    private static final String REACTIVE_SPV = "/caustica/rt/fsr2_reactive_mask_v2.comp.spv";
+    private static final String REACTIVE_V1_SPV = "/caustica/rt/fsr2_reactive_mask.comp.spv";
 
     private final RtContext ctx;
 
@@ -319,32 +321,57 @@ public final class RtPlateBridge {
      * disoccl) are all available. {@code viewZ} / {@code disoccl} may be null only
      * when the upscaler doesn't need the disocclusion-aware variant.
      *
+     * <p>v2 (material-aware): when {@code specAlbedo}, {@code emission}, {@code materialFlags}
+     * are all non-null, uses the enhanced shader that boosts reactive values for metallic,
+     * emissive, and transparent surfaces. Falls back to v1 (motion+depth divergence only) when
+     * material guides are missing.
+     *
      * @return true when the reactive mask was written; false if it was skipped (the
      *         caller should then dispatch without reactive).
      */
     public boolean computeReactiveMaskIfNeeded(VkCommandBuffer cmd,
                                                RtImage motion, RtImage depth, RtImage normals,
-                                               RtImage viewZ, RtImage disoccl) {
+                                               RtImage viewZ, RtImage disoccl,
+                                               RtImage specAlbedo, RtImage emission, RtImage materialFlags) {
         if (profile == null || !profile.needsReactiveMask || !reactiveReady) return false;
         if (motion == null || depth == null || normals == null) return false;
         if (viewZ == null || disoccl == null) return false;
+
+        // v2 material-aware path: requires all 3 new guides
+        boolean useMaterialAware = (specAlbedo != null && emission != null && materialFlags != null);
+
         try (MemoryStack stack = MemoryStack.stackPush();
              RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "plate reactive")) {
             barrierWrite(stack, cmd, reactiveMask.image);
-            bindReactive(motion, depth, normals, viewZ, disoccl, reactiveMask);
+
+            if (useMaterialAware) {
+                bindReactiveV2(motion, depth, normals, viewZ, disoccl, specAlbedo, emission, materialFlags, reactiveMask);
+            } else {
+                bindReactive(motion, depth, normals, viewZ, disoccl, reactiveMask);
+            }
+
             VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, reactivePipe);
             VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, reactiveLayout, 0,
                     stack.longs(reactiveSet), null);
             ByteBuffer push = stack.malloc(16);
-            push.putFloat(0, 1.0f);
-            push.putFloat(4, 1.0f);
-            push.putFloat(8, 0.0f);
-            push.putFloat(12, 0.0f);
+            push.putFloat(0, 1.0f);  // motionDivergenceScale
+            push.putFloat(4, 1.0f);  // depthDivergenceScale
+            push.putFloat(8, useMaterialAware ? 0.3f : 0.0f);  // materialBoostScale (v2 only)
+            push.putFloat(12, useMaterialAware ? 0.4f : 0.0f); // emissiveBoostScale (v2 only)
             VK10.vkCmdPushConstants(cmd, reactiveLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (renderW + 7) / 8, (renderH + 7) / 8, 1);
             barrierRW(stack, cmd, reactiveMask.image);
             return true;
         }
+    }
+
+    /**
+     * Backward-compatible overload for callers that don't have material guides yet.
+     */
+    public boolean computeReactiveMaskIfNeeded(VkCommandBuffer cmd,
+                                               RtImage motion, RtImage depth, RtImage normals,
+                                               RtImage viewZ, RtImage disoccl) {
+        return computeReactiveMaskIfNeeded(cmd, motion, depth, normals, viewZ, disoccl, null, null, null);
     }
 
     /**
@@ -495,7 +522,9 @@ public final class RtPlateBridge {
     private void ensureReactivePipelines() throws Throwable {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDevice vk = device();
-            final int B = 6;
+            // v2 uses 9 bindings: 0-5 (v1: motion/depth/viewZ/normalRough/disoccl/out)
+            //                    + 6-8 (v2: specAlbedo/emission/materialFlags)
+            final int B = 9;
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(B, stack);
             for (int i = 0; i < B; i++) {
                 binds.get(i).binding(i).descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
@@ -581,6 +610,30 @@ public final class RtPlateBridge {
             writeStorageImage(stack, writes.get(3), reactiveSet, 3, views[3]);
             writeStorageImage(stack, writes.get(4), reactiveSet, 4, views[4]);
             writeStorageImage(stack, writes.get(5), reactiveSet, 5, views[5]);
+            VK10.vkUpdateDescriptorSets(device(), writes, null);
+            reactiveBound = views;
+        }
+    }
+
+    private void bindReactiveV2(RtImage motion, RtImage deviceDepth, RtImage normalRough,
+                                RtImage viewZ, RtImage disoccl,
+                                RtImage specAlbedo, RtImage emission, RtImage materialFlags,
+                                RtImage out) {
+        long[] views = {motion.view, deviceDepth.view, viewZ.view,
+                normalRough.view, disoccl.view, out.view,
+                specAlbedo.view, emission.view, materialFlags.view};
+        if (Arrays.equals(reactiveBound, views)) return;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(9, stack);
+            writeStorageImage(stack, writes.get(0), reactiveSet, 0, views[0]);
+            writeStorageImage(stack, writes.get(1), reactiveSet, 1, views[1]);
+            writeStorageImage(stack, writes.get(2), reactiveSet, 2, views[2]);
+            writeStorageImage(stack, writes.get(3), reactiveSet, 3, views[3]);
+            writeStorageImage(stack, writes.get(4), reactiveSet, 4, views[4]);
+            writeStorageImage(stack, writes.get(5), reactiveSet, 5, views[5]);
+            writeStorageImage(stack, writes.get(6), reactiveSet, 6, views[6]);
+            writeStorageImage(stack, writes.get(7), reactiveSet, 7, views[7]);
+            writeStorageImage(stack, writes.get(8), reactiveSet, 8, views[8]);
             VK10.vkUpdateDescriptorSets(device(), writes, null);
             reactiveBound = views;
         }

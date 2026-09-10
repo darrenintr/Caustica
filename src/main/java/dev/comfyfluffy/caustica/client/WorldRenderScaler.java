@@ -49,7 +49,10 @@ public final class WorldRenderScaler {
 				VanillaRenderController.INSTANCE.markMissedBeforeHandSeam();
 				return;
 			}
-			boolean success = RtComposite.INSTANCE.composite(mainTarget.getColorTexture(), mainTarget.width, mainTarget.height);
+			// SPECULAR_ONLY (Phase 2 hybrid) needs the mainTarget color view to sample vanilla SDR in
+			// display.comp binding 4; full mode ignores it.
+			boolean success = RtComposite.INSTANCE.composite(mainTarget.getColorTexture(),
+					mainTarget.getColorTextureView(), mainTarget.width, mainTarget.height);
 			VanillaRenderController.INSTANCE.markRtCompositeResult(success);
 		}
 	}

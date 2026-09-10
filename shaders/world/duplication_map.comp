@@ -1,0 +1,89 @@
+#version 460
+// ReSTIR PT Enhanced §5 duplication map (Lin, Kettunen, Wyman, I3D 2026).
+//
+// Reads gV2SeedPrev (R32 UI, per-pixel V2 identifier from previous frame) and writes
+// gDupMapCurr (R8 UNORM, render-res). Each output pixel is the local V2-match ratio in a 17×17
+// window. Consumed by the temporal merge to cap history reuse: a pixel in a V2-homogeneous
+// neighbourhood reuses the previous frame's sample aggressively (low rejection), a pixel in a
+// heterogeneous neighbourhood reuses tightly (high rejection).
+//
+// The "LDS-like 8×8 tile + group-shared" pattern from the spec keeps texture reads at
+// ~1× pixel count instead of ~289× per inner iteration: each workgroup loads a 24×24 shared
+// footprint (17+8-1) covering its 8×8 tile + halo, then every thread reads its 17×17 window
+// from shared memory at zero global-memory cost.
+//
+// Bindings:
+//   0  gV2SeedPrev  (r32ui) ro   (filled by the seed_init pass before this one runs)
+//   1  gDupMapCurr   (r8)    writeonly
+//
+// Push:  ivec2 renderSize, uint frameSeed, uint pad → 16 bytes.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, set = 0, r32ui) uniform readonly uimage2D v2SeedPrev;
+layout(binding = 1, set = 0, r8)    uniform writeonly image2D dupMapCurr;
+
+layout(push_constant) uniform Push {
+    ivec2 renderSize;
+    uint  frameSeed;
+    uint  pad0;
+} pc;
+
+// 17×17 window + 8×8 tile → 24×24 shared-mem footprint (one-pixel halo all around so each
+// thread can read all 17×17 samples from shared without spilling to global memory).
+const int SHARED = 24;
+const int RADIUS = 8;   // (17 - 1) / 2
+
+shared uint gShared[SHARED * SHARED];
+
+// PCG-hash the seed so the duplication check isn't a trivial exact-uint compare (path
+// distributions with the same seed still differ in runtime jitter). xorshift-multiply variant
+// seeded with the per-frame frameSeed so the duplication map reshuffles every frame.
+uint pcg(uint x) {
+    uint h = x ^ (pc.frameSeed * 0x9E3779B9u);
+    h ^= h >> 16u; h *= 0x85EBCA6Bu;
+    h ^= h >> 13u; h *= 0xC2B2AE35u;
+    h ^= h >> 16u;
+    return h;
+}
+
+void main() {
+    ivec2 tileBase = ivec2(gl_WorkGroupID.xy) * 8;
+    ivec2 local    = ivec2(gl_LocalInvocationID.xy);
+
+    // Each thread loads 3×3 shared slots (its own + 2 neighbors per axis). Across the
+    // 8×8 group that's 24×24 — the 17×17 footprint with a 1-pixel halo.
+    for (int dy = 0; dy < 3; ++dy) {
+        for (int dx = 0; dx < 3; ++dx) {
+            ivec2 src = tileBase + local + ivec2(dx * 8 - 1, dy * 8 - 1);
+            src = clamp(src, ivec2(0), pc.renderSize - 1);
+            uint v = imageLoad(v2SeedPrev, src).r;
+            gShared[(local.y + dy * 8) * SHARED + (local.x + dx * 8)] = v;
+        }
+    }
+    barrier();
+
+    ivec2 px = tileBase + local;
+    if (px.x >= pc.renderSize.x || px.y >= pc.renderSize.y) {
+        return;
+    }
+
+    // Index into shared: local + (offset + RADIUS) for the 17×17 window centred at local.
+    uint mySeed = gShared[(local.y + RADIUS) * SHARED + (local.x + RADIUS)];
+    uint myTag = pcg(mySeed);
+
+    uint hits = 0u;
+    for (int dy = -RADIUS; dy <= RADIUS; ++dy) {
+        for (int dx = -RADIUS; dx <= RADIUS; ++dx) {
+            int sx = local.x + RADIUS + dx;
+            int sy = local.y + RADIUS + dy;
+            uint otherSeed = gShared[sy * SHARED + sx];
+            if (pcg(otherSeed) == myTag) {
+                ++hits;
+            }
+        }
+    }
+    // 17×17 = 289 samples → 0..289 → 0..255 fits in R8 after scaling.
+    float ratio = float(hits) * (255.0 / 289.0);
+    imageStore(dupMapCurr, px, vec4(clamp(ratio, 0.0, 255.0) / 255.0, 0.0, 0.0, 0.0));
+}

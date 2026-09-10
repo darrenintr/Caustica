@@ -26,6 +26,7 @@ import dev.comfyfluffy.caustica.rt.accel.RtImage;
 import dev.comfyfluffy.caustica.rt.plate.RtPlateBridge;
 import dev.comfyfluffy.caustica.upscale.Upscaler;
 import net.fabricmc.loader.api.FabricLoader;
+import dev.comfyfluffy.caustica.nativebridge.NativePlatform;
 import org.joml.Matrix4fc;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -89,6 +90,13 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
     private RtImage guideViewZ;
     private RtImage guideDisocclusionMix;
 
+    /**
+     * v2 material guides injected via {@link #setMaterialGuides} for enhanced reactive mask.
+     */
+    private RtImage guideSpecAlbedo;
+    private RtImage guideEmission;
+    private RtImage guideMaterialFlags;
+
     /** Composite-owned, non-owning format bridge injected before ensure/evaluate. */
     private RtPlateBridge plate;
     /** Actual VkFormat of the color image supplied to evaluate(). */
@@ -125,11 +133,20 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
             Path p = Path.of(override);
             return Files.isRegularFile(p) ? p : null;
         }
+        // 2026-08-06 fix: use NativePlatform instead of hardcoded "linux-x64" + ".so". Windows
+        // users on AMD/Intel were getting "Cannot open library: linux-x64/libffx_fsr2_caustica.so"
+        // even though windows-x64/ffx_fsr2_caustica.dll is in the JAR.
+        NativePlatform platform = NativePlatform.forLibrary(LIB);
+        if (platform == null) {
+            LOGGER.warn("FSR2 native: unsupported platform ({} / {})",
+                    System.getProperty("os.name"), System.getProperty("os.arch"));
+            return null;
+        }
         Path dir = FabricLoader.getInstance().getGameDir()
-                .resolve("caustica-fsr").resolve("natives").resolve("linux-x64");
+                .resolve("caustica-fsr").resolve("natives").resolve(platform.resourceDirectory());
         Files.createDirectories(dir);
-        Path target = dir.resolve(LIB);
-        try (InputStream in = Fsr2ClassicUpscaler.class.getResourceAsStream("/caustica/natives/linux-x64/" + LIB)) {
+        Path target = dir.resolve(platform.libraryName());
+        try (InputStream in = Fsr2ClassicUpscaler.class.getResourceAsStream(platform.resourcePath())) {
             if (in != null) {
                 byte[] bytes = in.readAllBytes();
                 // Always overwrite: size-only checks leave stale SO with wrong MV/format
@@ -141,7 +158,7 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
                 }
                 if (rewrite) {
                     Files.write(target, bytes);
-                    target.toFile().setExecutable(true);
+                    if (!platform.isWindows()) target.toFile().setExecutable(true);
                     LOGGER.info("Extracted FSR2 native to {} ({} bytes)", target, bytes.length);
                 }
                 return target;
@@ -150,7 +167,8 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
         if (Files.isRegularFile(target) && Files.size(target) > 50_000) {
             return target;
         }
-        Path dev = Path.of("src/main/resources/caustica/natives/linux-x64").resolve(LIB);
+        Path dev = Path.of("src/main/resources/caustica/natives")
+                .resolve(platform.resourceDirectory()).resolve(platform.libraryName());
         return Files.isRegularFile(dev) ? dev.toAbsolutePath() : null;
     }
 
@@ -350,12 +368,15 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
             RtImage fsrIn = plate.convertToUpscalerInput(cmd, color, inputColorFormat);
 
             // Optional reactive mask (motion+depth+normals+viewZ+disocclMix -> R32F).
+            // v2: when material guides (specAlbedo/emission/materialFlags) are available,
+            // uses material-aware shader for improved quality on metallic/emissive/transparent surfaces.
             // On RADV/NAVI33 the reactive compute + FSR2 v2 path hard-recovers the device on the
             // first real-geometry frame (fixed SQC GPUVM fault). Skip reactive and use v1 only.
             boolean reactiveRan = false;
             if (!dev.comfyfluffy.caustica.rt.RtDeviceBringup.isRadv()) {
                 reactiveRan = plate.computeReactiveMaskIfNeeded(
-                        cmd, motion, depth, normals, guideViewZ, guideDisocclusionMix);
+                        cmd, motion, depth, normals, guideViewZ, guideDisocclusionMix,
+                        guideSpecAlbedo, guideEmission, guideMaterialFlags);
             }
             RtImage fsrReactive = reactiveRan ? plate.reactiveMask() : null;
 
@@ -465,6 +486,13 @@ public final class Fsr2ClassicUpscaler implements Upscaler {
     public void setReactiveMaskGuides(RtImage viewZ, RtImage disocclusionMix) {
         this.guideViewZ = viewZ;
         this.guideDisocclusionMix = disocclusionMix;
+    }
+
+    @Override
+    public void setMaterialGuides(RtImage specAlbedo, RtImage emission, RtImage materialFlags) {
+        this.guideSpecAlbedo = specAlbedo;
+        this.guideEmission = emission;
+        this.guideMaterialFlags = materialFlags;
     }
 
 

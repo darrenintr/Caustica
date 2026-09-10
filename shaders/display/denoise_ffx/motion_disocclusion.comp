@@ -19,7 +19,7 @@
 // 100% or 0%.
 //
 // Inputs:
-//   0  gMotion              rg16f      (UV-space MV, prev - cur)
+//   0  gMotion              rg16f      (RENDER-PIXEL MV, prev - cur; see world.rgen)
 //   1  gViewZ               r32f       (NRD-format positive linear view Z, reverse-Z derived)
 //   2  gDeviceDepth         r32f       (current frame's deviceZ, reverse-Z infinite)
 //   3  gNormalRough         rgba16f    (oct-decoded normal in xyz, roughness in w; length(xyz) < 0.5 = sky)
@@ -66,15 +66,21 @@ void main() {
         return;
     }
 
-    // 1. Compute MV in pixel-space. MV comes in as UV-space [-1,1] (host-side convention
-    //    per NRD CommonSettings.motionVectorScale = {1/w, 1/h}); the actual MV for the
-    //    along-normal check is the LENGTH in pixels = mv.xy * size.
-    vec2 mv = imageLoad(gMotion, pix).rg;
-    float mvLenPixels = length(mv) * max(float(size.x), float(size.y));
+    // 1. Compute MV in pixel-space. gMotion is RENDER-PIXEL motion (prev-cur),
+    //    see world.rgen ("Screen MV in pixels for NRD"). Convert to UV for the
+    //    reproject lookup, and to pixels (per-axis) for the length check.
+    vec2 mvPx = imageLoad(gMotion, pix).rg;
+    // NaN/Inf guard: a poisoned MV must reject history, not smear it. Without
+    // this, NaN propagates through prevCoord into the depth fetch and produces
+    // a random 0/1 disocclusion per pixel (flicker).
+    bool mvBad = any(isnan(mvPx)) || any(isinf(mvPx));
+    vec2 sizeF = vec2(size);
+    vec2 mvUV = mvBad ? vec2(0.0) : mvPx / sizeF;
+    float mvLenPixels = mvBad ? 1e6 : length(mvPx);
     // 2. Sample prev frame's deviceZ at the reprojected coord. Sundial uses a 2x2 bilinear
     //    tap on a dedicated history bitmask; we don't have one here, so use single-tap
     //    texelFetch (slightly noisier, but correct in expectation).
-    vec2 prevCoord = (vec2(pix) + 0.5) / vec2(size) + mv;
+    vec2 prevCoord = (vec2(pix) + 0.5) / sizeF + mvUV;
     bool prevInBounds = all(greaterThanEqual(prevCoord, vec2(0.0)))
                      && all(lessThanEqual(prevCoord, vec2(1.0)));
     float prevDeviceZ = prevInBounds
@@ -90,7 +96,9 @@ void main() {
     // 4. Expected depth change if the camera moved mvLenPixels at this viewZ.
     //    Empirically tuned to ~8.0 to match Sundial's empirical 5000 constant when
     //    folded through Sundial's (dot(prevViewPos, prevViewPos) + 2.0) denominator.
-    float mvLenUV = length(mv);
+    //    mvLenUV is the UV-space length (pixels / size), so expectedZJump is in
+    //    normalized-depth units — same domain as actualZJump below.
+    float mvLenUV = length(mvUV);
     float expectedZJump = mvLenUV * 0.05; // 5% of normalized depth per unit MV
     float actualZJump = abs(currDeviceZ - prevDeviceZ);
     // 5. Disocclusion signal: anything beyond the expected depth jump is parallax-

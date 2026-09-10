@@ -136,12 +136,37 @@ abstract class CompileShaders extends DefaultTask {
 			compileOne(src, spv, [])
 			if (src.name == "world.rgen") {
 				compileOne(src, new File(outDirFile, "world_noser.rgen.spv"), ["-DCAUSTICA_SER_NONE=1"])
+			} else if (src.name == "world_specular.rgen") {
+				// Reflection-only variant — a STANDALONE rgen source (not a #ifdef of world.rgen).
+				// Stage interface (bindings + payload + push constant + globals) is intentionally
+				// identical to world.rgen so the Vulkan RT pipeline create call sees the same
+				// descriptor layout. The main() inside just skips NEE diffuse / ReSTIR DI /
+				// ReSTIR GI / SSS / secondary NEE — only specular reflection + GGX bounce +
+				// hemisphere ambient + emissive + sky survive. Selected by caustica.toml [rt]
+				// mode = "specular-only".
+				// Mirror the SER / no-SER split world.rgen ships — on devices that expose
+				// `VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.rayTracingInvocationReorder=true`
+				// (NVIDIA Ada+, AMD RDNA 4 when AMD wires it up, Mesa RADV once reorder HW path lands)
+				// we want the reorder hint. On Mesa RADV today (feature struct field=false) we fall
+				// back to the no-SER variant the same way the full mode does.
+				compileOne(src, new File(outDirFile, "world_specular_noser.rgen.spv"),
+						["-DCAUSTICA_SER_NONE=1"])
 			} else if (src.name == "world.rchit") {
 				compileOne(src, new File(outDirFile, "world_noposfetch.rchit.spv"),
 						["-DCAUSTICA_POSITION_FETCH_NONE=1"])
 			} else if (src.name == "block_outline.frag") {
 				compileOne(src, new File(outDirFile, "block_outline_no_ray_query.frag.spv"),
 						["-DCAUSTICA_RAY_QUERY_NONE=1"])
+			} else if (src.name == "depth_pyramid.comp") {
+				// Subgroup-scheduled variant of the depth hierarchy min-reduction.
+				// Subgroup ops are core in Vulkan 1.1 — the project's Vulkan 1.2
+				// baseline already includes them — but we ship two .spv variants so a
+				// driver that mis-handles subgroup scheduling can be isolated by
+				// setting caustica.rt.subgroupOps.enabled=false at runtime, without
+				// rebuilding the shader. The opt-in path is wired through
+				// RtDeviceBringup.selectDepthPyramidShader().
+				compileOne(src, new File(outDirFile, "depth_pyramid_group.comp.spv"),
+						["-DCAUSTICA_SUBGROUP_OPS=1"])
 			}
 		}
 	}
@@ -179,6 +204,8 @@ def buildNative = tasks.register("buildNative") {
 	description = "Builds the libcaustica_native JNI scaffold via cmake+ninja and copies it into resources/caustica/natives/<platform>/. Skips with a warning if the toolchain is unavailable — never fails the main build."
 
 	inputs.dir file("native/src")
+	inputs.dir file("native/jni")
+	inputs.dir file("native/renderer")
 	inputs.file file("native/CMakeLists.txt")
 	outputs.dir buildNativeOutDir
 
@@ -281,6 +308,111 @@ def buildNative = tasks.register("buildNative") {
 }
 
 sourceSets.main.resources.srcDir(files(buildNativeOutDir).builtBy(buildNative))
+
+// FSR 4.1 / FFX 4.x modular shim build. Mirrors buildNative's
+// never-fail-the-build pattern: if cmake / ninja are missing the
+// task logs a warning and produces no output. The runtime
+// (Fsr41Runtime.tryLoad) gracefully no-ops when the .so is absent
+// and the next upscale frame falls back to FSR2 / TAAU.
+//
+// PROBE_ONLY by default — the shim works without the FSR 4.1 Linux
+// port's libffx_fsr41_linux.a present. To enable FULL link, set
+// CAUSTICA_FFX_FSR41_FULL=ON and CAUSTICA_FFX_FSR41_PORT_LIB to
+// the port's static lib path.
+def buildFsr41OutDir = layout.buildDirectory.dir("generated/native-fsr41")
+def buildFsr41Native = tasks.register("buildFsr41Native") {
+	group = "build"
+	description = "Builds the libffx_fsr41_caustica.so shim via cmake+ninja and stages it into resources/caustica/natives/<platform>/. Skips with a warning if the toolchain is unavailable or the source tree is missing."
+
+	inputs.dir file("native/ffx_fsr41")
+	outputs.dir buildFsr41OutDir
+
+	doLast {
+		try {
+			def srcDir = file("native/ffx_fsr41")
+			if (!new File(srcDir, "CMakeLists.txt").exists()) {
+				logger.warn("buildFsr41Native: native/ffx_fsr41/CMakeLists.txt missing; skipping")
+				return
+			}
+			def cmake = ["cmake", "cmake3"].find { isExeOnPath(it) }
+			if (cmake == null) {
+				logger.warn("buildFsr41Native: cmake not on PATH; skipping")
+				return
+			}
+			def ninja = ["ninja", "ninja-build"].find { isExeOnPath(it) }
+			if (ninja == null) {
+				logger.warn("buildFsr41Native: ninja not on PATH; skipping")
+				return
+			}
+
+			def os = org.gradle.internal.os.OperatingSystem.current()
+			def arch = System.getProperty("os.arch", "").toLowerCase()
+			String platformDir
+			if (os.linux && (arch == "x86_64" || arch == "amd64")) {
+				platformDir = "linux-x64"
+			} else if (os.linux && (arch == "aarch64" || arch == "arm64")) {
+				platformDir = "linux-arm64"
+			} else if (os.windows && (arch == "x86_64" || arch == "amd64")) {
+				platformDir = "windows-x64"
+			} else {
+				// FSR 4.1 shim is currently Linux-only; macOS / Windows
+				// would need the FSR 4.1 Linux port to be ported first.
+				logger.warn("buildFsr41Native: unsupported platform ${os}/${arch}; skipping")
+				return
+			}
+
+			def buildDir = layout.buildDirectory.dir("native-fsr41/build").get().asFile
+			if (buildDir.exists()) {
+				delete(buildDir)
+			}
+			def configureArgs = [cmake, "-S", srcDir.absolutePath,
+					"-B", buildDir.absolutePath,
+					"-G", "Ninja",
+					"-DCMAKE_BUILD_TYPE=Release"]
+			// Forward FULL-link opt-in if the developer set it.
+			if (System.getenv("CAUSTICA_FFX_FSR41_FULL") == "1") {
+				configureArgs += "-DCAUSTICA_FFX_FSR41_FULL=ON"
+			}
+			def configureProc = new ProcessBuilder()
+					.command(configureArgs)
+					.redirectErrorStream(true)
+					.start()
+			def configureOut = configureProc.inputStream.text
+			configureProc.waitFor()
+			if (configureProc.exitValue() != 0) {
+				logger.warn("buildFsr41Native: cmake configure failed (exit {}); skipping\n{}", configureProc.exitValue(), configureOut)
+				return
+			}
+
+			def buildProc = new ProcessBuilder()
+					.command(ninja, "-C", buildDir.absolutePath)
+					.redirectErrorStream(true)
+					.start()
+			def buildOut = buildProc.inputStream.text
+			buildProc.waitFor()
+			if (buildProc.exitValue() != 0) {
+				logger.warn("buildFsr41Native: ninja build failed (exit {}); skipping\n{}", buildProc.exitValue(), buildOut)
+				return
+			}
+
+			def sharedLib = new File(buildDir, "libffx_fsr41_caustica.so")
+			if (!sharedLib.exists()) {
+				logger.warn("buildFsr41Native: expected ${sharedLib} not found; skipping")
+				return
+			}
+			def targetDir = new File(buildFsr41OutDir.get().asFile, "caustica/natives/${platformDir}")
+			targetDir.mkdirs()
+			def target = new File(targetDir, sharedLib.name)
+			java.nio.file.Files.copy(sharedLib.toPath(), target.toPath(),
+					java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+			logger.lifecycle("buildFsr41Native: built ${target} (${sharedLib.length()} bytes)")
+		} catch (Throwable t) {
+			logger.warn("buildFsr41Native: unexpected failure; continuing without FSR 4.1 shim", t)
+		}
+	}
+}
+
+sourceSets.main.resources.srcDir(files(buildFsr41OutDir).builtBy(buildFsr41Native))
 
 // Local helper: is `name` an executable on PATH?
 def isExeOnPath(String name) {
